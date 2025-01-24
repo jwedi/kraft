@@ -1,0 +1,190 @@
+use std::sync::Arc;
+use std::time::Duration;
+use crossbeam_queue::SegQueue;
+use csv::WriterBuilder;
+use rand::Rng;
+use rand::rngs::ThreadRng;
+use tokio::sync::oneshot;
+use tracing::{Level, Span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
+use crate::quorum::worker::{QuorumTask, QuorumTaskResponseType, QuorumTaskType};
+use crate::raft::candidate::RaftCandidateStateDelegate;
+use crate::raft::raft_sm::{AppendEntries, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, RaftResponseMessage, RaftResponsePayload, RaftServerState, RaftVolatileState, RaftWriteBatchResponse, RequestVoteRequest, SharedState, TermVote};
+use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
+
+pub struct RaftFollowerStateDelegate {
+    election_timeout: u128,
+    rng: ThreadRng,
+    election_timeout_min: u128,
+    election_timeout_max: u128
+}
+
+impl RaftFollowerStateDelegate {
+    pub fn new() -> Self {
+        let now = now_millis();
+        let mut rng = rand::thread_rng();
+        let min: u128 = 600;
+        let max: u128 = 1300;
+        let election_timout = rng.gen_range(min..max);
+        Self {
+            election_timeout: now_plus_duration_millis(Duration::from_millis(election_timout as u64)),
+            rng,
+            election_timeout_min: min,
+            election_timeout_max: max
+        }
+    }
+}
+
+impl RaftProtocol for RaftFollowerStateDelegate {
+    fn init(&self) {
+        todo!()
+    }
+    fn get_node_type(&self) -> RaftNodeType {
+        RaftNodeType::Follower
+    }
+    fn append_entries(&mut self, append_entries_request: AppendEntries, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
+        let span = tracing::span!(Level::INFO, "follower_append_entries", leader=false);
+        let _enter = span.enter();
+        tracing::debug!("handling append entries for term: {}, current term: {}", append_entries_request.term, shared_state.server_state.current_term);
+
+        if append_entries_request.term > shared_state.server_state.current_term {
+            tracing::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
+            // TODO check if prev term or prev index is same as our own, else inform new leader that we need backfill.
+            shared_state.server_state.current_term = append_entries_request.term;
+            shared_state.server_state.leader_id = append_entries_request.leader_id;
+
+            // TODO write data
+            callback.send(
+                RaftResponseMessage{
+                    payload: RaftResponsePayload::AppendEntries(true)
+                }
+            ).expect("sending append_entries response callback failed");
+        } else if append_entries_request.term == shared_state.server_state.current_term { // TODO maybe check leader id.
+            tracing::debug!("received append_entries request from current leader: {}, term: {}", append_entries_request.leader_id, append_entries_request.term);
+            let message_id = shared_state.next_message_id;
+            shared_state.next_message_id += 1;
+
+            let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: append_entries_request.serialized, parent_span: Span::current()};
+            shared_state.persistence_work.push(persistence_task);
+
+            let response_span = tracing::span!(Level::INFO, "append_entries_outstanding_message_processing");
+            response_span.set_parent(span.context());
+
+            let message_type = OutstandingMessageType::AppendLog{ callback };
+            let outstanding_message = OutstandingMessage{
+                id: message_id,
+                outstanding_responses: 1,
+                message_type,
+                span: response_span
+            };
+            shared_state.outstanding_messages.insert(message_id, outstanding_message);
+        } else {
+            tracing::info!("received append_entries request from non leader with lower term than current. caller: {}, term: {}, current term: {}", append_entries_request.leader_id, append_entries_request.term, shared_state.server_state.current_term);
+            callback.send(
+                RaftResponseMessage{
+                    payload: RaftResponsePayload::AppendEntries(false)
+                }
+            ).expect("sending append_entries response callback failed");
+        }
+        tracing::debug!("reset election timeout for term: {}", append_entries_request.term);
+        self.election_timeout = now_plus_duration_millis(Duration::from_millis(self.rng.gen_range(self.election_timeout_min..self.election_timeout_max) as u64));
+        RaftMessageStateChange::None
+    }
+
+    fn time_step(&mut self, shared_state: &mut SharedState) -> RaftMessageStateChange {
+        while let Some(task) = shared_state.persistence_response.pop() {
+            match task {
+                PersistenceResponseType::LogPersisted { id } => {
+                    if let Some(mut msg) = shared_state.outstanding_messages.remove(&id) {
+                        let span_clone = msg.span.clone();
+                        let _entered = span_clone.enter();
+                        match msg.message_type {
+                            OutstandingMessageType::AppendLog{callback} => {
+                                let payload = RaftResponsePayload::AppendEntries(true);
+                                let response = RaftResponseMessage{payload};
+                                if let Err(_) = callback.send(response) {
+                                    tracing::error!("Writing log persisted callback failed because reader closed channel")
+                                }
+                            }
+                            _ => {
+                                tracing::error!(message = "Received unexpected outstanding_messages type for PersistenceResponseType.LogPersisted", id);
+                                log::error!("Received unexpected outstanding_messages type for PersistenceResponseType.LogPersisted {}", id)
+                            }
+                        }
+                    } else {
+                        tracing::error!(message = "LogPersisted event with no outstanding message registered", id);
+                    }
+                }
+                PersistenceResponseType::VotePersisted { id, term, candidate_id } => {
+                    if let Some(mut msg) = shared_state.outstanding_messages.remove(&id) {
+                        let span_clone = msg.span.clone();
+                        let _entered = span_clone.enter();
+                        match msg.message_type {
+                            OutstandingMessageType::RequestVote{callback} => {
+                                let payload = RaftResponsePayload::RequestVote(true);
+                                let response = RaftResponseMessage{payload};
+                                callback.send(response).unwrap();
+                            }
+                            _ => {
+                                tracing::error!(message = "Received unexpected outstanding_messages type for PersistenceResponseType.VotePersisted", id);
+                            }
+                        }
+
+                    } else {
+                        tracing::error!(message = "Received persistence event with no outstanding message registered", id);
+                    }
+                }
+
+                v => {
+                    tracing::error!("Persistence event not valid in current state");
+                }
+            }
+        }
+
+        while let Some(task) = shared_state.quorum_response.pop() {
+            match task.response_type {
+                e => {
+                    tracing::error!(message = "Received invalid quorum response message in current state");
+                }
+            }
+        }
+        let now = now_millis();
+        if self.election_timeout < now {
+            return RaftMessageStateChange::Candidate(
+                Box::new(RaftCandidateStateDelegate::new())
+            );
+        }
+        return RaftMessageStateChange::None;
+    }
+
+    fn request_vote(&mut self, request_vote_request: RequestVoteRequest, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
+        let span = tracing::span!(Level::INFO, "follower_request_vote");
+        let _enter = span.enter();
+        if !self.should_accept_vote(request_vote_request.term, request_vote_request.last_log_term, request_vote_request.last_log_index, shared_state) {
+            callback.send(
+                RaftResponseMessage{
+                    payload: RaftResponsePayload::RequestVote(false)
+                }
+            ).expect("response callback for request_vote failed");
+            return RaftMessageStateChange::None
+        }
+        if shared_state.volatile_server_state.next_term <= request_vote_request.term {
+            shared_state.volatile_server_state.next_term = request_vote_request.term+1;
+        }
+
+        let message_id = shared_state.next_message_id;
+        shared_state.next_message_id = message_id+1;
+        let message_type = OutstandingMessageType::RequestVote{callback};
+        let response_span = tracing::span!(Level::INFO, "request_vote_outstanding_message_processing");
+        response_span.set_parent(span.context());
+        let outstanding_message = OutstandingMessage{
+            id: message_id,
+            outstanding_responses: 1,
+            message_type,
+            span: response_span
+        };
+        shared_state.outstanding_messages.insert(message_id, outstanding_message);
+        RaftMessageStateChange::None
+    }
+}

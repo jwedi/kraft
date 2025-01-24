@@ -1,0 +1,31 @@
+syntax = "proto3";
+package datastoreproto;
+
+
+message DataStoreRecord {
+  string id = 1;
+  string payload = 2;
+}
+
+message PutDataStoreRecordRequest {
+    string payload = 1;
+}
+
+message PutDataStoreRecordResponse {
+  DataStoreRecord record = 1;
+}
+
+message GetDataStoreRecordRequest {
+  string id = 1;
+}
+
+message GetDataStoreRecordResponse {
+  DataStoreRecord record = 1;
+}
+
+
+service Datastore {
+  rpc GetRecord (GetDataStoreRecordRequest) returns (GetDataStoreRecordResponse);
+  rpc PutRecord (PutDataStoreRecordRequest) returns (PutDataStoreRecordResponse);
+}
+

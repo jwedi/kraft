@@ -1,0 +1,486 @@
+use std::collections::{HashMap, VecDeque};
+use std::error::Error;
+use std::future::Future;
+use std::iter::Map;
+use std::rc::Rc;
+use std::sync::{Arc, Condvar};
+use std::thread::sleep;
+use std::time::Duration;
+use crossbeam_queue::SegQueue;
+use opentelemetry::Context;
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry::trace::SpanBuilder;
+use opentelemetry_zipkin::Propagator;
+use serde::Deserialize;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::{Receiver, Sender};
+use tokio::sync::oneshot::error::RecvError;
+use tokio::task::JoinSet;
+use tonic::{Request, Response, Status};
+use tonic::codegen::http::StatusCode;
+use tonic::transport::Channel;
+use tracing::{Id, Instrument, instrument, Level, Span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+use crate::client::cluster_node_client::SharedGrpcChannel;
+use crate::config::config::ClusterNode;
+use crate::persistence::worker::{PersistenceConfig, PersistenceResponseType, PersistenceTaskType, PersistenceWorker};
+use crate::raft::raft_sm::{RaftMessage, RaftMessagePayload, RaftResponseMessage, RaftResponsePayload, RaftWriteBatchRequest};
+use crate::server::raftproto::{PutBatchRequest, PutBatchResponse, PutRequest, PutResponse};
+use crate::server::raftproto::raft_client::RaftClient;
+use crate::service_utils::app_time::now_millis;
+
+#[derive(Debug)]
+pub struct WriteResponse {
+    pub responses: Vec<PutResponse>,
+    pub status_code: StatusCode
+}
+
+#[derive(Debug)]
+pub struct WriteBatch {
+    pub batch_id: String,
+    pub requests: Vec<PutRequest>,
+    pub span_parent: Option<Span>,
+    pub callback: oneshot::Sender<WriteResponse>
+}
+
+impl WriteBatch {
+    pub fn size(&self) -> usize {
+        self.requests.iter().map(|v| v.get_size()).sum()
+    }
+}
+
+impl PutRequest {
+    pub fn get_size(&self) -> usize {
+        self.payload.len()
+    }
+}
+
+#[derive(Debug)]
+pub struct WriteQueue {
+    work_queue: Arc<SegQueue<WriteBatch>>,
+    shelved_batch: Option<WriteBatch>,
+}
+
+impl WriteQueue {
+
+    pub fn next_write_batch(&mut self, max_batch_size: usize) -> Vec<WriteBatch> {
+        let mut responses: Vec<WriteBatch> = vec![];
+        let mut current_size: usize = 0usize;
+        if let Some(mut val) = self.shelved_batch.take() {
+            current_size += &val.size();
+            responses.push(val)
+        }
+
+        while current_size < max_batch_size {
+            if let Some(next) = self.work_queue.pop() {
+                tracing::debug!("received write request");
+                let new_size = next.size() + current_size;
+                if new_size <= max_batch_size {
+                    // Take, otherwise memorise and break;
+                    responses.push(next);
+                    current_size = new_size;
+                } else {
+                    // Doesn't fit current batch
+                    self.shelved_batch = Some(next);
+                    break;
+                }
+            } else {
+                //tracing::info!("no more write requests");
+                // No more pending batches
+                break;
+            }
+        }
+        //tracing::info!("returning batch with {} items", responses.len());
+        return responses;
+    }
+}
+
+#[derive(Debug)]
+pub struct WriteProxy {
+    write_queue: WriteQueue,
+    max_batch_size: usize,
+    task_queue: Arc<SegQueue<RaftMessage>>,
+    self_id: u32,
+    cluster_nodes: Vec<ClusterNode>,
+    current_leader_connection: SharedGrpcChannel,
+    propagator: Propagator
+}
+
+impl WriteProxy {
+    pub fn new(
+        work_queue: Arc<SegQueue<WriteBatch>>,
+        max_batch_size: usize,
+        task_queue: Arc<SegQueue<RaftMessage>>,
+        self_id: u32,
+        cluster_nodes: Vec<ClusterNode>
+    ) -> Self {
+        let write_queue = WriteQueue {
+            work_queue,
+            shelved_batch: None,
+        };
+        let default_leader_connection = SharedGrpcChannel::new("placeholder", 0); // Lazy connection so this doesn't matter. Don't wanna juggle Options.
+        Self {
+            write_queue,
+            max_batch_size,
+            task_queue,
+            self_id,
+            cluster_nodes,
+            current_leader_connection: default_leader_connection,
+            propagator: opentelemetry_zipkin::Propagator::new(),
+        }
+    }
+
+    async fn get_client(&mut self, node_id: u32) -> Result<RaftClient<Channel>, String> {
+        if node_id == self.current_leader_connection.node_id {
+            self.current_leader_connection.get_client().await
+        } else {
+            // New leader
+            tracing::info!("Establishing write proxy connection to new leader {}", node_id);
+            let cn = self.cluster_nodes.iter().find(|node| node.node_id == node_id).unwrap(); // TODO
+            self.current_leader_connection = SharedGrpcChannel::new(cn.endpoint.as_str(), cn.node_id);
+            self.current_leader_connection.get_client().await
+        }
+
+    }
+
+    fn respond_to_put_responses(responses: Vec<PutResponse>, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
+        let mut grouped: HashMap<String, Vec<PutResponse>> = HashMap::new();
+
+        for resp in responses {
+            let entry = grouped.entry(resp.id.clone()); // TODO clone
+            entry.or_insert(vec![]).push(resp);
+        }
+
+        for b in batch_callbacks {
+            let maybe_responses = grouped.remove(&b.0).unwrap_or_else(|| vec![]);
+            let msg = WriteResponse {
+                responses: maybe_responses,
+                status_code: StatusCode::OK
+            };
+            match b.1.send(msg) {
+                Ok(_) => {}
+                Err(_) => {
+                    tracing::info!("Sending write response callback failed because the receiver dropped");
+                }
+            }
+        }
+    }
+
+    fn handle_insert_completed(msg: RaftResponseMessage, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
+
+        match msg.payload {
+            RaftResponsePayload::WriteBatch ( responses ) => {
+                WriteProxy::respond_to_put_responses(responses.responses, batch_callbacks)
+            }
+            default => {
+                batch_callbacks.into_iter().for_each(|mut callback| {
+                    let msg = WriteResponse {
+                        responses: vec![],
+                        status_code: StatusCode::INTERNAL_SERVER_ERROR
+                    };
+                    match callback.1.send(msg) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::warn!("Sending write response callback failed because the receiver dropped");
+                        }
+                    }
+                });
+            }
+        }
+
+    }
+
+    async fn handle_local_write_response(receiver: Receiver<RaftResponseMessage>, parent_span: Span, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
+        let span = tracing::span!(Level::INFO, "write_proxy_local_batch_forward_response_await");
+        span.set_parent(parent_span.context());
+        let resp = receiver.instrument(span).await;
+        match resp {
+            Ok(ok_runtime_resp) => {
+                tracing::debug!("raft batch handling completed");
+                WriteProxy::handle_insert_completed(ok_runtime_resp, batch_callbacks)
+            }
+            Err(e) => {
+                tracing::error!("receiving raft message in proxy failed with error, {}", e);
+            }
+        }
+    }
+
+
+    fn prepare_batch_and_callbacks(batches: Vec<WriteBatch>) -> (Vec<PutRequest>, HashMap<String, Sender<WriteResponse>>) {
+        let mut all_requests: Vec<PutRequest> = vec![];
+        let mut batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>> = HashMap::new();
+        for mut b in batches.into_iter() {
+            all_requests.append(&mut b.requests);
+            batch_callbacks.insert(b.batch_id, b.callback);
+        }
+        (all_requests, batch_callbacks)
+    }
+
+    fn prepare_put_batch_request(put_requests: Vec<PutRequest>, span_parent: Span, propagator: &Propagator) -> Request<PutBatchRequest> {
+        let req = PutBatchRequest {
+            put_request: put_requests
+        };
+
+        let mut request = tonic::Request::new(req);
+
+        // Tracing stuff
+        let mut carrier = std::collections::HashMap::new();
+        let ctx = span_parent.context();
+        propagator.inject_context(&ctx, &mut carrier);
+
+        // Add tracing metadata to the request
+        let metadata = request.metadata_mut();
+        for (key, value) in carrier {
+            if let Ok(key) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes()) {
+                metadata.insert(key, value.parse().unwrap());
+            }
+        }
+        request
+    }
+
+    async fn send_remote_put_batch_and_handle_response(mut client: RaftClient<Channel>, request: Request<PutBatchRequest>, batch_callbacks: HashMap<String, Sender<WriteResponse>>, span: Span) {
+
+        let s = span.clone();
+        let resp = client.put_batch(request).instrument(s).await;
+        match resp {
+            Ok(put_response) => {
+                let write_callback_span = tracing::span!(Level::INFO, "write_proxy_remote_success_callbacks");
+                write_callback_span.set_parent(span.context());
+                write_callback_span.in_scope(|| {
+                    WriteProxy::respond_to_put_responses(put_response.into_inner().responses, batch_callbacks)
+                })
+            }
+            Err(e) => {
+                tracing::error!("Remote PutBatch request failed with error: {}", e);
+                for b in batch_callbacks {
+                    let msg = WriteResponse {
+                        responses: vec![],
+                        status_code: StatusCode::INTERNAL_SERVER_ERROR
+                    };
+                    b.1.send(msg);
+                }
+            }
+        }
+    }
+
+    async fn handle_write_batch_with_known_leader(&mut self, leader_id: u32, batches: Vec<WriteBatch>) {
+        let parent = Span::current();
+        let mut preparation = WriteProxy::prepare_batch_and_callbacks(batches);
+        let all_requests = preparation.0;
+        let mut batch_callbacks = preparation.1;
+
+        if leader_id == self.self_id {
+            tracing::debug!("local batch forward");
+            // Node is the leader
+            let chan: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
+            let payload = RaftMessagePayload::WriteBatch(
+                RaftWriteBatchRequest {
+                    requests: all_requests,
+                    serialized: vec![1, 2, 3] // TODO
+                }
+            );
+            let span = tracing::span!(Level::INFO, "write_proxy_local_batch_forward_await");
+            let raft_message = RaftMessage {
+                payload,
+                callback: chan.0,
+                parent_span: span.clone()
+            };
+            self.task_queue.push(raft_message);
+            WriteProxy::handle_local_write_response(chan.1, span.clone(), batch_callbacks).instrument(span).await;
+        } else {
+            let span = tracing::span!(Level::INFO, "write_proxy_remote_batch_forward_client");
+            tracing::debug!("remote batch forward");
+
+            // Get RPC client and do a remote PutBatch request.
+            match self.get_client(leader_id).instrument(span).await {
+                Ok(mut client) => {
+                    let put_batch_span = tracing::span!(Level::INFO, "write_proxy_remote_put_batch");
+                    put_batch_span.set_parent(parent.context());
+
+                    let rpc_put_batch_span = tracing::span!(Level::INFO, "write_proxy_remote_put_batch_send_rpc");
+                    rpc_put_batch_span.set_parent(put_batch_span.context());
+
+                    let request = WriteProxy::prepare_put_batch_request(all_requests, rpc_put_batch_span.clone(), &self.propagator);
+
+                    WriteProxy::send_remote_put_batch_and_handle_response(client, request, batch_callbacks, rpc_put_batch_span).instrument(put_batch_span).await;
+                }
+                Err(e) => {
+                    tracing::error!("Setting up remote client failed with error: {}", e);
+                    for b in batch_callbacks {
+                        let msg = WriteResponse {
+                            responses: vec![],
+                            status_code: StatusCode::INTERNAL_SERVER_ERROR
+                        };
+                        b.1.send(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn run(&mut self) {
+        tracing::info!("Write proxy worker running");
+        let mut join_set = JoinSet::new();
+        let mut current_leader_id = 0u32;
+
+        loop {
+            if current_leader_id <= 0 {
+                let span = Span::current();
+                let chan: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
+                let payload = RaftMessagePayload::GetRaftState;
+                let raft_message = RaftMessage {
+                    payload,
+                    callback: chan.0,
+                    parent_span: span.clone()
+                };
+                self.task_queue.push(raft_message);
+                let resp = chan.1.instrument(span).await;
+                match resp {
+                    Ok(m) => {
+                        match &m.payload {
+                            RaftResponsePayload::RaftState { leader_id } => {
+                                if *leader_id <= 0 {
+                                    log::warn!("No leader elected, retrying later");
+                                    tokio::time::sleep(Duration::from_millis(3)).await;
+                                    continue
+                                } else {
+                                    log::info!("New leader received: {}", *leader_id);
+                                    current_leader_id = *leader_id
+                                }
+                            }
+                            default => {
+                                log::error!("Received unexpected raft response payload type, expected RaftState");
+                                tokio::time::sleep(Duration::from_millis(3)).await;
+                                continue
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("Reading raft response message failed: {}", err);
+                        tokio::time::sleep(Duration::from_millis(3)).await;
+                        continue
+                    }
+                }
+            }
+
+            let mut batch = self.write_queue.next_write_batch(self.max_batch_size);
+            let start_time = now_millis();
+            if !batch.is_empty() {
+                let mut new_root = batch.first_mut().unwrap().span_parent.take().unwrap_or_else( || {
+                    log::error!("unexpected empty parent span from write queue batch");
+                    Span::none()
+                });
+                let span = tracing::span!(Level::INFO, "write_proxy_raft_state_await", batches=batch.len());
+                span.set_parent(new_root.context());
+
+                let chan: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
+                let payload = RaftMessagePayload::GetRaftState;
+                let raft_message = RaftMessage {
+                    payload,
+                    callback: chan.0,
+                    parent_span: span.clone()
+                };
+                self.task_queue.push(raft_message);
+                let resp = chan.1.instrument(span).await;
+                match resp {
+                    Ok(m) => {
+                        match &m.payload {
+                            RaftResponsePayload::RaftState { leader_id } => {
+                                let write_batch_span = tracing::span!(Level::INFO, "write_proxy_write_batch_await");
+                                write_batch_span.set_parent(new_root.context());
+
+                                let mut preparation = WriteProxy::prepare_batch_and_callbacks(batch);
+                                let all_requests = preparation.0;
+                                let mut batch_callbacks = preparation.1;
+
+                                if self.self_id == *leader_id {
+                                    // Node is the leader
+                                    let chan: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
+                                    let payload = RaftMessagePayload::WriteBatch(
+                                        RaftWriteBatchRequest {
+                                            requests: all_requests,
+                                            serialized: vec![1, 2, 3] // TODO
+                                        }
+                                    );
+                                    let span = tracing::span!(Level::INFO, "write_proxy_local_batch_forward_await");
+                                    span.set_parent(new_root.context());
+                                    let raft_message = RaftMessage {
+                                        payload,
+                                        callback: chan.0,
+                                        parent_span: span.clone()
+                                    };
+                                    self.task_queue.push(raft_message);
+                                    join_set.spawn(async {
+                                        WriteProxy::handle_local_write_response(chan.1, span.clone(), batch_callbacks).instrument(span).await;
+                                    });
+                                } else {
+                                    match self.get_client(*leader_id).await {
+                                        Ok(mut client) => {
+                                            let put_batch_span = tracing::span!(Level::INFO, "write_proxy_remote_put_batch");
+                                            put_batch_span.set_parent(new_root.context());
+                                            let request = WriteProxy::prepare_put_batch_request(all_requests, put_batch_span.clone(), &self.propagator);
+
+                                            let p = new_root.clone();
+                                            join_set.spawn(async {
+                                                WriteProxy::send_remote_put_batch_and_handle_response(client, request, batch_callbacks, p).instrument(put_batch_span).await
+                                            });
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Setting up remote client failed with error: {}", e);
+                                            for b in batch_callbacks {
+                                                let msg = WriteResponse {
+                                                    responses: vec![],
+                                                    status_code: StatusCode::INTERNAL_SERVER_ERROR
+                                                };
+                                                b.1.send(msg);
+                                            }
+                                        }
+                                    }
+                                }
+                                let delta = now_millis() - start_time;
+                                if delta < 5 {
+                                    tokio::time::sleep(Duration::from_millis(delta as u64)).await;
+                                }
+                                //  Clean up completed tasks
+                                while let Some(result) = join_set.try_join_next() {
+                                    match result {
+                                        Ok(_) => {
+                                            // Handle successful completion if needed
+                                        }
+                                        Err(e) => {
+                                            log::error!("A task failed: {:?}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            default => {
+                                tracing::error!("Received unexpected raft response payload type, expected RaftState");
+                                log::error!("Received unexpected raft response payload type, expected RaftState")
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("Reading raft response message failed: {}", err);
+                        log::error!("Reading raft response message failed: {}", err)
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_micros(300)).await;
+            }
+        }
+
+        // Solution would only be scalable in terms of writes if leadership can be sharded?
+        // Alternatively 3 nodes are made into a mini-quorum for a key range. So N*3 nodes means N*100.000 RPS, that's decent.
+        // Cassandra does around 10.000 replicated RPS for a 3 node cluster.
+
+        // 100.000 RPS
+        // means 1000 requests per ms
+        // means 33.000 RPS per node in 3 node cluster
+        // means 333 requests per millisecond per node.
+
+        // means 1 request per millisecond for batches of 1000.
+        // means 4 requests per millisecond for batches of 250.
+        // 2 serial RPCs and 2 potentially concurrent disk IO per batch. Throughput of 100 batches per second.
+        // This is within the realm of reasonable
+    }
+}

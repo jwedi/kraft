@@ -1,0 +1,44 @@
+[package]
+name = "rusty_raft"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]] # Bin to run the HelloWorld gRPC server
+name = "rusty-raft"
+path = "src/main.rs"
+
+[[bin]] # Bin to run the HelloWorld gRPC client
+name = "rusty-raft-client"
+path = "src/client.rs"
+
+[dependencies]
+tonic = "0.12.3"
+prost = "0.13"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+log = "0.4.22"
+tracing-subscriber = "0.3.19"
+tracing = "0.1.41"
+crossbeam-queue = "0.3.12"
+futures = "0.3.31"
+time = "0.3.37"
+serde = { version = "1.0.216", features = ["derive"] }
+csv = "1.3.1"
+config = "0.15.4"
+rand = "0.8.5"
+chrono = "0.4.39"
+tracing-opentelemetry = "0.28.0"
+opentelemetry = { version = "0.27.0" }
+opentelemetry_sdk = { version = "0.27.0", features = ["rt-tokio", "rt-async-std"] }
+opentelemetry-zipkin = { version = "0.27.0", features = ["reqwest-client"], default-features = false }
+env_logger = "0.11.6"
+
+[dependencies.uuid]
+version = "1.11.0"
+features = [
+    "v4",                # Lets you generate random UUIDs
+    "fast-rng",          # Use a faster (but still sufficiently random) RNG
+    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
+]
+
+[build-dependencies]
+tonic-build = "*"
