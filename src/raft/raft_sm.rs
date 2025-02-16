@@ -200,6 +200,16 @@ pub trait RaftProtocol {
 
     fn time_step(&mut self, shared_state: &mut SharedState) -> RaftMessageStateChange;
 
+    fn validate_append_entries(&mut self, append_entries_request: &AppendEntries, prev_index: u64, prev_term: u64) -> bool {
+        if append_entries_request.prev_term != prev_term {
+            return false
+        }
+        if append_entries_request.prev_index != prev_index {
+            return false
+        }
+        return true;
+    }
+
     fn should_accept_vote(&mut self, term: u64, last_log_term: u64, last_log_index: u64, shared_state: &mut SharedState) -> bool {
         if let Some(voted_for) = shared_state.term_votes.get(&term) {
             // Node have already voted for someone this term.
@@ -249,9 +259,16 @@ pub struct RaftMessage {
 pub enum RaftResponsePayload {
     None,
     RequestVote(bool), // granted
-    AppendEntries(bool), // OK
+    AppendEntries(AppendEntriesCallbackResponse), // OK
     RaftState{leader_id: u32},
     WriteBatch(RaftWriteBatchResponse)
+}
+
+#[derive(Debug)]
+pub enum AppendEntriesCallbackResponse {
+    Ok,
+    UnrecognizedLeader,
+    WantedPreviousEntry{ last_term: u64, last_index: u64} // Want the entry that follows the given term and index
 }
 
 #[derive(Debug)]

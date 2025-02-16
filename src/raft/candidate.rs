@@ -10,7 +10,7 @@ use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
 use crate::quorum::worker::{QuorumResponse, QuorumTask, QuorumTaskResponseType, QuorumTaskType};
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::raft::leader::RaftLeaderStateDelegate;
-use crate::raft::raft_sm::{AppendEntries, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, RaftResponseMessage, RaftResponsePayload, RaftServerState, RaftVolatileState, RequestVoteRequest, SharedState, TermVote};
+use crate::raft::raft_sm::{AppendEntries, AppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, RaftResponseMessage, RaftResponsePayload, RaftServerState, RaftVolatileState, RequestVoteRequest, SharedState, TermVote};
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
 
 struct OngoingElection {
@@ -43,16 +43,22 @@ impl RaftProtocol for RaftCandidateStateDelegate {
     fn append_entries(&mut self, append_entries_request: AppendEntries, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
         tracing::debug!("handling append entries for term: {}, current term: {}", append_entries_request.term, shared_state.server_state.current_term);
         if append_entries_request.term >= shared_state.server_state.current_term {
-            tracing::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
+            log::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
             // TODO check if prev term or prev index is same as our own, else inform new leader that we need backfill.
             // New leader
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
             shared_state.volatile_server_state.next_term = append_entries_request.term +1;
 
+            if let Some(entry) = append_entries_request.entries.last() {
+                shared_state.volatile_server_state.last_log_index = entry.index;
+                shared_state.volatile_server_state.last_log_term = entry.term;
+                log::info!("updating last log term {} and index {}", entry.term, entry.index);
+            }
+
             callback.send(
                 RaftResponseMessage{
-                    payload: RaftResponsePayload::AppendEntries(true)
+                    payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::Ok)
                 }
             ).expect("Sending channel message failed");
             return RaftMessageStateChange::Follower(Box::new(RaftFollowerStateDelegate::new()));
@@ -60,7 +66,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         } else {
             callback.send(
                 RaftResponseMessage{
-                    payload: RaftResponsePayload::AppendEntries(false)
+                    payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::UnrecognizedLeader)
                 }
             ).expect("Sending channel message failed");
         }
@@ -112,7 +118,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                         let _entered = msg.span.enter();
                         match msg.message_type {
                             OutstandingMessageType::AppendLog{callback} => {
-                                let payload = RaftResponsePayload::AppendEntries(true);
+                                let payload = RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::Ok);
                                 let response = RaftResponseMessage{payload};
                                 callback.send(response).unwrap();
                             }
@@ -152,6 +158,8 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                 if new_votes >= shared_state.quorum_size && persistence_done {
                                     // Candidate election done, Transition to leader.
                                     tracing::info!(message = "Node elected leader for term", term);
+                                    log::info!("Node was elected leader for term: {}, node id: {}", term, shared_state.identity);
+                                    shared_state.server_state.leader_id = shared_state.identity;
                                     shared_state.server_state.current_term = term;
                                     return RaftMessageStateChange::Leader(Box::new(RaftLeaderStateDelegate::new()));
                                 } else if new_outstanding_resp > 0 {

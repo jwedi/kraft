@@ -10,7 +10,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
 use crate::quorum::worker::{QuorumTask, QuorumTaskResponseType, QuorumTaskType};
 use crate::raft::candidate::RaftCandidateStateDelegate;
-use crate::raft::raft_sm::{AppendEntries, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, RaftResponseMessage, RaftResponsePayload, RaftServerState, RaftVolatileState, RaftWriteBatchResponse, RequestVoteRequest, SharedState, TermVote};
+use crate::raft::raft_sm::{AppendEntries, AppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, RaftResponseMessage, RaftResponsePayload, RaftServerState, RaftVolatileState, RaftWriteBatchResponse, RequestVoteRequest, SharedState, TermVote};
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
 
 pub struct RaftFollowerStateDelegate {
@@ -49,7 +49,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
         tracing::debug!("handling append entries for term: {}, current term: {}", append_entries_request.term, shared_state.server_state.current_term);
 
         if append_entries_request.term > shared_state.server_state.current_term {
-            tracing::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
+            log::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
             // TODO check if prev term or prev index is same as our own, else inform new leader that we need backfill.
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
@@ -57,33 +57,50 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             // TODO write data
             callback.send(
                 RaftResponseMessage{
-                    payload: RaftResponsePayload::AppendEntries(true)
+                    payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::Ok)
                 }
             ).expect("sending append_entries response callback failed");
         } else if append_entries_request.term == shared_state.server_state.current_term { // TODO maybe check leader id.
             tracing::debug!("received append_entries request from current leader: {}, term: {}", append_entries_request.leader_id, append_entries_request.term);
+
+            // Check request if valid in current state:
+            if !self.validate_append_entries(&append_entries_request, shared_state.volatile_server_state.last_log_index, shared_state.volatile_server_state.last_log_term) {
+                log::info!("non-consecutive append log req: term {}, index: {}, state: term {}, index {}", append_entries_request.prev_term, append_entries_request.prev_index, shared_state.volatile_server_state.last_log_term, shared_state.volatile_server_state.last_log_index);
+                callback.send(
+                    RaftResponseMessage{
+                        payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::WantedPreviousEntry { last_term: shared_state.volatile_server_state.last_log_term, last_index: shared_state.volatile_server_state.last_log_index})
+                    }
+                ).expect("sending append_entries response callback failed");
+                return RaftMessageStateChange::None
+            } else {
+                log::debug!("consecutive append log req: term {}, index: {}, state: term {}, index {}", append_entries_request.prev_term, append_entries_request.prev_index, shared_state.volatile_server_state.last_log_term, shared_state.volatile_server_state.last_log_index);
+            }
+
             let message_id = shared_state.next_message_id;
             shared_state.next_message_id += 1;
 
             let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: append_entries_request.serialized, parent_span: Span::current()};
             shared_state.persistence_work.push(persistence_task);
 
-            let response_span = tracing::span!(Level::INFO, "append_entries_outstanding_message_processing");
-            response_span.set_parent(span.context());
-
             let message_type = OutstandingMessageType::AppendLog{ callback };
             let outstanding_message = OutstandingMessage{
                 id: message_id,
                 outstanding_responses: 1,
                 message_type,
-                span: response_span
+                span: Span::current()
             };
             shared_state.outstanding_messages.insert(message_id, outstanding_message);
+
+            if let Some(entry) = append_entries_request.entries.last() {
+                shared_state.volatile_server_state.last_log_index = entry.index;
+                shared_state.volatile_server_state.last_log_term = entry.term;
+                log::info!("updating last log term {} and index {}", entry.term, entry.index);
+            }
         } else {
             tracing::info!("received append_entries request from non leader with lower term than current. caller: {}, term: {}, current term: {}", append_entries_request.leader_id, append_entries_request.term, shared_state.server_state.current_term);
             callback.send(
                 RaftResponseMessage{
-                    payload: RaftResponsePayload::AppendEntries(false)
+                    payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::UnrecognizedLeader)
                 }
             ).expect("sending append_entries response callback failed");
         }
@@ -97,11 +114,14 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             match task {
                 PersistenceResponseType::LogPersisted { id } => {
                     if let Some(mut msg) = shared_state.outstanding_messages.remove(&id) {
-                        let span_clone = msg.span.clone();
-                        let _entered = span_clone.enter();
+                        let span = tracing::span!(Level::INFO, "outstanding_message_log_persisted_processing");
+                        span.set_parent(msg.span.context());
+                        let _entered = span.enter();
+                        tracing::event!(Level::INFO, "handling log persisted");
+
                         match msg.message_type {
                             OutstandingMessageType::AppendLog{callback} => {
-                                let payload = RaftResponsePayload::AppendEntries(true);
+                                let payload = RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::Ok);
                                 let response = RaftResponseMessage{payload};
                                 if let Err(_) = callback.send(response) {
                                     tracing::error!("Writing log persisted callback failed because reader closed channel")

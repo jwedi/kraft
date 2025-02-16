@@ -3,21 +3,21 @@ Basic Rust implementation of the Raft consensus algorithm.
 
 
 TODOs
-- Ping gRPC server running
+- Ping gRPC server running, Done
 - Server running in Docker
-- Leader election
-  - No-op AppendEntries heartbeats
-- Persist state to disk. i.e Leader for current term
-- Log replication
+- Leader election, Done
+  - No-op AppendEntries heartbeats, Done
+- Persist state to disk. i.e Leader for current term, Done
+- Log replication, Done
 
 
 
-- Circle buffer with job commands.
-- Sync writer, single reader.
-- Writers get index of buffer they can write to. (Sync increment index, cannot overrun the read index)
-- Reader smart batching.
-- Timer every N ms check if buffer is empty, if true, add hearbeat command.
-- Queueing commands return some sort of future value that is written to when the reader has processed the command and the writer can read from / await.
+- Circle buffer with job commands, Done using Crossbeam
+- Sync writer, single reader, Done
+- Writers get index of buffer they can write to. (Sync increment index, cannot overrun the read index), N/A due to crossbeam segqueue
+- Reader smart batching, Done
+- Timer every N ms check if buffer is empty, if true, add hearbeat command, Done
+- Queueing commands return some sort of future value that is written to when the reader has processed the command and the writer can read from / await. Done using oneshot queues for callbacks.
 
 
 
@@ -25,19 +25,19 @@ Overall flow:
 Leader election:
 - 
 Writes:
-- Client connects to one of the servers.
-- Client sends insert request to server.
-- If server is the master it adds the insert command into the command queue and waits for a response.
-  - The command worker reads commands into a smart batch.
-  - It first writes a log entry to the local persistent log.
-  - It then sends an AppendEntries RPC to all other servers to replicate the log entry.
-  - If a majority of servers respond with success, the leader commits the log entry.
-  - The next AppendEntries request from the leader to the followers will now contain the new commit index.
-  - The leader then updates its state machine and responds to the client.
-- If server is not the master it forwards the request to the master.
-  - The follower waits for a positive response from the leader and then returns with the result.
-- On response on channel it returns the response to the client.
-Reads:
+- Client connects to one of the servers. Done
+- Client sends insert request to server. Done
+- If server is the master it adds the insert command into the command queue and waits for a response. Done
+  - The command worker reads commands into a smart batch. Done
+  - It first writes a log entry to the local persistent log. Done
+  - It then sends an AppendEntries RPC to all other servers to replicate the log entry. Done
+  - If a majority of servers respond with success, the leader commits the log entry. Done
+  - The next AppendEntries request from the leader to the followers will now contain the new commit index. TODO
+  - The leader then updates its state machine and responds to the client. TODO as in needs to update soem in-memory data structure that's used for reads. TODO
+- If server is not the master it forwards the request to the master. Done
+  - The follower waits for a positive response from the leader and then returns with the result. Done
+- On response on channel it returns the response to the client. Done
+Reads: TODO
 - The server sends a read command to its local job queue.
 - The worker reads the commands and completes the request by reading from the state machine.
 - The worker then responds with the result to the response channel.
@@ -47,33 +47,33 @@ Reads:
 
 AppendEntries:
 - Potentially unique payload per follower due to backfilling entries.
-- Leader prepares batch of entries from follower.matchIndex -> leader.currentIndex.
+- Leader prepares batch of entries from follower.matchIndex -> leader.currentIndex. TODO, no backfilling in place and always sends next
 - It sends AppendEntries to given follower
-  - with prevIndex and prevTerm taken from first entry in batch.
+  - with prevIndex and prevTerm taken from first entry in batch. Done?
   - with lastCommitted taken from leader.commitIndex
-  - with leaderId taken from leader config.
-  - with term taken from leader.currentTerm.
+  - with leaderId taken from leader config. Done
+  - with term taken from leader.currentTerm. Done
 
 
-RequestVote:
-- Same payload for all followers.
-- It sends RequestVote to each follower:
-  - term being the new term, i.e old term +1.
-  - index of last entry applied
-  - term of last entry applied.
-  - candidate id taken from server config.
+RequestVote: Done
+- Same payload for all followers. Done
+- It sends RequestVote to each follower: Done
+  - term being the new term, i.e old term +1. Done
+  - index of last entry applied. Done?
+  - term of last entry applied. Done?
+  - candidate id taken from server config. Done
 
 
 
 
 Performance thoughts.
-- Should smart batch on each follower node before forwarding writes to leader
+- Should smart batch on each follower node before forwarding writes to leader. Done
   - Reduces networking overhead
   - Achieves constant load
-- Should smart batch on leader worker
+- Should smart batch on leader worker. Done
   - Reduces Bookeeping overhead
   - Reduces IO overhead by batching writes together
-- Maybe some CAS thingy to avoid blocking the main working thread.
+- Maybe some CAS thingy to avoid blocking the main working thread. Effectively done using the outstanding messages bookeeping in the state machine worker.
   - API issues a request like PrepareVote, 
   - the worker would validate the request and reserve an IO "Mutex" to the caller where they can write the data themselves, 
   - then the caller would send something like CommitVote and the worker would then consider the vote accepted.
@@ -84,12 +84,12 @@ Performance thoughts.
   - The next disk write could probably be prepared while waiting for the disk write to complete.
   - Like some kind of pipelining strategy where the system can have one pipelining and one internal processing task active at a time.
   - If there's no stable leader, then i would not expect AppendEntries and RequestVote requests to happen in parallell, maybe that's mostly a non-issue.
-- As long as the IO cost is amortized over a large enough number of requests, I should be fine.
+- As long as the IO cost is amortized over a large enough number of requests, I should be fine. This should effectively be done.
   - Maybe each request to the executor should contain both the request for validation but also the serialized version of the data that can immediately be dumped into the write buffer
   - The worker would have a fixed size write buffer and smart batches more requests until the batch size is too large for the buffer.
   - The buffer is reset after each IO dump, alternatively a new epoc buffer is created.
   - So smart batch incoming requests while there are more on the queue, no leader election is happening and write buffer allows more data.
-- A batch write involves both a write to disk and then a RPC to all followers to accept the request.
+- A batch write involves both a write to disk and then a RPC to all followers to accept the request. Done using persistence worker and one quorum worker per other node in the cluster.
   - Doing all of this blocking IO on the main thread sounds terrible.
   - Maybe one NodeHandler per node in the cluster. Is also a State machine, where it continously polls heartbeats while in Leader state.
 
@@ -99,19 +99,19 @@ Performance thoughts.
 
 
 More TODOs
-- API needs to send message to worker to get the current leader id for writes.
+- API needs to send message to worker to get the current leader id for writes. Done, not sure if caching is actually needed due to handling of the request on the state machine is just a hashmap lookup.
   - Should locally cache response for a short period of time.
   - Writes should only go to leader.
   - 
-- API needs to put write requests onto internal queue and they need to be smart batched.
+- API needs to put write requests onto internal queue and they need to be smart batched. Done
 - Whenever writes have been written to a quorum majority
-  - Internal datastructure like btree should be updated 
-  - callback should fire to respond to API client
-  - Some type of message should be sent to learner
-- Maybe during smart batch build one message containing all writes in the batch. 
-- Insert pending message with payload that's all callbacks, on response respond to all callbacks.
+  - Internal datastructure like btree should be updated. TODO
+  - callback should fire to respond to API client. Done
+  - Some type of message should be sent to learner. TODO
+- Maybe during smart batch build one message containing all writes in the batch. Done
+- Insert pending message with payload that's all callbacks, on response respond to all callbacks. Done
 
-Having separate works queues for append entries and control messages would be convenient.
+Having separate works queues for append entries and control messages would be convenient. Done
 Even if i did, i would still need to peek messages and potentially not take them.
 Maybe add a simple array buffer in the queue worker that's processed before the queue and where messages can be stored for later.
 
@@ -129,10 +129,23 @@ Read flow
    3. If that's the case then how is the datastructure updated?
    4. We don't want lock contention for each request, maybe the same single worker approach(?)
 
-Write flow
+Write flow. Done
 1. Write request is sent to write proxy
 2. Write proxy figures out who the leader is
 3. Write proxy batches requests into a smart batch and then forwards to leader.
 4. (Leader can't be having the combined RPS of all nodes)
 5. Would maybe not need to have leader level batching if that is the case.
-6. 
+
+
+TODOs update:
+1. Verify append entries prev index being sent correctly.
+2. Respect append entries prev index in follower, i.e don't commit if append entries prev index doesn't match follower last index
+3. Some sort of backfilling in follower, notify leader of the services last index and term so that leader can send log entries for backfilling.
+4. Actually serialize real data and persist to disk.
+5. Read log entries from disk on bootup and bootstrap config based on persisted log stuff.
+6. Metrics
+7. Metrics exporter
+8. Bidirectional stream for quorum workers. Ensures append log is delivered in-order. Maybe quorum worker try establish connections at random intervals.
+   9. Phone exchange, node with highest id wins if duplicated streams.
+   10. Global stream manager with some locking for each bidirectional stream. IO is much more expensive than locking, especially for single writer, overhead should be negible.
+9. Rename to Kraft

@@ -9,7 +9,7 @@ use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
 use crate::quorum::worker::{QuorumTask, QuorumTaskResponseType, QuorumTaskType};
 use crate::raft::candidate::RaftCandidateStateDelegate;
 use crate::raft::follower::RaftFollowerStateDelegate;
-use crate::raft::raft_sm::{AppendEntries, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, RaftResponseMessage, RaftResponsePayload, RaftServerState, RaftVolatileState, RaftWriteBatchRequest, RaftWriteBatchResponse, RequestVoteRequest, SharedState, TermVote};
+use crate::raft::raft_sm::{AppendEntries, AppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, RaftResponseMessage, RaftResponsePayload, RaftServerState, RaftVolatileState, RaftWriteBatchRequest, RaftWriteBatchResponse, RequestVoteRequest, SharedState, TermVote};
 use crate::server::raftproto::{AppendEntriesRequest, LogEntry};
 use crate::service_utils::app_time::now_millis;
 
@@ -76,13 +76,13 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         });
 
         let message_type = OutstandingMessageType::WriteBatch{persistence_done: false, quorum_acks: 0, callback};
-        let response_span = tracing::span!(Level::INFO, "write_batch_outstanding_message_processing");
-        response_span.set_parent(span.context());
+        //let response_span = tracing::span!(Level::INFO, "write_batch_outstanding_message_processing");
+        //response_span.set_parent(span.context());
         let outstanding_message = OutstandingMessage{
             id: message_id,
             outstanding_responses: 1 + shared_state.quorum_worker_tasks.len() as i32,
             message_type,
-            span: response_span
+            span: Span::current()
         };
         shared_state.outstanding_messages.insert(message_id, outstanding_message);
 
@@ -97,10 +97,11 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         tracing::debug!("handling append entries for term: {}, current term: {}", append_entries_request.term, shared_state.server_state.current_term);
 
         if append_entries_request.term > shared_state.server_state.current_term {
-            tracing::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
+            log::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
             // TODO check if prev term or prev index is same as our own, else inform new leader that we need backfill.
             // New leader
             shared_state.server_state.current_term = append_entries_request.term;
+            shared_state.server_state.leader_id = append_entries_request.leader_id;
 
             let message_id = shared_state.next_message_id;
             shared_state.next_message_id += 1;
@@ -109,9 +110,14 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                 let task = QuorumTaskType::StopHeartbeats{ id: message_id };
                 task_queue.push(QuorumTask{task_type: task});
             });
+            if let Some(entry) = append_entries_request.entries.last() {
+                shared_state.volatile_server_state.last_log_index = entry.index;
+                shared_state.volatile_server_state.last_log_term = entry.term;
+                log::info!("updating last log term {} and index {}", entry.term, entry.index);
+            }
             callback.send(
                 RaftResponseMessage{
-                    payload: RaftResponsePayload::AppendEntries(true)
+                    payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::Ok)
                 }
             ).expect("sending append_entries callback failed");
             return RaftMessageStateChange::Follower(Box::new(RaftFollowerStateDelegate::new()));
@@ -120,7 +126,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             tracing::info!("Received append_entries request from lower term candidate: {}, {}", append_entries_request.term, append_entries_request.leader_id);
             callback.send(
                 RaftResponseMessage{
-                    payload: RaftResponsePayload::AppendEntries(false)
+                    payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::UnrecognizedLeader)
                 }
             ).expect("sending append_entries callback failed");
         }
@@ -159,8 +165,10 @@ impl RaftProtocol for RaftLeaderStateDelegate {
 
                 PersistenceResponseType::LogPersisted { id } => {
                     if let Some(mut msg) = shared_state.outstanding_messages.remove(&id) {
-                        let span_clone = msg.span.clone();
-                        let _entered = span_clone.enter();
+                        let span = tracing::span!(Level::INFO, "outstanding_message_log_persisted_processing");
+                        span.set_parent(msg.span.context());
+                        let _entered = span.enter();
+                        tracing::event!(Level::INFO, "handling log persisted");
                         let new_outstanding_resp = msg.outstanding_responses-1; // Maybe remove
                         match msg.message_type {
                             OutstandingMessageType::WriteBatch{persistence_done, quorum_acks, callback} => {
@@ -226,8 +234,10 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             match task.response_type {
                 QuorumTaskResponseType::AppendEntries { id, ok } => {
                     if let Some(mut msg) = shared_state.outstanding_messages.remove(&id) {
-                        let span_clone = msg.span.clone();
-                        let _entered = span_clone.enter();
+                        let span = tracing::span!(Level::INFO, "outstanding_message_quorum_append_entries_processing");
+                        span.set_parent(msg.span.context());
+                        let _entered = span.enter();
+                        tracing::event!(Level::INFO, "handling quorum append entries");
                         let new_outstanding_resp = msg.outstanding_responses-1;
 
                         match msg.message_type {
@@ -245,7 +255,6 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     callback.send(response).unwrap();
                                 } else if new_outstanding_resp > 0 {
                                     msg.outstanding_responses = new_outstanding_resp;
-                                    // TODO maybe not recreate this all of the time.
                                     let new_state = OutstandingMessageType::WriteBatch { persistence_done, quorum_acks: new_acks, callback};
                                     msg.message_type = new_state;
                                     shared_state.outstanding_messages.insert(id, msg);

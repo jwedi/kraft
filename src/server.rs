@@ -15,7 +15,7 @@ use crate::runtime_core::task_buffer::TaskBufferImpl;
 use crate::runtime_core::types::{Command, RuntimeTask, RuntimeTaskResponse, CommandType};
 use crate::server::raftproto::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse, PutBatchRequest, PutBatchResponse, PutResponse};
 use crate::service_utils::errors::ServiceError;
-use crate::raft::raft_sm::{RaftStateMachineExecutor, StateMachineExecutorImpl, RaftServerState, TermVote, RaftVolatileState, SharedState, RaftMessage, RaftMessagePayload, RequestVoteRequest, RaftResponseMessage, RaftResponsePayload, AppendEntries, RaftWriteBatchRequest};
+use crate::raft::raft_sm::{RaftStateMachineExecutor, StateMachineExecutorImpl, RaftServerState, TermVote, RaftVolatileState, SharedState, RaftMessage, RaftMessagePayload, RequestVoteRequest, RaftResponseMessage, RaftResponsePayload, AppendEntries, RaftWriteBatchRequest, AppendEntriesCallbackResponse};
 use crossbeam_queue::SegQueue;
 use tokio::sync::oneshot::error::RecvError;
 use tracing::{instrument, Instrument, Level, Span};
@@ -177,9 +177,20 @@ impl Raft for RaftServerImpl {
         let ok: bool = match receive_resp {
             Ok(resp) => {
                 match resp.payload {
-                    RaftResponsePayload::AppendEntries(ok) => {
-                        tracing::debug!("append entries response from channel ok: {}, term: {}, leader {}", ok, req.term, req.leader_id);
-                        ok
+                    RaftResponsePayload::AppendEntries(append_entries_resp) => {
+                        match append_entries_resp {
+                            AppendEntriesCallbackResponse::Ok => {
+                                true
+                            }
+                            AppendEntriesCallbackResponse::UnrecognizedLeader => {
+                                tracing::warn!("append entries response from channel received unrecognized leader: term: {}, leader {}", req.term, req.leader_id);
+                                false
+                            }
+                            AppendEntriesCallbackResponse::WantedPreviousEntry { last_term, last_index } => {
+                                tracing::warn!("append entries response from channel received wanted previous entry: last term {} last index {}, req term {} req index {}", last_term, last_index, req.prev_log_term, req.prev_log_index);
+                                false
+                            }
+                        }
                     }
                     RaftResponsePayload::None => {
                         tracing::error!("append entries unexpected response type {} {}, None", req.term, req.leader_id);

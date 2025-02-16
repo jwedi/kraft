@@ -11,7 +11,7 @@ use log::{info, warn};
 use tokio::sync::oneshot::{Receiver, Sender};
 use crate::runtime_core::task_buffer::TaskBufferImpl;
 use crate::runtime_core::types::{Command, RuntimeTask, RuntimeTaskResponse, CommandType};
-use crate::server::raftproto::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse};
+use crate::server::raftproto::{AppendEntriesRequest, AppendEntriesResponse, PutRequest, VoteRequest, VoteResponse};
 use crate::service_utils::errors::ServiceError;
 use crate::raft::raft_sm::{RaftStateMachineExecutor, StateMachineExecutorImpl, RaftServerState, TermVote, RaftVolatileState, SharedState, RaftMessage, RaftMessagePayload, RequestVoteRequest, RaftResponseMessage, RaftResponsePayload, AppendEntries, RaftWriteBatchRequest};
 use crossbeam_queue::SegQueue;
@@ -49,14 +49,17 @@ impl Datastore for DatastoreServerImpl {
     async fn put_record(&self, request: Request<PutDataStoreRecordRequest>) -> Result<Response<PutDataStoreRecordResponse>, Status> {
         tracing::debug!("received put_records request");
 
-        //let current = Span::current();
-        //Span::new_root(current.metadata().unwrap(), &field::ValueSet{});
         let req = request.into_inner();
+        let put_req = PutRequest {
+            id: Uuid::new_v4().to_string(),
+            node_id: 0,
+            payload: req.payload
+        };
         let callback: (Sender<WriteResponse>, Receiver<WriteResponse>) = oneshot::channel();
         let span = tracing::span!(Level::INFO, "awaiting_put_record");
         let msg = WriteBatch{
             batch_id: Uuid::new_v4().to_string(),
-            requests: vec![],
+            requests: vec![put_req],
             callback: callback.0,
             span_parent: Some(span.clone())
         };

@@ -68,15 +68,10 @@ async fn do_write_batch_async() -> Result<(), Box<dyn std::error::Error>> {
     let chans = vec![channel, channel2, channel3];
     let now = Utc::now();
 
-    // Use an `Arc` to share the client across tasks (or create new clients per request)
-    //let client = Arc::new(RaftClient::connect("http://[::1]:50051").await?);
-
     let times: Vec<i64> = vec![];
     let safe_times = Arc::new(Mutex::new(times));
-    // Create a vector of async tasks
     let tasks = (0..n_requests).map(|i| {
         let t = Arc::clone(&safe_times);
-        //let c = ;
         let mut client = DatastoreClient::new(chans[i%chans.len()].clone());
         async move {
             let mut request = tonic::Request::new(PutDataStoreRecordRequest {
@@ -84,11 +79,9 @@ async fn do_write_batch_async() -> Result<(), Box<dyn std::error::Error>> {
             });
             request.set_timeout(Duration::from_secs(1));
 
-            // Make the gRPC request
             let start = Utc::now();
             match client.put_record(request).await {
                 Ok(response) => {
-                    //println!("Task {} RESPONSE={:?}", i, response.into_inner());
                     let done_time = Utc::now();
                     let taken = done_time.sub(start);
                     let taken_millis = taken.num_milliseconds();
@@ -105,7 +98,6 @@ async fn do_write_batch_async() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Await all tasks in parallel
     future::join_all(tasks).await;
     let mut t = safe_times.lock().unwrap();
     let sum: i64 = t.iter().sum();
