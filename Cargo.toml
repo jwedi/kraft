@@ -1,14 +1,14 @@
 [package]
-name = "rusty_raft"
+name = "kraft"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]] # Bin to run the HelloWorld gRPC server
-name = "rusty-raft"
+name = "kraft"
 path = "src/main.rs"
 
 [[bin]] # Bin to run the HelloWorld gRPC client
-name = "rusty-raft-client"
+name = "kraft-client"
 path = "src/client.rs"
 
 [dependencies]
