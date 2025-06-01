@@ -40,6 +40,7 @@ async fn do_append_entries() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = RaftClient::connect("http://[::1]:50051").await?;
 
     let request = tonic::Request::new(AppendEntriesRequest {
+        request_id: 0,
         term: 1,
         leader_id: 1,
         prev_log_index: 0,
@@ -54,7 +55,7 @@ async fn do_append_entries() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn do_write_batch_async() -> Result<(), Box<dyn std::error::Error>> {
     // Define the number of requests to make
-    let n_requests = 10000;
+    let n_requests = 5000;
     // Create a shared channel
     let channel = Channel::from_static("http://[::1]:50051")
         .connect()
@@ -136,6 +137,7 @@ async fn do_append_entries_async() -> Result<(), Box<dyn std::error::Error>> {
         let mut client = RaftClient::new(channel.clone());
         async move {
             let request = tonic::Request::new(AppendEntriesRequest {
+                request_id: 0,
                 term: 1,
                 leader_id: 1,
                 prev_log_index: 0,

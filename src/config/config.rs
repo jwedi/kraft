@@ -14,7 +14,7 @@ pub struct AppConfig {
 }
 
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ClusterNode {
     pub endpoint: String,
     pub node_id: u32,

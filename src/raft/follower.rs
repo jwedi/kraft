@@ -54,6 +54,10 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
 
+            // TODO this isn't correct, fix when log backfill and storage works
+            shared_state.volatile_server_state.last_log_term = append_entries_request.term;
+            shared_state.volatile_server_state.last_log_index = 0;
+
             // TODO write data
             callback.send(
                 RaftResponseMessage{
@@ -63,9 +67,27 @@ impl RaftProtocol for RaftFollowerStateDelegate {
         } else if append_entries_request.term == shared_state.server_state.current_term { // TODO maybe check leader id.
             tracing::debug!("received append_entries request from current leader: {}, term: {}", append_entries_request.leader_id, append_entries_request.term);
 
+            // Check if heartbeat
+            if append_entries_request.request_id == 0 {
+                // Heartbeat request
+                self.election_timeout = now_plus_duration_millis(Duration::from_millis(self.rng.gen_range(self.election_timeout_min..self.election_timeout_max) as u64));
+
+                callback.send(
+                    RaftResponseMessage{
+                        payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::WantedPreviousEntry { last_term: shared_state.volatile_server_state.last_log_term, last_index: shared_state.volatile_server_state.last_log_index})
+                    }
+                ).expect("sending append_entries response callback failed");
+                return RaftMessageStateChange::None
+            }
+
             // Check request if valid in current state:
+
             if !self.validate_append_entries(&append_entries_request, shared_state.volatile_server_state.last_log_index, shared_state.volatile_server_state.last_log_term) {
                 log::info!("non-consecutive append log req: term {}, index: {}, state: term {}, index {}", append_entries_request.prev_term, append_entries_request.prev_index, shared_state.volatile_server_state.last_log_term, shared_state.volatile_server_state.last_log_index);
+
+                tracing::debug!("reset election timeout for term: {}", append_entries_request.term);
+                self.election_timeout = now_plus_duration_millis(Duration::from_millis(self.rng.gen_range(self.election_timeout_min..self.election_timeout_max) as u64));
+
                 callback.send(
                     RaftResponseMessage{
                         payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::WantedPreviousEntry { last_term: shared_state.volatile_server_state.last_log_term, last_index: shared_state.volatile_server_state.last_log_index})

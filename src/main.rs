@@ -7,7 +7,7 @@ use server::RaftServerImpl;
 use tonic::{transport::Server, Request, Response, Status};
 use crate::server::ping::ping_pong_server::PingPongServer;
 use crate::server::raftproto::raft_server::RaftServer;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use log::{info, log, warn};
 use tokio::sync::mpsc::{Receiver, Sender};
 use crate::runtime_core::task_buffer;
@@ -31,8 +31,10 @@ use crate::config::config::{ClusterNode, read_config};
 use crate::persistence::worker::{PersistenceConfig, PersistenceResponseType, PersistenceTaskType, PersistenceWorker, VoteRow};
 use crate::quorum::worker::{QuorumResponse, QuorumTask, QuorumWorker};
 use crate::raft::raft_sm::{OutstandingMessage, RaftMessage, RaftServerState, RaftVolatileState, SharedState};
+use crate::server::raftproto::QuorumMessage;
 use crate::transport::datastore::datastoreproto::datastore_server::DatastoreServer;
 use crate::transport::datastore::DatastoreServerImpl;
+use crate::transport::stream_manager::StreamManagerImpl;
 use crate::transport::write_proxy::{WriteBatch, WriteProxy};
 
 
@@ -72,6 +74,7 @@ mod config {
 mod transport {
     pub mod datastore;
     pub mod write_proxy;
+    pub mod stream_manager;
 }
 
 mod client {
@@ -115,7 +118,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task_queue = Arc::new(SegQueue::<RaftMessage>::new());
     let worker_queue = Arc::clone(&task_queue);
     let api_raft_queue = Arc::clone(&task_queue);
-    let raft_server = RaftServerImpl{task_queue: api_raft_queue, self_id: cfg.node_id };
     let api_write_work_queue = Arc::new(SegQueue::<WriteBatch>::new());
     let proxy_write_work_queue = Arc::clone(&api_write_work_queue);
     let datastore_server = DatastoreServerImpl{task_queue: api_write_work_queue};
@@ -149,7 +151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_applied: 0,
         last_log_index: 0,
         last_log_term: 0,
-        next_term: server_state.current_term+1
+        next_term: server_state.current_term+1,
+        next_log_index: 0,
     };
 
 
@@ -167,6 +170,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let outstanding_messages: HashMap<u64, OutstandingMessage> = HashMap::new();
 
+    let send_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<mpsc::UnboundedSender<QuorumMessage>>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let receive_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<tonic::Streaming<QuorumMessage>>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let sm: StreamManagerImpl = StreamManagerImpl::new(
+        node_id,
+        Vec::clone(&cluster_nodes_without_self),
+        send_streams,
+        receive_streams
+    );
+    let sm_arc = Arc::new(sm);
+    let raft_server = RaftServerImpl{task_queue: api_raft_queue, self_id: cfg.node_id, stream_manager: Arc::clone(&sm_arc)};
+
     // For each cluster_nodes_without_self
     let mut quorum_send_channels: Vec<Arc<SegQueue<QuorumTask>>> = vec![];
     let cluster_workers: Vec<QuorumWorker> = cluster_nodes_without_self.iter().map(|node| {
@@ -180,7 +194,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.node_id.into(),
             0,
             node.node_id.into(),
-            node.endpoint.clone()
+            node.endpoint.clone(),
+            Arc::clone(&sm_arc),
+            Arc::clone(&task_queue)
         )
     }).collect();
 
@@ -204,7 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let proxy_raft_queue = Arc::clone(&task_queue);
             let mut wp = WriteProxy::new(
                 proxy_write_work_queue,
-                8192,
+                4096,
                 proxy_raft_queue,
                 cfg.node_id,
                 cluster_nodes_without_self

@@ -41,9 +41,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
     }
 
     fn write_batch(&mut self, write_batch_request: RaftWriteBatchRequest, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) {
-        tracing::info!("leader handling writing batches {}", write_batch_request.requests.len());
         let message_id = shared_state.next_message_id;
-        let mut idx = shared_state.volatile_server_state.last_log_index +1;
+        log::info!("leader handling writing batches {} as message id: {}", write_batch_request.requests.len(), message_id);
+        let mut idx = shared_state.volatile_server_state.next_log_index;
         shared_state.next_message_id += 1;
 
         let span = tracing::span!(Level::INFO, "delegate_write_batch");
@@ -64,6 +64,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                 entries: vec![le],
                 prev_log_index: shared_state.volatile_server_state.last_log_index,
                 prev_log_term: shared_state.volatile_server_state.last_log_term,
+                request_id: message_id
             };
 
             let quorum_span = Span::current();
@@ -88,6 +89,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
 
         shared_state.volatile_server_state.last_log_term = shared_state.server_state.current_term;
         shared_state.volatile_server_state.last_log_index = idx;
+        shared_state.volatile_server_state.next_log_index = idx +1;
     }
 
     fn append_entries(&mut self, append_entries_request: AppendEntries, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
@@ -99,6 +101,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         if append_entries_request.term > shared_state.server_state.current_term {
             log::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
             // TODO check if prev term or prev index is same as our own, else inform new leader that we need backfill.
+
             // New leader
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
@@ -140,6 +143,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         if !self.initialized {
             let message_id = shared_state.next_message_id;
             shared_state.next_message_id += 1;
+            shared_state.volatile_server_state.next_log_index = 0;
 
             // Tell quorum workers to start sending heartbeats.
             shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
@@ -174,7 +178,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                             OutstandingMessageType::WriteBatch{persistence_done, quorum_acks, callback} => {
                                 if quorum_acks >= shared_state.quorum_size {
                                     // Persistence done and replicated to quorum of nodes
-                                    tracing::info!("Write batch with message id {} has been persisted on quorum of nodes", id);
+                                    log::info!("Write batch with message id {} has been persisted on quorum of nodes", id);
                                     // TODO update commit index and apply to data structure.
                                     let r = RaftWriteBatchResponse{
                                         responses: vec![], // TODO
@@ -198,11 +202,11 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                 callback.send(response).unwrap();
                             }
                             _ => {
-                                tracing::error!(message = "Received unexpected outstanding_messages type for PersistenceResponseType.LogPersisted", id);
+                                log::error!("Received unexpected outstanding_messages type for PersistenceResponseType.LogPersisted {}", id);
                             }
                         }
                     } else {
-                        tracing::error!(message = "LogPersisted event with no outstanding message registered", id);
+                        log::error!("LogPersisted event with no outstanding message registered {}", id);
                     }
                 }
                 PersistenceResponseType::VotePersisted { id, term, candidate_id } => {
@@ -215,17 +219,17 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                 callback.send(response).unwrap();
                             }
                             _ => {
-                                tracing::error!(message = "Received unexpected outstanding_messages type for PersistenceResponseType.VotePersisted", id);
+                                log::error!("Received unexpected outstanding_messages type for PersistenceResponseType.VotePersisted {}", id);
                             }
                         }
 
                     } else {
-                        tracing::error!(message = "Received persistence event with no outstanding message registered", id);
+                        tracing::error!("Received persistence event with no outstanding message registered {}", id);
                     }
                 }
 
                 v => {
-                    tracing::error!("Persistence event not valid in current state");
+                    log::error!("Persistence event not valid in current state");
                 }
             }
         }
@@ -245,7 +249,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                 let new_acks = quorum_acks +1;
                                 if new_acks >= shared_state.quorum_size && persistence_done {
                                     // Log replication done
-                                    tracing::info!("Write batch with message id {} has been persisted on quorum of nodes", id);
+                                    log::info!("Write batch with message id {} has been persisted on quorum of nodes", id);
                                     let r = RaftWriteBatchResponse{
                                         responses: vec![], // TODO
                                         err: None
@@ -259,21 +263,22 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     msg.message_type = new_state;
                                     shared_state.outstanding_messages.insert(id, msg);
                                 } else {
-                                    tracing::info!(message = "All nodes have acked write batch", id);
+                                    log::info!("All nodes have acked write batch {}", id);
                                 }
                             }
 
                             _ => {
-                                tracing::error!(message = "Received invalid outstanding quorum message in current state", id);
+                                log::error!("Received invalid outstanding quorum message in current state {}", id);
                             }
                         }
                     } else {
-                        tracing::error!(message = "Received quorum event with no outstanding message registered", id);
+                        log::error!("Received quorum event with no outstanding message registered {}", id);
                     }
                 }
 
                 e => {
-                    tracing::error!(message = "Received invalid quorum response message in current state");
+
+                    log::error!("Received invalid quorum response message in current state");
                 }
             }
         }

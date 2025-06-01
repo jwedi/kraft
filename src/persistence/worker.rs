@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::{BufWriter, Bytes, Write};
 use std::path::Path;
@@ -72,6 +72,23 @@ impl PersistenceWorker {
 
     pub fn run(&mut self) {
         tracing::info!("Running persistence worker");
+
+        let mut log_write_file_handle = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(format!("{}log.pb", self.persistence_config.out_dir))
+            .unwrap();
+        let mut log_write_buffer = BufWriter::new(log_write_file_handle);
+
+        let mut vote_write_file_handle = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(format!("{}votes.csv", self.persistence_config.out_dir))
+            .unwrap();
+        let mut vote_write_buffer = WriterBuilder::new().has_headers(false).from_writer(vote_write_file_handle);
+
         loop {
             let queue_len = self.work_queue.len();
             if queue_len > 5 {
@@ -87,7 +104,7 @@ impl PersistenceWorker {
                             span.set_parent(parent_span.context());
                             let _enter = span.enter();
                             tracing::info!("Saving vote message {}, term {}, candidate {}", id, term, candidate_id);
-                            self.persist_vote(term, candidate_id).unwrap();
+                            self.persist_vote(term, candidate_id, & mut vote_write_buffer).unwrap();
                             self.response_queue.push(PersistenceResponseType::VotePersisted{id, term, candidate_id})
                         }
                         PersistenceTaskType::ReadVotes{id, span} => {
@@ -103,7 +120,7 @@ impl PersistenceWorker {
                             let span = tracing::span!(Level::INFO, "persistence_append_log", id=id, bytes=data.len());
                             span.set_parent(parent_span.context());
                             let _enter = span.enter();
-                            self.append_log(&data).unwrap();
+                            self.append_log(&data, & mut log_write_buffer).unwrap();
                             self.response_queue.push(PersistenceResponseType::LogPersisted{id})
                         }
                     }
@@ -116,31 +133,18 @@ impl PersistenceWorker {
         }
     }
 
-    pub fn persist_vote(&mut self, term: u64, candidate_id: u32) -> Result<(), Box<dyn Error>> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(format!("{}votes.csv", self.persistence_config.out_dir))
-            .unwrap();
-        let mut wtr = WriterBuilder::new().has_headers(false).from_writer(file);
-        wtr.serialize(VoteRow {
+    pub fn persist_vote(&mut self, term: u64, candidate_id: u32, file_handle: & mut Writer<File>) -> Result<(), Box<dyn Error>> {
+        file_handle.serialize(VoteRow {
             term,
             candidate_id
         })?;
-        wtr.flush()?;
+        file_handle.flush()?;
         Ok(())
     }
 
-    fn append_log(&mut self, buffer: &[u8]) -> io::Result<()> {
-        let mut file_handle = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(format!("{}log.pb", self.persistence_config.out_dir))
-            .unwrap();
-        let mut file = BufWriter::new(file_handle);
-        file.write_all(buffer)?;
+    fn append_log(&mut self, buffer: &[u8], file_handle: & mut BufWriter<File>) -> io::Result<()> {
+        file_handle.write_all(buffer)?;
+        file_handle.flush()?;
         Ok(())
     }
 

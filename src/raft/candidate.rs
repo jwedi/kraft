@@ -45,6 +45,11 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         if append_entries_request.term >= shared_state.server_state.current_term {
             log::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
             // TODO check if prev term or prev index is same as our own, else inform new leader that we need backfill.
+
+            // TODO this isn't correct, fix when log backfill and storage works
+            shared_state.volatile_server_state.last_log_term = append_entries_request.term;
+            shared_state.volatile_server_state.last_log_index = 1;
+
             // New leader
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
@@ -94,7 +99,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
 
                                 if quorum_votes >= shared_state.quorum_size {
                                     // Candidate election done, Transition to leader.
-                                    tracing::info!(message = "Node elected leader for term", term);
+                                    log::info!("Node elected leader for term {}", term);
                                     return RaftMessageStateChange::Leader(Box::new(RaftLeaderStateDelegate::new()));
                                 } else {
                                     msg.outstanding_responses = new_outstanding_resp;
@@ -105,12 +110,12 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                 }
                             }
                             _ => {
-                                tracing::error!(message = "Received unexpected outstanding_messages type for PersistenceResponseType.VotePersisted", id);
+                                log::error!("Received unexpected outstanding_messages type for PersistenceResponseType.VotePersisted {}", id);
                             }
                         }
 
                     } else {
-                        tracing::error!(message = "Received persistence event with no outstanding message registered", id);
+                        log::error!("Received persistence event with no outstanding message registered {}", id);
                     }
                 }
                 PersistenceResponseType::LogPersisted { id } => {
@@ -123,12 +128,12 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                 callback.send(response).unwrap();
                             }
                             _ => {
-                                tracing::error!(message = "Received unexpected outstanding_messages type for PersistenceResponseType.LogPersisted", id);
+                                log::error!("Received unexpected outstanding_messages type for PersistenceResponseType.LogPersisted {}", id);
                             }
 
                         }
                     } else {
-                        tracing::error!(message = "LogPersisted event with no outstanding message registered", id);
+                        log::error!("LogPersisted event with no outstanding message registered {}", id);
                     }
                 }
             }
@@ -179,16 +184,16 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                             }
 
                             _ => {
-                                tracing::error!(message = "Received invalid quorum event in current state");
+                                log::error!("Received invalid quorum event in current state");
                             }
                         }
                     } else {
-                        tracing::error!(message = "Received quorum event with no outstanding message registered", id);
+                        log::error!("Received quorum event with no outstanding message registered {}", id);
                     }
                 }
 
                 _ => {
-                    tracing::error!(message = "Received invalid quorum event in current state");
+                    log::error!("Received invalid quorum event in current state");
                 }
             }
         }
@@ -197,11 +202,11 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         if self.initiate_election_timeout < now {
             // Initiate ProposeVote procedure.
             let message_id = shared_state.next_message_id;
-            tracing::warn!("Initiating election due to timeout {}, now {}, id {}", self.initiate_election_timeout, now, message_id);
+            log::warn!("Initiating election due to timeout {}, now {}, id {}", self.initiate_election_timeout, now, message_id);
             shared_state.next_message_id += 1;
             let next_term = shared_state.volatile_server_state.next_term; // TODO should be larger than any term previously proposed.
             if let Some(already_voted) = shared_state.term_votes.get(&next_term) {
-                tracing::error!("trying to start an election for a term it has already voted {}", next_term)
+                log::error!("trying to start an election for a term it has already voted {}", next_term)
             }
             shared_state.volatile_server_state.next_term = next_term+1;
             let new_election = OngoingElection{ term: next_term, started_millis: now };
