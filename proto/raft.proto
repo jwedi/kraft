@@ -7,6 +7,14 @@ message AppendEntriesRequest {
     uint64 prev_log_index = 3;
     uint64 prev_log_term = 4;
     repeated LogEntry entries = 5;
+    uint64 request_id = 6;
+}
+
+message AppendEntriesAcknowledge {
+    uint64 term = 1;
+    uint64 log_index = 2;
+    uint64 request_id = 3;
+    bool ok = 4;
 }
 
 message AppendEntriesResponse {
@@ -25,10 +33,13 @@ message VoteRequest {
     uint32 candidate_id = 2;
     uint64 last_log_index = 3;
     uint64 last_log_term = 4;
+    uint64 request_id = 5;
 }
 
 message VoteResponse {
     bool vote_granted = 1;
+    uint64 request_id = 2;
+    uint64 term = 3;
 }
 
 message PutRequest {
@@ -59,9 +70,33 @@ message PutBatchResponse {
     repeated PutResponse responses = 1;
 }
 
+message ConnectRequest {
+    uint32 node_id = 1;
+}
+
+message ConnectResponse {
+    bool ok = 1;
+}
+
+message QuorumMessage {
+    oneof message_payload {
+        ConnectRequest connect_request_option = 1;
+        ConnectResponse connect_response_option = 2;
+        VoteRequest vote_request_option = 3;
+        VoteResponse vote_response_option = 4;
+        AppendEntriesRequest append_entries_request_option = 5;
+        AppendEntriesAcknowledge append_entries_acknowledge_option = 6;
+    }
+}
+
+message StreamResponse {
+
+}
+
 service Raft {
     rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
     rpc RequestVote (VoteRequest) returns (VoteResponse);
     rpc PutBatch (PutBatchRequest) returns (PutBatchResponse);
+    rpc Messages(stream QuorumMessage) returns (StreamResponse);
 }
 

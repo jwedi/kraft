@@ -330,7 +330,9 @@ impl WriteProxy {
             // Checking once per batch shouldn't be a big deal as well, but will test out if it's better.
             // Realistically, this is just stupid.
             // Something like a atomic integer that's shared between the write proxy and the state machine could also work.
-            if current_leader_id <= 0 || leader_resync.elapsed().as_millis() > 10 {
+
+            //if current_leader_id <= 0 || leader_resync.elapsed().as_millis() > 10 {
+            if true {
                 let span = Span::current();
                 let chan: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
                 let payload = RaftMessagePayload::GetRaftState;
@@ -453,102 +455,6 @@ impl WriteProxy {
                         }
                     }
                 }
-
-                /*
-                let span = tracing::span!(Level::INFO, "write_proxy_raft_state_await", batches=batch.len());
-                span.set_parent(new_root.context());
-
-                let chan: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
-                let payload = RaftMessagePayload::GetRaftState;
-                let raft_message = RaftMessage {
-                    payload,
-                    callback: chan.0,
-                    parent_span: span.clone()
-                };
-                self.task_queue.push(raft_message);
-                let resp = chan.1.instrument(span).await;
-                match resp {
-                    Ok(m) => {
-                        match &m.payload {
-                            RaftResponsePayload::RaftState { leader_id } => {
-                                let write_batch_span = tracing::span!(Level::INFO, "write_proxy_write_batch_await");
-                                write_batch_span.set_parent(new_root.context());
-
-                                let mut preparation = WriteProxy::prepare_batch_and_callbacks(batch);
-                                let all_requests = preparation.0;
-                                let mut batch_callbacks = preparation.1;
-
-                                if self.self_id == *leader_id {
-                                    // Node is the leader
-                                    let chan: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
-                                    let payload = RaftMessagePayload::WriteBatch(
-                                        RaftWriteBatchRequest {
-                                            requests: all_requests,
-                                            serialized: vec![1, 2, 3] // TODO
-                                        }
-                                    );
-                                    let span = tracing::span!(Level::INFO, "write_proxy_local_batch_forward_await");
-                                    span.set_parent(new_root.context());
-                                    let raft_message = RaftMessage {
-                                        payload,
-                                        callback: chan.0,
-                                        parent_span: span.clone()
-                                    };
-                                    self.task_queue.push(raft_message);
-                                    join_set.spawn(async {
-                                        WriteProxy::handle_local_write_response(chan.1, span.clone(), batch_callbacks).instrument(span).await;
-                                    });
-                                } else {
-                                    match self.get_client(*leader_id).await {
-                                        Ok(mut client) => {
-                                            let put_batch_span = tracing::span!(Level::INFO, "write_proxy_remote_put_batch");
-                                            put_batch_span.set_parent(new_root.context());
-                                            let request = WriteProxy::prepare_put_batch_request(all_requests, put_batch_span.clone(), &self.propagator);
-
-                                            let p = new_root.clone();
-                                            join_set.spawn(async {
-                                                WriteProxy::send_remote_put_batch_and_handle_response(client, request, batch_callbacks, p).instrument(put_batch_span).await
-                                            });
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("Setting up remote client failed with error: {}", e);
-                                            for b in batch_callbacks {
-                                                let msg = WriteResponse {
-                                                    responses: vec![],
-                                                    status_code: StatusCode::INTERNAL_SERVER_ERROR
-                                                };
-                                                b.1.send(msg);
-                                            }
-                                        }
-                                    }
-                                }
-                                let delta = now_millis() - start_time;
-                                if delta < 5 {
-                                    tokio::time::sleep(Duration::from_millis(delta as u64)).await;
-                                }
-                                //  Clean up completed tasks
-                                while let Some(result) = join_set.try_join_next() {
-                                    match result {
-                                        Ok(_) => {
-                                            // Handle successful completion if needed
-                                        }
-                                        Err(e) => {
-                                            log::error!("A task failed: {:?}", e);
-                                        }
-                                    }
-                                }
-                            }
-                            default => {
-                                tracing::error!("Received unexpected raft response payload type, expected RaftState");
-                                log::error!("Received unexpected raft response payload type, expected RaftState")
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::error!("Reading raft response message failed: {}", err);
-                        log::error!("Reading raft response message failed: {}", err)
-                    }
-                }*/
             } else {
                 tokio::time::sleep(Duration::from_micros(300)).await;
             }

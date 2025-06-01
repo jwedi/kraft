@@ -138,14 +138,18 @@ Write flow. Done
 
 
 TODOs update:
-1. Verify append entries prev index being sent correctly.
-2. Respect append entries prev index in follower, i.e don't commit if append entries prev index doesn't match follower last index
+1. Verify append entries prev index being sent correctly. Done
+2. Respect append entries prev index in follower, i.e don't commit if append entries prev index doesn't match follower last index. Done
 3. Some sort of backfilling in follower, notify leader of the services last index and term so that leader can send log entries for backfilling.
 4. Actually serialize real data and persist to disk.
 5. Read log entries from disk on bootup and bootstrap config based on persisted log stuff.
 6. Metrics
 7. Metrics exporter
-8. Bidirectional stream for quorum workers. Ensures append log is delivered in-order. Maybe quorum worker try establish connections at random intervals.
+8. Bidirectional stream for quorum workers. Ensures append log is delivered in-order. Maybe quorum worker try establish connections at random intervals. Done
    9. Phone exchange, node with highest id wins if duplicated streams.
    10. Global stream manager with some locking for each bidirectional stream. IO is much more expensive than locking, especially for single writer, overhead should be negible.
-9. Rename to Kraft
+9. Rename to Kraft, Done
+10. Validate business logic on leader before commit
+11. Redo and initiate tracing for write proxy batch.
+12. Performance profiling.
+13. Emit writes to learners?

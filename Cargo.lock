@@ -1302,6 +1302,7 @@ dependencies = [
  "serde",
  "time",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
  "tracing",

@@ -41,6 +41,7 @@ pub struct RaftVolatileState {
     pub last_log_index: u64,
     pub last_log_term: u64,
     pub next_term: u64,// 1 more than the largest term value seen.
+    pub next_log_index: u64,
 }
 
 pub enum OutstandingMessageType {
@@ -92,15 +93,15 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
         match state_change {
             RaftMessageStateChange::None => {}
             RaftMessageStateChange::Candidate(new_state) => {
-                tracing::info!(message = "State change to Candidate.");
+                log::info!("State change to Candidate.");
                 self.state_delegate = new_state
             }
             RaftMessageStateChange::Follower(new_state) => {
-                tracing::info!(message = "State change to Follower.");
+                log::info!("State change to Follower.");
                 self.state_delegate = new_state
             }
             RaftMessageStateChange::Leader(new_state) => {
-                tracing::info!(message = "State change to Leader.");
+                log::info!("State change to Leader.");
                 self.state_delegate = new_state
             }
         }
@@ -165,7 +166,7 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                 if self.state_delegate.get_node_type() == RaftNodeType::Leader {
                     self.state_delegate.write_batch(batch, raft_message.callback, &mut self.shared_state)
                 } else {
-                    tracing::error!("Received write batch as non-leader.");
+                    log::error!("Received write batch as non-leader. Leader is {}", self.shared_state.server_state.leader_id);
                     let resp = RaftWriteBatchResponse{
                         responses: vec![],
                         err: Some("Received write batch as non-leader".to_string())
@@ -246,7 +247,8 @@ pub struct AppendEntries {
     pub entries: Vec<LogEntry>,
     pub prev_index: u64,
     pub prev_term: u64,
-    pub serialized: Vec<u8>
+    pub serialized: Vec<u8>,
+    pub request_id: u64,
 }
 
 pub struct RaftMessage {
