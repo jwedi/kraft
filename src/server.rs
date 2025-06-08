@@ -115,7 +115,6 @@ impl Raft for RaftServerImpl {
         let callback: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
         let payload = RaftMessagePayload::WriteBatch(RaftWriteBatchRequest{
             requests: req.put_request,
-            serialized: vec![]
         });
 
         let span = tracing::span!(Level::INFO, "awaiting_put_batch");
@@ -183,8 +182,8 @@ impl Raft for RaftServerImpl {
             prev_index: req.prev_log_index,
             prev_term: req.prev_log_term,
             entries: req.entries,
-            serialized: vec![], // TODO
-            request_id: req.request_id
+            request_id: req.request_id,
+            entry: req.entry
         });
         let span = tracing::span!(Level::INFO, "awaiting_append_entries");
         let msg = RaftMessage{

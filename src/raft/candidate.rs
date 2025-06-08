@@ -47,18 +47,18 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             // TODO check if prev term or prev index is same as our own, else inform new leader that we need backfill.
 
             // TODO this isn't correct, fix when log backfill and storage works
-            shared_state.volatile_server_state.last_log_term = append_entries_request.term;
-            shared_state.volatile_server_state.last_log_index = 1;
+            //shared_state.volatile_server_state.last_log_term = append_entries_request.term;
+            //shared_state.volatile_server_state.last_log_index = 1;
 
             // New leader
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
             shared_state.volatile_server_state.next_term = append_entries_request.term +1;
 
-            if let Some(entry) = append_entries_request.entries.last() {
+            if let Some(entry) = append_entries_request.entry {
                 shared_state.volatile_server_state.last_log_index = entry.index;
                 shared_state.volatile_server_state.last_log_term = entry.term;
-                log::info!("updating last log term {} and index {}", entry.term, entry.index);
+                log::debug!("updating last log term {} and index {}", entry.term, entry.index);
             }
 
             callback.send(

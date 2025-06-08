@@ -45,6 +45,7 @@ mod raft_runtime {
 mod service_utils {
     pub mod errors;
     pub mod app_time;
+    pub mod storage_utils;
 }
 
 mod runtime_core {
@@ -152,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_log_index: 0,
         last_log_term: 0,
         next_term: server_state.current_term+1,
-        next_log_index: 0,
+        next_log_index: 1,
     };
 
 
@@ -220,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let proxy_raft_queue = Arc::clone(&task_queue);
             let mut wp = WriteProxy::new(
                 proxy_write_work_queue,
-                4096,
+                256,
                 proxy_raft_queue,
                 cfg.node_id,
                 cluster_nodes_without_self

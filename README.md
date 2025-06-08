@@ -135,21 +135,28 @@ Write flow. Done
 3. Write proxy batches requests into a smart batch and then forwards to leader.
 4. (Leader can't be having the combined RPS of all nodes)
 5. Would maybe not need to have leader level batching if that is the case.
+6. Leader picks up a write batch from queue
+7. It validates incoming write requests.
+8. It serializes the data in a format that can be written to disk.
+9. It writes the serialized data to the persistence handler and all quorum workers.
+10. When data is persisted locally and on quorum of nodes it triggers the batch callback and notifies learners.
 
 
 TODOs update:
 1. Verify append entries prev index being sent correctly. Done
 2. Respect append entries prev index in follower, i.e don't commit if append entries prev index doesn't match follower last index. Done
 3. Some sort of backfilling in follower, notify leader of the services last index and term so that leader can send log entries for backfilling.
-4. Actually serialize real data and persist to disk.
-5. Read log entries from disk on bootup and bootstrap config based on persisted log stuff.
-6. Metrics
-7. Metrics exporter
-8. Bidirectional stream for quorum workers. Ensures append log is delivered in-order. Maybe quorum worker try establish connections at random intervals. Done
-   9. Phone exchange, node with highest id wins if duplicated streams.
-   10. Global stream manager with some locking for each bidirectional stream. IO is much more expensive than locking, especially for single writer, overhead should be negible.
-9. Rename to Kraft, Done
-10. Validate business logic on leader before commit
-11. Redo and initiate tracing for write proxy batch.
-12. Performance profiling.
-13. Emit writes to learners?
+4. Read log entries from disk on bootup and bootstrap config based on persisted log stuff.
+5. Fix log replication on restarted node. Currently starts up with previous log index being 0.
+6. Actually serialize real data and persist to disk. Done
+7. Metrics
+8. Metrics exporter
+9. Bidirectional stream for quorum workers. Ensures append log is delivered in-order. Maybe quorum worker try establish connections at random intervals. Done 
+- Phone exchange, node with highest id wins if duplicated streams.
+- Global stream manager with some locking for each bidirectional stream. IO is much more expensive than locking, especially for single writer, overhead should be negible.
+10. Rename to Kraft, Done
+11. Validate business logic on leader before commit
+12. Redo and initiate tracing for write proxy batch.
+13. Performance profiling. 
+14. Emit writes to learners?
+15. Send commit index in append entries after persisted on quorum of nodes.

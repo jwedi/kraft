@@ -1,7 +1,13 @@
 use std::sync::Arc;
 use crossbeam_queue::SegQueue;
+use prost::bytes::BufMut;
 use rand::Rng;
 use rand::rngs::ThreadRng;
+use sbe_kraft_replication_schema::command_codec::CommandEncoder;
+use sbe_kraft_replication_schema::log_entry_codec::encoder::CommandsEncoder;
+use sbe_kraft_replication_schema::log_entry_codec::LogEntryEncoder;
+use sbe_kraft_replication_schema::{message_header_codec, WriteBuf};
+use sbe_kraft_replication_schema::command_type::CommandType;
 use tokio::sync::oneshot;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -10,8 +16,9 @@ use crate::quorum::worker::{QuorumTask, QuorumTaskResponseType, QuorumTaskType};
 use crate::raft::candidate::RaftCandidateStateDelegate;
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::raft::raft_sm::{AppendEntries, AppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, RaftResponseMessage, RaftResponsePayload, RaftServerState, RaftVolatileState, RaftWriteBatchRequest, RaftWriteBatchResponse, RequestVoteRequest, SharedState, TermVote};
-use crate::server::raftproto::{AppendEntriesRequest, LogEntry};
+use crate::server::raftproto::{AppendEntriesRequest, LogEntry, PutRequest};
 use crate::service_utils::app_time::now_millis;
+use crate::service_utils::storage_utils::{SerializationData, serialize_data};
 
 pub struct RaftLeaderStateDelegate {
     election_timeout: u128,
@@ -42,29 +49,37 @@ impl RaftProtocol for RaftLeaderStateDelegate {
 
     fn write_batch(&mut self, write_batch_request: RaftWriteBatchRequest, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) {
         let message_id = shared_state.next_message_id;
-        log::info!("leader handling writing batches {} as message id: {}", write_batch_request.requests.len(), message_id);
         let mut idx = shared_state.volatile_server_state.next_log_index;
+        log::info!("leader handling writing batches {} as message id: {} with index: {}", write_batch_request.requests.len(), message_id, idx);
         shared_state.next_message_id += 1;
 
         let span = tracing::span!(Level::INFO, "delegate_write_batch");
         let _enter = span.enter();
-        let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: write_batch_request.serialized, parent_span: Span::current()};
+        // TODO validate request
+        // TODO serialize valid request bits
+        let mut buffer = vec![0u8; 2048];
+        let offset = 0usize;
+        let (limit, mut data) = serialize_data(SerializationData{index: idx, term: shared_state.server_state.current_term, timestamp: now_millis() as u64, requests: write_batch_request.requests}, buffer, offset);
+        data.truncate(limit);
+        let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: data.clone(), parent_span: Span::current(), request_id: message_id};
         shared_state.persistence_work.push(persistence_task);
 
+        // TODO log entry command should be just bytes
         shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
             let le = LogEntry { // TODO
                 index: idx,
-                command: "data".to_string(),
+                data: data.clone(), // TODO maybe fundamental problem with the approach, doesn't support IO without copies...
                 batch_index: idx,
                 term: shared_state.server_state.current_term
             };
-            let req = AppendEntriesRequest { // TODO
+            let req = AppendEntriesRequest {
                 term: shared_state.server_state.current_term,
                 leader_id: shared_state.server_state.leader_id,
-                entries: vec![le],
+                entries: vec![],
                 prev_log_index: shared_state.volatile_server_state.last_log_index,
                 prev_log_term: shared_state.volatile_server_state.last_log_term,
-                request_id: message_id
+                request_id: message_id,
+                entry: Some(le)
             };
 
             let quorum_span = Span::current();
@@ -88,8 +103,8 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         shared_state.outstanding_messages.insert(message_id, outstanding_message);
 
         shared_state.volatile_server_state.last_log_term = shared_state.server_state.current_term;
-        shared_state.volatile_server_state.last_log_index = idx;
         shared_state.volatile_server_state.next_log_index = idx +1;
+        shared_state.volatile_server_state.last_log_index = idx;
     }
 
     fn append_entries(&mut self, append_entries_request: AppendEntries, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
@@ -105,6 +120,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             // New leader
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
+            shared_state.volatile_server_state.next_term = append_entries_request.term +1;
 
             let message_id = shared_state.next_message_id;
             shared_state.next_message_id += 1;
@@ -113,10 +129,10 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                 let task = QuorumTaskType::StopHeartbeats{ id: message_id };
                 task_queue.push(QuorumTask{task_type: task});
             });
-            if let Some(entry) = append_entries_request.entries.last() {
+            if let Some(entry) = append_entries_request.entry {
                 shared_state.volatile_server_state.last_log_index = entry.index;
                 shared_state.volatile_server_state.last_log_term = entry.term;
-                log::info!("updating last log term {} and index {}", entry.term, entry.index);
+                log::debug!("updating last log term {} and index {}", entry.term, entry.index);
             }
             callback.send(
                 RaftResponseMessage{

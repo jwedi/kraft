@@ -17,7 +17,7 @@ pub enum PersistenceTaskType {
     ReadState{id: u64, span: Span},
     AppendVote{id: u64, term: u64, candidate_id: u32, parent_span: Span},
     ReadVotes{id: u64, span: Span},
-    AppendLog{id: u64, data: Vec<u8>, parent_span: Span}
+    AppendLog{id: u64, data: Vec<u8>, parent_span: Span, request_id: u64}
     // Can either be RC / Arc and immutable, or copied, or immutable and the persistence worker serializes while waiting for IO sync.
     // Preparing next batch while waiting for IO sync seems reasonable.
     // Now sure how to avoid IO if that's the case.
@@ -77,7 +77,7 @@ impl PersistenceWorker {
             .write(true)
             .create(true)
             .append(true)
-            .open(format!("{}log.pb", self.persistence_config.out_dir))
+            .open(format!("{}log.sbe", self.persistence_config.out_dir))
             .unwrap();
         let mut log_write_buffer = BufWriter::new(log_write_file_handle);
 
@@ -116,7 +116,8 @@ impl PersistenceWorker {
                         PersistenceTaskType::WriteState{id, span} => {
                             let _enter = span.enter();
                         }
-                        PersistenceTaskType::AppendLog {id, data, parent_span} => {
+                        PersistenceTaskType::AppendLog {id, data, parent_span, request_id} => {
+                            log::debug!("Appending log entry with id {} and data length {}", request_id, data.len());
                             let span = tracing::span!(Level::INFO, "persistence_append_log", id=id, bytes=data.len());
                             span.set_parent(parent_span.context());
                             let _enter = span.enter();

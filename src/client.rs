@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use datastoreproto::datastore_client::{DatastoreClient};
 use crate::datastoreproto::PutDataStoreRecordRequest;
 use chrono::Utc;
+use uuid::Uuid;
+use crate::raftproto::LogEntry;
 
 pub mod ping {
     tonic::include_proto!("ping"); // The string specified here must match the proto package name
@@ -46,6 +48,12 @@ async fn do_append_entries() -> Result<(), Box<dyn std::error::Error>> {
         prev_log_index: 0,
         prev_log_term: 0,
         entries: vec![],
+        entry: Some(LogEntry {
+            term: 1,
+            index: 0,
+            data: vec![1, 2, 3, 4],
+            batch_index: 0
+        }),
     });
     let response = client.append_entries(request).await?;
     println!("RESPONSE={:?}", response.into_inner());
@@ -76,7 +84,8 @@ async fn do_write_batch_async() -> Result<(), Box<dyn std::error::Error>> {
         let mut client = DatastoreClient::new(chans[i%chans.len()].clone());
         async move {
             let mut request = tonic::Request::new(PutDataStoreRecordRequest {
-                payload: "some_value".to_string(),
+                key: i.to_string(),
+                value: i.to_string(),
             });
             request.set_timeout(Duration::from_secs(1));
 
@@ -143,6 +152,12 @@ async fn do_append_entries_async() -> Result<(), Box<dyn std::error::Error>> {
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: vec![],
+                entry: Some(LogEntry {
+                    term: 1,
+                    index: 0,
+                    data: vec![1, 2, 3, 4],
+                    batch_index: 0
+                }),
             });
 
             // Make the gRPC request
@@ -171,6 +186,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::builder().filter_level(log::LevelFilter::Info).init();
     let mut iterations = 0;
     let mut last_time = Instant::now();
+    //do_write_batch_async().await?;
+
     loop {
         //do_append_entries_async().await?;
         do_write_batch_async().await?;
