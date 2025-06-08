@@ -247,8 +247,8 @@ pub struct AppendEntries {
     pub entries: Vec<LogEntry>,
     pub prev_index: u64,
     pub prev_term: u64,
-    pub serialized: Vec<u8>,
     pub request_id: u64,
+    pub entry: Option<LogEntry>
 }
 
 pub struct RaftMessage {
@@ -286,7 +286,6 @@ pub struct RaftResponseMessage {
 
 pub struct RaftWriteBatchRequest {
     pub requests: Vec<PutRequest>,
-    pub serialized: Vec<u8>
 }
 
 pub enum RaftMessagePayload {

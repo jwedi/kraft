@@ -243,31 +243,30 @@ impl QuorumWorker {
                                     self.response_queue.push(QuorumResponse{response_type: resp})
                                 }
                             }
-                            Some(MessagePayload::AppendEntriesRequestOption(append_entries)) => {
+                            Some(MessagePayload::AppendEntriesRequestOption(mut append_entries)) => {
                                 //log::info!("received append entries request from: {}", self.member_id);
                                 let callback: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
 
-                                let last_entry = (&append_entries.entries).last();
-                                let index = last_entry.map(|entry| entry.index).unwrap_or_else(|| 0);
-                                let term = last_entry.map(|entry| entry.term).unwrap_or_else(|| 0);
+                                let index = append_entries.entry.as_ref().map(|entry| entry.index).unwrap_or_else(|| 0);
+                                let term = append_entries.entry.as_ref().map(|entry| entry.term).unwrap_or_else(|| 0);
 
                                 let span = tracing::span!(Level::INFO, "awaiting_append_entries_response");
 
                                 self.task_queue.push(RaftMessage{
-                                    payload: RaftMessagePayload::AppendEntries(AppendEntries{ leader_id: append_entries.leader_id, term: append_entries.term, prev_term: append_entries.prev_log_term, prev_index: append_entries.prev_log_index, entries: append_entries.entries, serialized: vec![], request_id: append_entries.request_id}),
+                                    payload: RaftMessagePayload::AppendEntries(AppendEntries{ leader_id: append_entries.leader_id, term: append_entries.term, prev_term: append_entries.prev_log_term, prev_index: append_entries.prev_log_index, entries: append_entries.entries, request_id: append_entries.request_id, entry: append_entries.entry}),
                                     callback: callback.0,
                                     parent_span: span
 
                                 }, );
 
                                 let pending_task = pendingTask{
-                                    task: PendingTaskEnum::AppendEntries{request_id: append_entries.request_id, log_index: index, term: term},
+                                    task: PendingTaskEnum::AppendEntries{request_id: append_entries.request_id, log_index: term, term: index},
                                     callback: callback.1
                                 };
                                 pending_tasks.push(pending_task);
                             }
                             Some(MessagePayload::VoteRequestOption(vote_request)) => {
-                                log::info!("received vote request from: {}", self.member_id);
+                                log::info!("received vote request from: {} for term: {}", self.member_id, vote_request.term);
                                 // TODO what do we do with the callbacks? Do we add a list of receivers that the quorum worker polls each iteration or does the queue worker send a message instead of invoking a callback?
                                 // Adding a list of pending callbacks is probably easiest since we don't need to re-write all state machines.
                                 let callback: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
@@ -320,7 +319,8 @@ impl QuorumWorker {
                     prev_log_index: self.prev_log_index,
                     prev_log_term: self.prev_log_term,
                     entries: vec![],
-                    request_id: 0
+                    request_id: 0,
+                    entry: None
                 };
 
                 let req = MessagePayload::AppendEntriesRequestOption(request);

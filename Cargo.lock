@@ -1299,6 +1299,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prost",
  "rand",
+ "sbe_kraft_replication_schema",
  "serde",
  "time",
  "tokio",
@@ -1904,6 +1905,10 @@ name = "ryu"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
+
+[[package]]
+name = "sbe_kraft_replication_schema"
+version = "0.1.0"
 
 [[package]]
 name = "serde"

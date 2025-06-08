@@ -28,6 +28,10 @@ use crate::raft::raft_sm::{RaftMessage, RaftMessagePayload, RaftResponseMessage,
 use crate::server::raftproto::{PutBatchRequest, PutBatchResponse, PutRequest, PutResponse};
 use crate::server::raftproto::raft_client::RaftClient;
 use crate::service_utils::app_time::now_millis;
+use sbe_kraft_replication_schema::{log_entry_codec, message_header_codec, WriteBuf};
+use sbe_kraft_replication_schema::command_codec::CommandEncoder;
+use sbe_kraft_replication_schema::log_entry_codec::encoder::CommandsEncoder;
+use sbe_kraft_replication_schema::log_entry_codec::LogEntryEncoder;
 
 #[derive(Debug)]
 pub struct WriteResponse {
@@ -277,7 +281,6 @@ impl WriteProxy {
             let payload = RaftMessagePayload::WriteBatch(
                 RaftWriteBatchRequest {
                     requests: all_requests,
-                    serialized: vec![1, 2, 3] // TODO
                 }
             );
             let span = tracing::span!(Level::INFO, "write_proxy_local_batch_forward_await");
@@ -402,7 +405,6 @@ impl WriteProxy {
                     let payload = RaftMessagePayload::WriteBatch(
                         RaftWriteBatchRequest {
                             requests: all_requests,
-                            serialized: vec![1, 2, 3] // TODO
                         }
                     );
                     let span = tracing::span!(Level::INFO, "write_proxy_local_batch_forward_await", num_requests=num_requests, request_size=request_size);

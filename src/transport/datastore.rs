@@ -51,9 +51,9 @@ impl Datastore for DatastoreServerImpl {
 
         let req = request.into_inner();
         let put_req = PutRequest {
-            id: Uuid::new_v4().to_string(),
+            id: req.key,
             node_id: 0,
-            payload: req.payload
+            payload: req.value
         };
         let callback: (Sender<WriteResponse>, Receiver<WriteResponse>) = oneshot::channel();
         let span = tracing::span!(Level::INFO, "awaiting_put_record");

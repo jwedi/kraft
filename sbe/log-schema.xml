@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+                   package="kraft.replication.schema"
+                   id="1"
+                   version="2"
+                   semanticVersion="5.2"
+                   description="Schema for sbe log replication"
+                   byteOrder="littleEndian">
+    <types>
+        <composite name="messageHeader" description="Message identifiers and length of message root">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+        <composite name="groupSizeEncoding" description="Repeating group dimensions">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="numInGroup" primitiveType="uint16"/>
+        </composite>
+        <composite name="varStringEncoding" description="Variable length UTF-8 String.">
+            <type name="length" primitiveType="uint32" maxValue="1073741824"/>
+            <type name="varData" primitiveType="uint8" length="0" characterEncoding="UTF-8"/>
+        </composite>
+        <composite name="varDataEncoding">
+            <type name="length" primitiveType="uint32" maxValue="1073741824"/>
+            <type name="varData" primitiveType="uint8" length="0"/>
+        </composite>
+        <type name="timestamp" primitiveType="uint64" semanticType="UTCTimestamp"/>
+        <type name="uuid" length="36" primitiveType="char" characterEncoding="US-ASCII"/>
+        <enum name="CommandType" encodingType="char">
+            <validValue name="PUT">P</validValue>
+            <validValue name="DELETE">D</validValue>
+        </enum>
+    </types>
+
+    <sbe:message name="LogEntry" id="2" description="Log propagation entry">
+        <field name="timestamp" id="1" type="timestamp" timeUnit="millisecond" semanticType="UTCTimestamp"/>
+        <field name="term" id="2" type="uint64"/>
+        <field name="index" id="3" type="uint64"/>
+        <group name="commands" id="8" dimensionType="groupSizeEncoding">
+            <field name="commandType" id="9" type="CommandType"/>
+            <data name="payload" id="10" type="varDataEncoding"/>
+        </group>
+    </sbe:message>
+
+    <sbe:message name="PutDataRecord" id="3" description="PutDataRecordCommand">
+        <data name="key" id="1" type="varDataEncoding"/>
+        <data name="value" id="2" type="varDataEncoding"/>
+    </sbe:message>
+</sbe:messageSchema>

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use crossbeam_queue::SegQueue;
 use csv::WriterBuilder;
+use log::{error, log};
 use rand::Rng;
 use rand::rngs::ThreadRng;
 use tokio::sync::oneshot;
@@ -53,10 +54,14 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             // TODO check if prev term or prev index is same as our own, else inform new leader that we need backfill.
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
+            shared_state.volatile_server_state.next_term = append_entries_request.term + 1;
 
             // TODO this isn't correct, fix when log backfill and storage works
-            shared_state.volatile_server_state.last_log_term = append_entries_request.term;
-            shared_state.volatile_server_state.last_log_index = 0;
+            //shared_state.volatile_server_state.last_log_term = append_entries_request.term;
+            //shared_state.volatile_server_state.last_log_index = 0;
+            if let Some(entry) = append_entries_request.entry {
+                error!("Received append_entries request with entry when recognizing new leader, but follower should not have entries. Leader: {}, term: {}, index: {}", append_entries_request.leader_id, append_entries_request.term, entry.index);
+            }
 
             // TODO write data
             callback.send(
@@ -83,7 +88,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             // Check request if valid in current state:
 
             if !self.validate_append_entries(&append_entries_request, shared_state.volatile_server_state.last_log_index, shared_state.volatile_server_state.last_log_term) {
-                log::info!("non-consecutive append log req: term {}, index: {}, state: term {}, index {}", append_entries_request.prev_term, append_entries_request.prev_index, shared_state.volatile_server_state.last_log_term, shared_state.volatile_server_state.last_log_index);
+                log::info!("non-consecutive append log req: req prev term {}, req prev index: {}, state: last log term {}, state: last log index {}, requestId: {}, dataLen: {}", append_entries_request.prev_term, append_entries_request.prev_index, shared_state.volatile_server_state.last_log_term, shared_state.volatile_server_state.last_log_index, append_entries_request.request_id, append_entries_request.entry.map(|e| e.data.len()).unwrap_or(0));
 
                 tracing::debug!("reset election timeout for term: {}", append_entries_request.term);
                 self.election_timeout = now_plus_duration_millis(Duration::from_millis(self.rng.gen_range(self.election_timeout_min..self.election_timeout_max) as u64));
@@ -101,7 +106,20 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             let message_id = shared_state.next_message_id;
             shared_state.next_message_id += 1;
 
-            let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: append_entries_request.serialized, parent_span: Span::current()};
+            let data = if let Some(entry) = append_entries_request.entry {
+                shared_state.volatile_server_state.last_log_index = entry.index;
+                shared_state.volatile_server_state.last_log_term = entry.term;
+                log::debug!("updating last log term {} and index {}", entry.term, entry.index);
+                entry.data
+            } else {
+                vec![]
+            };
+
+            if data.is_empty() {
+                log::error!("Received empty append_entries data request from leader: {}, term: {}, index: {}", append_entries_request.leader_id, append_entries_request.term, append_entries_request.prev_index);
+            }
+
+            let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: data, parent_span: Span::current(), request_id: append_entries_request.request_id};
             shared_state.persistence_work.push(persistence_task);
 
             let message_type = OutstandingMessageType::AppendLog{ callback };
@@ -112,12 +130,6 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 span: Span::current()
             };
             shared_state.outstanding_messages.insert(message_id, outstanding_message);
-
-            if let Some(entry) = append_entries_request.entries.last() {
-                shared_state.volatile_server_state.last_log_index = entry.index;
-                shared_state.volatile_server_state.last_log_term = entry.term;
-                log::info!("updating last log term {} and index {}", entry.term, entry.index);
-            }
         } else {
             tracing::info!("received append_entries request from non leader with lower term than current. caller: {}, term: {}, current term: {}", append_entries_request.leader_id, append_entries_request.term, shared_state.server_state.current_term);
             callback.send(
