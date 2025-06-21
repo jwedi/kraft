@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
-use crate::quorum::worker::{QuorumResponse, QuorumTask, QuorumTaskResponseType, QuorumTaskType};
+use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::raft::leader::RaftLeaderStateDelegate;
 use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRequestVoteRequest, SharedState, TermVote};
@@ -141,7 +141,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
 
         while let Some(task) = shared_state.quorum_response.pop() {
             match task.response_type {
-                QuorumTaskResponseType::RequestVoteResponse { id, term, received_vote } => {
+                LocalQuorumTaskResponseType::RequestVoteResponse { id, term, received_vote } => {
                     if let Some(mut msg) = shared_state.outstanding_messages.remove(&id) {
                         let span_clone = msg.span.clone();
                         let _entered = span_clone.enter();
@@ -219,8 +219,8 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             let _enter = span.enter();
             shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
                 let quorum_span = Span::current();
-                let task = QuorumTaskType::RequestVote{ id: message_id, term: next_term, last_term, last_index, parent_span: quorum_span};
-                task_queue.push(QuorumTask{task_type: task});
+                let task = LocalQuorumWorkerTaskType::RequestVote{ id: message_id, term: next_term, last_term, last_index, parent_span: quorum_span};
+                task_queue.push(LocalQuorumWorkerTask {task_type: task});
             });
             let persistence_span = Span::current();
             let persistence_task = PersistenceTaskType::AppendVote{id: message_id, term: next_term, candidate_id: shared_state.identity, parent_span: persistence_span};

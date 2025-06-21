@@ -34,15 +34,15 @@ use crate::service_utils::storage_utils::{SerializationData, SerializedData};
 use crate::transport::stream_manager::{StreamManager, StreamManagerImpl};
 use crate::transport::write_proxy::WriteResponse;
 
-pub struct QuorumTask {
-    pub task_type: QuorumTaskType
+pub struct LocalQuorumWorkerTask {
+    pub task_type: LocalQuorumWorkerTaskType
     // New append entries
     // Request vote
     // Start heartbeats
     // Stop heartbeats
 }
 
-pub enum QuorumTaskType {
+pub enum LocalQuorumWorkerTaskType {
     StartHeartbeats{ id: u64, term: u64, prev_term: u64, prev_log_index: u64 },
     StopHeartbeats { id: u64 },
     RequestVote{ id: u64, term: u64, last_term: u64, last_index: u64, parent_span: Span}, // Term, last term, last index,
@@ -50,14 +50,14 @@ pub enum QuorumTaskType {
     // TODO backfill
 }
 
-pub enum QuorumTaskResponseType {
+pub enum LocalQuorumTaskResponseType {
     RequestVoteResponse{ id: u64, term: u64, received_vote: bool},
     AppendEntries{ id: u64, ok: bool}, // TODO get next index
     BackfillLog{member_id: u64, prev_term: u64, prev_index: u64}
 }
 
-pub struct QuorumResponse {
-    pub response_type: QuorumTaskResponseType
+pub struct LocalQuorumResponse {
+    pub response_type: LocalQuorumTaskResponseType
 }
 
 // Responsible for communication with other nodes in the cluster if this node is the leader.
@@ -65,8 +65,8 @@ pub struct QuorumResponse {
 // Sends RequestVote when asked to.
 // Sends AppendEntries heartbeats regardless to keep up constant load.
 pub struct QuorumWorker {
-    work_queue: Arc<SegQueue<QuorumTask>>,
-    response_queue: Arc<SegQueue<QuorumResponse>>,
+    work_queue: Arc<SegQueue<LocalQuorumWorkerTask>>,
+    response_queue: Arc<SegQueue<LocalQuorumResponse>>,
     send_heartbeats: bool,
     self_id: u32,
     next_index: u64,
@@ -90,20 +90,20 @@ pub struct QuorumWorker {
 
 
 #[derive(Debug)]
-pub enum PendingTaskEnum {
+pub enum PendingQuorumTaskEnum {
     Vote(RemoteVoteRequest),
     AppendEntries{request_id: u64, log_index: u64, term: u64}
 }
 #[derive(Debug)]
-struct pendingTask {
+struct PendingQuorumTask {
     callback: Receiver<LocalRaftResponseMessage>,
-    task: PendingTaskEnum
+    task: PendingQuorumTaskEnum
 }
 
 impl QuorumWorker {
     pub fn new(
-        work_queue: Arc<SegQueue<QuorumTask>>,
-        response_queue: Arc<SegQueue<QuorumResponse>>,
+        work_queue: Arc<SegQueue<LocalQuorumWorkerTask>>,
+        response_queue: Arc<SegQueue<LocalQuorumResponse>>,
         self_id: u32,
         next_index: u64,
         member_id: u64,
@@ -134,7 +134,7 @@ impl QuorumWorker {
 
     pub async fn run(&mut self) {
         log::info!("Running quorum worker");
-        let mut pending_tasks: Vec<pendingTask> = vec![];
+        let mut pending_tasks: Vec<PendingQuorumTask> = vec![];
 
         loop {
             let mut maybe_receive_stream = self.stream_manager.get_receive_stream(self.member_id as u32).await;
@@ -180,7 +180,7 @@ impl QuorumWorker {
                                 match val.payload {
                                     LocalRaftResponsePayload::RequestVote(rv) => {
                                         match &pt.task {
-                                            PendingTaskEnum::Vote(task) => {
+                                            PendingQuorumTaskEnum::Vote(task) => {
                                                 send_stream.send(RemoteQuorumMessage{message_payload: Some(MessagePayload::VoteResponseOption(RemoteVoteResponse{vote_granted: rv, request_id: task.request_id, term: task.term}))}).expect("sending on stream shouldn't fail");
                                             }
                                             default => {
@@ -192,7 +192,7 @@ impl QuorumWorker {
                                         // TODO check if OK or not
 
                                         match &pt.task {
-                                            PendingTaskEnum::AppendEntries{request_id, log_index, term} => {
+                                            PendingQuorumTaskEnum::AppendEntries{request_id, log_index, term} => {
                                                 send_stream.send(RemoteQuorumMessage{message_payload: Some(MessagePayload::AppendEntriesAcknowledgeOption(RemoteAppendEntriesAcknowledge{log_index: *log_index, term: *term, request_id: *request_id, ok: true}))}).expect("sending on stream shouldn't fail");
                                             }
                                             default => {
@@ -236,8 +236,8 @@ impl QuorumWorker {
                             }
                             Some(MessagePayload::VoteResponseOption(vote)) => {
                                 log::info!("received vote response id: {}, member: {}, term: {}, granted: {}", vote.request_id, self.member_id, vote.term, vote.vote_granted);
-                                let resp = QuorumTaskResponseType::RequestVoteResponse{id: vote.request_id, term: vote.term, received_vote: vote.vote_granted};
-                                self.response_queue.push(QuorumResponse{response_type: resp})
+                                let resp = LocalQuorumTaskResponseType::RequestVoteResponse{id: vote.request_id, term: vote.term, received_vote: vote.vote_granted};
+                                self.response_queue.push(LocalQuorumResponse {response_type: resp})
                             }
                             Some(MessagePayload::AppendEntriesAcknowledgeOption(append_entries)) => {
                                 if append_entries.log_index > 0 {
@@ -245,8 +245,8 @@ impl QuorumWorker {
                                 }
                                 if append_entries.request_id != 0 {
                                     // TODO
-                                    let resp = QuorumTaskResponseType::AppendEntries{id: append_entries.request_id, ok: append_entries.ok};
-                                    self.response_queue.push(QuorumResponse{response_type: resp})
+                                    let resp = LocalQuorumTaskResponseType::AppendEntries{id: append_entries.request_id, ok: append_entries.ok};
+                                    self.response_queue.push(LocalQuorumResponse {response_type: resp})
                                 }
                             }
                             Some(MessagePayload::AppendEntriesRequestOption(mut append_entries)) => {
@@ -265,8 +265,8 @@ impl QuorumWorker {
 
                                 }, );
 
-                                let pending_task = pendingTask{
-                                    task: PendingTaskEnum::AppendEntries{request_id: append_entries.request_id, log_index: term, term: index},
+                                let pending_task = PendingQuorumTask {
+                                    task: PendingQuorumTaskEnum::AppendEntries{request_id: append_entries.request_id, log_index: term, term: index},
                                     callback: callback.1
                                 };
                                 pending_tasks.push(pending_task);
@@ -284,8 +284,8 @@ impl QuorumWorker {
                                     parent_span: span
 
                                 }, );
-                                let pending_task = pendingTask{
-                                    task: PendingTaskEnum::Vote(vote_request),
+                                let pending_task = PendingQuorumTask {
+                                    task: PendingQuorumTaskEnum::Vote(vote_request),
                                     callback: callback.1
                                 };
                                 pending_tasks.push(pending_task);
@@ -356,18 +356,18 @@ impl QuorumWorker {
                 Some(task) => {
                     log::info!("Received quorum task");
                     match task.task_type {
-                        QuorumTaskType::StartHeartbeats{id, term, prev_term, prev_log_index} => {
+                        LocalQuorumWorkerTaskType::StartHeartbeats{id, term, prev_term, prev_log_index} => {
                             log::info!("received start heartbeat request id: {}, term: {}", id, term);
                             self.send_heartbeats = true;
                             self.term = term;
                             self.prev_log_term = prev_term;
                             self.prev_log_index = prev_log_index;
                         }
-                        QuorumTaskType::StopHeartbeats{id} => {
+                        LocalQuorumWorkerTaskType::StopHeartbeats{id} => {
                             log::info!("received stop heartbeat request id: {}", id);
                             self.send_heartbeats = false;
                         }
-                        QuorumTaskType::RequestVote{id, term, last_index, last_term, parent_span} => {
+                        LocalQuorumWorkerTaskType::RequestVote{id, term, last_index, last_term, parent_span} => {
                             log::info!("sending request vote with request id {} for term {}", id, term);
                             let vote_req = RemoteVoteRequest{
                                 term,
@@ -393,7 +393,7 @@ impl QuorumWorker {
                                 }
                             }
                         }
-                        QuorumTaskType::AppendEntries {id, req, parent_span} => {
+                        LocalQuorumWorkerTaskType::AppendEntries {id, req, parent_span} => {
                             // TODO benchmark copying log entries 3 times and writing to segqueues vs cloning Vectors.
                             send_stream.send(RemoteQuorumMessage{message_payload: Some(MessagePayload::AppendEntriesRequestOption(req))}).unwrap();
                             self.last_heartbeat = now_millis();

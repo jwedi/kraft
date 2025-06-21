@@ -29,7 +29,7 @@ use tracing_opentelemetry::{OpenTelemetryLayer, OpenTelemetrySpanExt};
 use tracing_subscriber::{registry, layer::SubscriberExt, Registry, Layer};
 use crate::config::config::{ClusterNode, read_config};
 use crate::persistence::worker::{PersistenceConfig, PersistenceResponseType, PersistenceTaskType, PersistenceWorker, VoteRow};
-use crate::quorum::worker::{QuorumResponse, QuorumTask, QuorumWorker};
+use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask, QuorumWorker};
 use crate::raft::raft_sm::{OutstandingMessage, LocalRaftMessage, RaftServerState, RaftVolatileState, SharedState};
 use crate::server::raftproto::RemoteQuorumMessage;
 use crate::service_utils::app_time::now_millis;
@@ -177,9 +177,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
 
-    let quorum_queue: Arc<SegQueue<QuorumTask>> = Arc::new(SegQueue::<QuorumTask>::new());
+    let quorum_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::<LocalQuorumWorkerTask>::new());
     let sm_quorum_work = Arc::clone(&quorum_queue);
-    let quorum_response_queue = Arc::new(SegQueue::<QuorumResponse>::new());
+    let quorum_response_queue = Arc::new(SegQueue::<LocalQuorumResponse>::new());
     let sm_quorum_response = Arc::clone(&quorum_response_queue);
     let quorum_size = (cfg.cluster_nodes.len() as u32).div_ceil(2);
     let cluster_nodes_without_self: Vec<ClusterNode> = cfg.cluster_nodes.into_iter().filter(|item| item.node_id != cfg.node_id).map(|c| c).collect();
@@ -203,9 +203,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_server = RaftServerImpl{task_queue: api_raft_queue, self_id: cfg.node_id, stream_manager: Arc::clone(&sm_arc)};
 
     // For each cluster_nodes_without_self
-    let mut quorum_send_channels: Vec<Arc<SegQueue<QuorumTask>>> = vec![];
+    let mut quorum_send_channels: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>> = vec![];
     let cluster_workers: Vec<QuorumWorker> = cluster_nodes_without_self.iter().map(|node| {
-        let mut c_queue: Arc<SegQueue<QuorumTask>> = Arc::new(SegQueue::<QuorumTask>::new());
+        let mut c_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::<LocalQuorumWorkerTask>::new());
         let c_queue_clone = Arc::clone(&c_queue);
         quorum_send_channels.push(c_queue);
         let response_c = Arc::clone(&sm_quorum_response);

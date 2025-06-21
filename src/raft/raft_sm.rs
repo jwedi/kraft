@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
-use crate::quorum::worker::{QuorumResponse, QuorumTask};
+use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask};
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::server::raftproto::{RemoteLogEntry, RemotePutRequest, RemotePutResponse};
 use crate::server::raftproto::raft_server::Raft;
@@ -58,14 +58,14 @@ pub struct SharedState {
     pub volatile_server_state: RaftVolatileState,
     pub persistence_work: Arc<SegQueue<PersistenceTaskType>>,
     pub persistence_response: Arc<SegQueue<PersistenceResponseType>>,
-    pub quorum_work: Arc<SegQueue<QuorumTask>>,
-    pub quorum_response: Arc<SegQueue<QuorumResponse>>,
+    pub quorum_work: Arc<SegQueue<LocalQuorumWorkerTask>>,
+    pub quorum_response: Arc<SegQueue<LocalQuorumResponse>>,
     pub identity: u32,
     pub term_votes: HashMap<u64, u32>, // Term -> candidate_id that was voted for.
     pub next_message_id: u64,
     pub outstanding_messages: HashMap<u64, OutstandingMessage>,
     pub quorum_size: u32,
-    pub quorum_worker_tasks: Vec<Arc<SegQueue<QuorumTask>>>,
+    pub quorum_worker_tasks: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>>,
 }
 
 pub struct StateMachineExecutorImpl {

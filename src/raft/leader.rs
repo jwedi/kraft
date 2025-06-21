@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
-use crate::quorum::worker::{QuorumTask, QuorumTaskResponseType, QuorumTaskType};
+use crate::quorum::worker::{LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
 use crate::raft::candidate::RaftCandidateStateDelegate;
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRaftWriteBatchRequest, LocalRaftWriteBatchResponse, LocalRequestVoteRequest, SharedState, TermVote};
@@ -84,12 +84,12 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             };
 
             let quorum_span = Span::current();
-            let task = QuorumTaskType::AppendEntries{
+            let task = LocalQuorumWorkerTaskType::AppendEntries{
                 id: message_id,
                 parent_span: quorum_span,
                 req,
             };
-            task_queue.push(QuorumTask{task_type: task});
+            task_queue.push(LocalQuorumWorkerTask {task_type: task});
         });
 
         let message_type = OutstandingMessageType::WriteBatch{persistence_done: false, quorum_acks: 0, callback};
@@ -127,8 +127,8 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             shared_state.next_message_id += 1;
 
             shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
-                let task = QuorumTaskType::StopHeartbeats{ id: message_id };
-                task_queue.push(QuorumTask{task_type: task});
+                let task = LocalQuorumWorkerTaskType::StopHeartbeats{ id: message_id };
+                task_queue.push(LocalQuorumWorkerTask {task_type: task});
             });
             if let Some(entry) = append_entries_request.entry {
                 shared_state.volatile_server_state.last_log_index = entry.index;
@@ -164,13 +164,13 @@ impl RaftProtocol for RaftLeaderStateDelegate {
 
             // Tell quorum workers to start sending heartbeats.
             shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
-                let task = QuorumTaskType::StartHeartbeats{
+                let task = LocalQuorumWorkerTaskType::StartHeartbeats{
                     id: message_id,
                     term: shared_state.server_state.current_term,
                     prev_term: shared_state.volatile_server_state.last_log_term,
                     prev_log_index: shared_state.volatile_server_state.last_log_index
                 };
-                task_queue.push(QuorumTask{task_type: task});
+                task_queue.push(LocalQuorumWorkerTask {task_type: task});
             });
             self.initialized = true
         }
@@ -253,7 +253,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
 
         while let Some(task) = shared_state.quorum_response.pop() {
             match task.response_type {
-                QuorumTaskResponseType::AppendEntries { id, ok } => {
+                LocalQuorumTaskResponseType::AppendEntries { id, ok } => {
                     if let Some(mut msg) = shared_state.outstanding_messages.remove(&id) {
                         let span = tracing::span!(Level::INFO, "outstanding_message_quorum_append_entries_processing");
                         span.set_parent(msg.span.context());
@@ -292,7 +292,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                         log::error!("Received quorum event with no outstanding message registered {}", id);
                     }
                 }
-                QuorumTaskResponseType::BackfillLog {member_id: u64, prev_term, prev_index} => {
+                LocalQuorumTaskResponseType::BackfillLog {member_id: u64, prev_term, prev_index} => {
                     log::info!("Received backfill log request for member {}, prev_term: {}, prev_index: {}", u64, prev_term, prev_index);
                     // TODO
 
