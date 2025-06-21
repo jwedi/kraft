@@ -119,7 +119,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                     }
                 }
                 PersistenceResponseType::LogPersisted { id } => {
-                    if let Some(mut msg) = shared_state.outstanding_messages.remove(&id) {
+                    if let Some(msg) = shared_state.outstanding_messages.remove(&id) {
                         let _entered = msg.span.enter();
                         match msg.message_type {
                             OutstandingMessageType::AppendLog{callback} => {

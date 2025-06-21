@@ -3,6 +3,7 @@ use std::time::Duration;
 use crossbeam_queue::SegQueue;
 use csv::WriterBuilder;
 use log::{error, log};
+use prost::bytes::Bytes;
 use rand::Rng;
 use rand::rngs::ThreadRng;
 use tokio::sync::oneshot;
@@ -23,7 +24,6 @@ pub struct RaftFollowerStateDelegate {
 
 impl RaftFollowerStateDelegate {
     pub fn new() -> Self {
-        let now = now_millis();
         let mut rng = rand::thread_rng();
         let min: u128 = 600;
         let max: u128 = 1300;
@@ -119,7 +119,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 log::error!("Received empty append_entries data request from leader: {}, term: {}, index: {}", append_entries_request.leader_id, append_entries_request.term, append_entries_request.prev_index);
             }
 
-            let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: data, parent_span: Span::current(), request_id: append_entries_request.request_id};
+            let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: data.to_vec(), parent_span: Span::current(), request_id: append_entries_request.request_id};
             shared_state.persistence_work.push(persistence_task);
 
             let message_type = OutstandingMessageType::AppendLog{ callback };
@@ -190,7 +190,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                     }
                 }
 
-                v => {
+                _ => {
                     tracing::error!("Persistence event not valid in current state");
                 }
             }
@@ -198,7 +198,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
 
         while let Some(task) = shared_state.quorum_response.pop() {
             match task.response_type {
-                e => {
+                _ => {
                     tracing::error!(message = "Received invalid quorum response message in current state");
                 }
             }

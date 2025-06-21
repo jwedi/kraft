@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use crossbeam_queue::SegQueue;
-use prost::bytes::BufMut;
+use prost::bytes::{BufMut, Bytes};
 use rand::Rng;
 use rand::rngs::ThreadRng;
 use sbe_kraft_replication_schema::command_codec::CommandEncoder;
@@ -57,16 +57,17 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         let _enter = span.enter();
         // TODO validate request
         // TODO serialize valid request bits
-        let mut buffer = vec![0u8; 2048];
+        let buffer = vec![0u8; 2048];
         let offset = 0usize;
         let (limit, mut data) = serialize_data(SerializationData{index: idx, term: shared_state.server_state.current_term, timestamp: now_millis() as u64, requests: write_batch_request.requests}, buffer, offset);
         data.truncate(limit);
+        // TODO no clone.
         let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: data.clone(), parent_span: Span::current(), request_id: message_id};
         shared_state.persistence_work.push(persistence_task);
 
         // TODO log entry command should be just bytes
         shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
-            let le = LogEntry { // TODO
+            let le = LogEntry {
                 index: idx,
                 data: data.clone(), // TODO maybe fundamental problem with the approach, doesn't support IO without copies...
                 batch_index: idx,
@@ -244,7 +245,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                     }
                 }
 
-                v => {
+                _ => {
                     log::error!("Persistence event not valid in current state");
                 }
             }
@@ -292,7 +293,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                     }
                 }
 
-                e => {
+                _ => {
 
                     log::error!("Received invalid quorum response message in current state");
                 }

@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::io::{BufWriter, Bytes, Write};
+use std::io::{BufWriter, Bytes, Read, Write};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Condvar};
@@ -17,7 +17,7 @@ pub enum PersistenceTaskType {
     ReadState{id: u64, span: Span},
     AppendVote{id: u64, term: u64, candidate_id: u32, parent_span: Span},
     ReadVotes{id: u64, span: Span},
-    AppendLog{id: u64, data: Vec<u8>, parent_span: Span, request_id: u64}
+    AppendLog{id: u64, data: Vec<u8>, parent_span: Span, request_id: u64},
     // Can either be RC / Arc and immutable, or copied, or immutable and the persistence worker serializes while waiting for IO sync.
     // Preparing next batch while waiting for IO sync seems reasonable.
     // Now sure how to avoid IO if that's the case.
@@ -73,7 +73,7 @@ impl PersistenceWorker {
     pub fn run(&mut self) {
         tracing::info!("Running persistence worker");
 
-        let mut log_write_file_handle = OpenOptions::new()
+        let log_write_file_handle = OpenOptions::new()
             .write(true)
             .create(true)
             .append(true)
@@ -81,7 +81,7 @@ impl PersistenceWorker {
             .unwrap();
         let mut log_write_buffer = BufWriter::new(log_write_file_handle);
 
-        let mut vote_write_file_handle = OpenOptions::new()
+        let vote_write_file_handle = OpenOptions::new()
             .write(true)
             .create(true)
             .append(true)
@@ -150,7 +150,7 @@ impl PersistenceWorker {
     }
 
     pub fn read_votes(&mut self) -> Result<Vec<VoteRow>, Box<dyn Error>> {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -166,5 +166,17 @@ impl PersistenceWorker {
             votes.push(record)
         }
         Ok(votes)
+    }
+
+    pub fn read_log(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(format!("{}log.sbe", self.persistence_config.out_dir))?;
+
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+        Ok(buffer)
     }
 }
