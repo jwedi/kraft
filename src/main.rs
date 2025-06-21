@@ -30,8 +30,8 @@ use tracing_subscriber::{registry, layer::SubscriberExt, Registry, Layer};
 use crate::config::config::{ClusterNode, read_config};
 use crate::persistence::worker::{PersistenceConfig, PersistenceResponseType, PersistenceTaskType, PersistenceWorker, VoteRow};
 use crate::quorum::worker::{QuorumResponse, QuorumTask, QuorumWorker};
-use crate::raft::raft_sm::{OutstandingMessage, RaftMessage, RaftServerState, RaftVolatileState, SharedState};
-use crate::server::raftproto::QuorumMessage;
+use crate::raft::raft_sm::{OutstandingMessage, LocalRaftMessage, RaftServerState, RaftVolatileState, SharedState};
+use crate::server::raftproto::RemoteQuorumMessage;
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils;
 use crate::service_utils::storage_utils::SerializationData;
@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("[::1]:{}", cfg.port).parse()?;
     let pinger = PingServer::default();
 
-    let task_queue = Arc::new(SegQueue::<RaftMessage>::new());
+    let task_queue = Arc::new(SegQueue::<LocalRaftMessage>::new());
     let worker_queue = Arc::clone(&task_queue);
     let api_raft_queue = Arc::clone(&task_queue);
     let api_write_work_queue = Arc::new(SegQueue::<WriteBatch>::new());
@@ -191,8 +191,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let outstanding_messages: HashMap<u64, OutstandingMessage> = HashMap::new();
 
-    let send_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<mpsc::UnboundedSender<QuorumMessage>>>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let receive_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<tonic::Streaming<QuorumMessage>>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let send_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<mpsc::UnboundedSender<RemoteQuorumMessage>>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let receive_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<tonic::Streaming<RemoteQuorumMessage>>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let sm: StreamManagerImpl = StreamManagerImpl::new(
         node_id,
         Vec::clone(&cluster_nodes_without_self),

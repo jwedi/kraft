@@ -11,9 +11,9 @@ use log::{info, warn};
 use tokio::sync::oneshot::{Receiver, Sender};
 use crate::runtime_core::task_buffer::TaskBufferImpl;
 use crate::runtime_core::types::{Command, RuntimeTask, RuntimeTaskResponse, CommandType};
-use crate::server::raftproto::{AppendEntriesRequest, AppendEntriesResponse, PutRequest, VoteRequest, VoteResponse};
+use crate::server::raftproto::RemotePutRequest;
 use crate::service_utils::errors::ServiceError;
-use crate::raft::raft_sm::{RaftStateMachineExecutor, StateMachineExecutorImpl, RaftServerState, TermVote, RaftVolatileState, SharedState, RaftMessage, RaftMessagePayload, RequestVoteRequest, RaftResponseMessage, RaftResponsePayload, AppendEntries, RaftWriteBatchRequest};
+use crate::raft::raft_sm::{RaftStateMachineExecutor, StateMachineExecutorImpl, RaftServerState, TermVote, RaftVolatileState, SharedState, LocalRaftMessage, LocalRaftMessagePayload, LocalRequestVoteRequest, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalAppendEntries, LocalRaftWriteBatchRequest};
 use crossbeam_queue::SegQueue;
 use tokio::sync::oneshot::error::RecvError;
 use tracing::{field, instrument, Instrument, Level, Metadata, Span};
@@ -50,7 +50,7 @@ impl Datastore for DatastoreServerImpl {
         tracing::debug!("received put_records request");
 
         let req = request.into_inner();
-        let put_req = PutRequest {
+        let put_req = RemotePutRequest {
             id: req.key,
             node_id: 0,
             payload: req.value

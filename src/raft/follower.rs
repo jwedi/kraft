@@ -12,7 +12,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
 use crate::quorum::worker::{QuorumTask, QuorumTaskResponseType, QuorumTaskType};
 use crate::raft::candidate::RaftCandidateStateDelegate;
-use crate::raft::raft_sm::{AppendEntries, AppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, RaftResponseMessage, RaftResponsePayload, RaftServerState, RaftVolatileState, RaftWriteBatchResponse, RequestVoteRequest, SharedState, TermVote};
+use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRaftWriteBatchResponse, LocalRequestVoteRequest, SharedState, TermVote};
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
 
 pub struct RaftFollowerStateDelegate {
@@ -44,7 +44,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
     fn get_node_type(&self) -> RaftNodeType {
         RaftNodeType::Follower
     }
-    fn append_entries(&mut self, append_entries_request: AppendEntries, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
+    fn append_entries(&mut self, append_entries_request: LocalAppendEntries, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
         let span = tracing::span!(Level::INFO, "follower_append_entries", leader=false);
         let _enter = span.enter();
         tracing::debug!("handling append entries for term: {}, current term: {}", append_entries_request.term, shared_state.server_state.current_term);
@@ -65,8 +65,8 @@ impl RaftProtocol for RaftFollowerStateDelegate {
 
             // TODO write data
             callback.send(
-                RaftResponseMessage{
-                    payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::Ok)
+                LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok)
                 }
             ).expect("sending append_entries response callback failed");
         } else if append_entries_request.term == shared_state.server_state.current_term { // TODO maybe check leader id.
@@ -78,8 +78,8 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 self.election_timeout = now_plus_duration_millis(Duration::from_millis(self.rng.gen_range(self.election_timeout_min..self.election_timeout_max) as u64));
 
                 callback.send(
-                    RaftResponseMessage{
-                        payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::WantedPreviousEntry { last_term: shared_state.volatile_server_state.last_log_term, last_index: shared_state.volatile_server_state.last_log_index})
+                    LocalRaftResponseMessage {
+                        payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::WantedPreviousEntry { last_term: shared_state.volatile_server_state.last_log_term, last_index: shared_state.volatile_server_state.last_log_index})
                     }
                 ).expect("sending append_entries response callback failed");
                 return RaftMessageStateChange::None
@@ -94,8 +94,8 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 self.election_timeout = now_plus_duration_millis(Duration::from_millis(self.rng.gen_range(self.election_timeout_min..self.election_timeout_max) as u64));
 
                 callback.send(
-                    RaftResponseMessage{
-                        payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::WantedPreviousEntry { last_term: shared_state.volatile_server_state.last_log_term, last_index: shared_state.volatile_server_state.last_log_index})
+                    LocalRaftResponseMessage {
+                        payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::WantedPreviousEntry { last_term: shared_state.volatile_server_state.last_log_term, last_index: shared_state.volatile_server_state.last_log_index})
                     }
                 ).expect("sending append_entries response callback failed");
                 return RaftMessageStateChange::None
@@ -133,8 +133,8 @@ impl RaftProtocol for RaftFollowerStateDelegate {
         } else {
             tracing::info!("received append_entries request from non leader with lower term than current. caller: {}, term: {}, current term: {}", append_entries_request.leader_id, append_entries_request.term, shared_state.server_state.current_term);
             callback.send(
-                RaftResponseMessage{
-                    payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::UnrecognizedLeader)
+                LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::UnrecognizedLeader)
                 }
             ).expect("sending append_entries response callback failed");
         }
@@ -155,8 +155,8 @@ impl RaftProtocol for RaftFollowerStateDelegate {
 
                         match msg.message_type {
                             OutstandingMessageType::AppendLog{callback} => {
-                                let payload = RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::Ok);
-                                let response = RaftResponseMessage{payload};
+                                let payload = LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok);
+                                let response = LocalRaftResponseMessage {payload};
                                 if let Err(_) = callback.send(response) {
                                     tracing::error!("Writing log persisted callback failed because reader closed channel")
                                 }
@@ -176,8 +176,8 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                         let _entered = span_clone.enter();
                         match msg.message_type {
                             OutstandingMessageType::RequestVote{callback} => {
-                                let payload = RaftResponsePayload::RequestVote(true);
-                                let response = RaftResponseMessage{payload};
+                                let payload = LocalRaftResponsePayload::RequestVote(true);
+                                let response = LocalRaftResponseMessage {payload};
                                 callback.send(response).unwrap();
                             }
                             _ => {
@@ -212,13 +212,13 @@ impl RaftProtocol for RaftFollowerStateDelegate {
         return RaftMessageStateChange::None;
     }
 
-    fn request_vote(&mut self, request_vote_request: RequestVoteRequest, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
+    fn request_vote(&mut self, request_vote_request: LocalRequestVoteRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
         let span = tracing::span!(Level::INFO, "follower_request_vote");
         let _enter = span.enter();
         if !self.should_accept_vote(request_vote_request.term, request_vote_request.last_log_term, request_vote_request.last_log_index, shared_state) {
             callback.send(
-                RaftResponseMessage{
-                    payload: RaftResponsePayload::RequestVote(false)
+                LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::RequestVote(false)
                 }
             ).expect("response callback for request_vote failed");
             return RaftMessageStateChange::None

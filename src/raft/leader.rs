@@ -15,8 +15,8 @@ use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
 use crate::quorum::worker::{QuorumTask, QuorumTaskResponseType, QuorumTaskType};
 use crate::raft::candidate::RaftCandidateStateDelegate;
 use crate::raft::follower::RaftFollowerStateDelegate;
-use crate::raft::raft_sm::{AppendEntries, AppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, RaftResponseMessage, RaftResponsePayload, RaftServerState, RaftVolatileState, RaftWriteBatchRequest, RaftWriteBatchResponse, RequestVoteRequest, SharedState, TermVote};
-use crate::server::raftproto::{AppendEntriesRequest, LogEntry, PutRequest};
+use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRaftWriteBatchRequest, LocalRaftWriteBatchResponse, LocalRequestVoteRequest, SharedState, TermVote};
+use crate::server::raftproto::{RemoteAppendEntriesRequest, RemoteLogEntry, RemotePutRequest};
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils::{SerializationData, serialize_data};
 
@@ -47,7 +47,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         RaftNodeType::Leader
     }
 
-    fn write_batch(&mut self, write_batch_request: RaftWriteBatchRequest, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) {
+    fn write_batch(&mut self, write_batch_request: LocalRaftWriteBatchRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) {
         let message_id = shared_state.next_message_id;
         let mut idx = shared_state.volatile_server_state.next_log_index;
         log::info!("leader handling writing batches {} as message id: {} with index: {}", write_batch_request.requests.len(), message_id, idx);
@@ -67,13 +67,13 @@ impl RaftProtocol for RaftLeaderStateDelegate {
 
         // TODO log entry command should be just bytes
         shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
-            let le = LogEntry {
+            let le = RemoteLogEntry {
                 index: idx,
                 data: data.clone(), // TODO maybe fundamental problem with the approach, doesn't support IO without copies...
                 batch_index: idx,
                 term: shared_state.server_state.current_term
             };
-            let req = AppendEntriesRequest {
+            let req = RemoteAppendEntriesRequest {
                 term: shared_state.server_state.current_term,
                 leader_id: shared_state.server_state.leader_id,
                 entries: vec![],
@@ -108,7 +108,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         shared_state.volatile_server_state.last_log_index = idx;
     }
 
-    fn append_entries(&mut self, append_entries_request: AppendEntries, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
+    fn append_entries(&mut self, append_entries_request: LocalAppendEntries, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
 
         let span = tracing::span!(Level::INFO, "leader_append_entries", leader=true);
         let _enter = span.enter();
@@ -136,8 +136,8 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                 log::debug!("updating last log term {} and index {}", entry.term, entry.index);
             }
             callback.send(
-                RaftResponseMessage{
-                    payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::Ok)
+                LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok)
                 }
             ).expect("sending append_entries callback failed");
             return RaftMessageStateChange::Follower(Box::new(RaftFollowerStateDelegate::new()));
@@ -145,8 +145,8 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         } else {
             tracing::info!("Received append_entries request from lower term candidate: {}, {}", append_entries_request.term, append_entries_request.leader_id);
             callback.send(
-                RaftResponseMessage{
-                    payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::UnrecognizedLeader)
+                LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::UnrecognizedLeader)
                 }
             ).expect("sending append_entries callback failed");
         }
@@ -197,12 +197,12 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     // Persistence done and replicated to quorum of nodes
                                     log::info!("Write batch with message id {} has been persisted on quorum of nodes", id);
                                     // TODO update commit index and apply to data structure.
-                                    let r = RaftWriteBatchResponse{
+                                    let r = LocalRaftWriteBatchResponse{
                                         responses: vec![], // TODO
                                         err: None
                                     };
-                                    let payload = RaftResponsePayload::WriteBatch(r);
-                                    let response = RaftResponseMessage{payload};
+                                    let payload = LocalRaftResponsePayload::WriteBatch(r);
+                                    let response = LocalRaftResponseMessage {payload};
                                     callback.send(response).unwrap();
                                 } else {
                                     msg.outstanding_responses = new_outstanding_resp;
@@ -214,8 +214,8 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                             }
 
                             OutstandingMessageType::RequestVote{callback} => {
-                                let payload = RaftResponsePayload::RequestVote(true);
-                                let response = RaftResponseMessage{payload};
+                                let payload = LocalRaftResponsePayload::RequestVote(true);
+                                let response = LocalRaftResponseMessage {payload};
                                 callback.send(response).unwrap();
                             }
                             _ => {
@@ -231,8 +231,8 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                         let _entered = msg.span.enter();
                         match msg.message_type {
                             OutstandingMessageType::RequestVote{callback} => {
-                                let payload = RaftResponsePayload::RequestVote(true);
-                                let response = RaftResponseMessage{payload};
+                                let payload = LocalRaftResponsePayload::RequestVote(true);
+                                let response = LocalRaftResponseMessage {payload};
                                 callback.send(response).unwrap();
                             }
                             _ => {
@@ -267,12 +267,12 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                 if new_acks >= shared_state.quorum_size && persistence_done {
                                     // Log replication done
                                     log::info!("Write batch with message id {} has been persisted on quorum of nodes", id);
-                                    let r = RaftWriteBatchResponse{
+                                    let r = LocalRaftWriteBatchResponse{
                                         responses: vec![], // TODO
                                         err: None
                                     };
-                                    let payload = RaftResponsePayload::WriteBatch(r);
-                                    let response = RaftResponseMessage{payload};
+                                    let payload = LocalRaftResponsePayload::WriteBatch(r);
+                                    let response = LocalRaftResponseMessage {payload};
                                     callback.send(response).unwrap();
                                 } else if new_outstanding_resp > 0 {
                                     msg.outstanding_responses = new_outstanding_resp;
@@ -292,6 +292,12 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                         log::error!("Received quorum event with no outstanding message registered {}", id);
                     }
                 }
+                QuorumTaskResponseType::BackfillLog {member_id: u64, prev_term, prev_index} => {
+                    log::info!("Received backfill log request for member {}, prev_term: {}, prev_index: {}", u64, prev_term, prev_index);
+                    // TODO
+
+
+                }
 
                 _ => {
 
@@ -303,11 +309,11 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         return RaftMessageStateChange::None;
     }
 
-    fn request_vote(&mut self, request_vote_request: RequestVoteRequest, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
+    fn request_vote(&mut self, request_vote_request: LocalRequestVoteRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
         if !self.should_accept_vote(request_vote_request.term, request_vote_request.last_log_term, request_vote_request.last_log_index, shared_state) {
             callback.send(
-                RaftResponseMessage{
-                    payload: RaftResponsePayload::RequestVote(false)
+                LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::RequestVote(false)
                 }
             );
             return RaftMessageStateChange::None

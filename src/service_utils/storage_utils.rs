@@ -1,5 +1,5 @@
 use prost::bytes::Bytes;
-use crate::server::raftproto::PutRequest;
+use crate::server::raftproto::RemotePutRequest;
 use sbe_kraft_replication_schema::command_type::CommandType;
 use sbe_kraft_replication_schema::log_entry_codec::encoder::CommandsEncoder;
 use sbe_kraft_replication_schema::log_entry_codec::{LogEntryDecoder, LogEntryEncoder};
@@ -11,7 +11,7 @@ pub struct SerializationData {
     pub index: u64,
     pub term: u64,
     pub timestamp: u64,
-    pub requests: Vec<PutRequest>,
+    pub requests: Vec<RemotePutRequest>,
 }
 
 #[derive(Clone)]
@@ -63,7 +63,7 @@ pub fn deserialize_data(data: &[u8], offset: usize) -> Result<(usize, Serializat
         if command_decoder.command_type() == CommandType::PUT {
             let coord = command_decoder.payload_decoder();
             let payload = command_decoder.payload_slice(coord); // TODO parse
-            requests.push(PutRequest {
+            requests.push(RemotePutRequest {
                 id: String::new(),
                 payload: String::from_utf8_lossy(payload).to_string(), // Assuming payload is UTF-8 encoded
                 node_id: 0,
@@ -107,12 +107,12 @@ mod tests {
     #[test]
     fn test_serialization() {
         let requests = vec![
-            PutRequest {
+            RemotePutRequest {
                 id: "1".to_string(),
                 payload: "data1".to_string(),
                 node_id: 0,
             },
-            PutRequest {
+            RemotePutRequest {
                 id: "2".to_string(),
                 payload: "data2".to_string(),
                 node_id: 0,
@@ -144,12 +144,12 @@ mod tests {
     fn test_serialization_buffer_with_multiple_log_entries() {
 
         let requests_idx1 = vec![
-            PutRequest {
+            RemotePutRequest {
                 id: "1".to_string(),
                 payload: "data1".to_string(),
                 node_id: 0,
             },
-            PutRequest {
+            RemotePutRequest {
                 id: "2".to_string(),
                 payload: "data2".to_string(),
                 node_id: 0,
@@ -163,12 +163,12 @@ mod tests {
         };
 
         let requests_idx2 = vec![
-            PutRequest {
+            RemotePutRequest {
                 id: "3".to_string(),
                 payload: "data3".to_string(),
                 node_id: 0,
             },
-            PutRequest {
+            RemotePutRequest {
                 id: "4".to_string(),
                 payload: "data4".to_string(),
                 node_id: 0,
@@ -210,12 +210,12 @@ mod tests {
     fn test_deserialize_all() {
 
         let requests_idx1 = vec![
-            PutRequest {
+            RemotePutRequest {
                 id: "1".to_string(),
                 payload: "data1".to_string(),
                 node_id: 0,
             },
-            PutRequest {
+            RemotePutRequest {
                 id: "2".to_string(),
                 payload: "data2".to_string(),
                 node_id: 0,
@@ -229,12 +229,12 @@ mod tests {
         };
 
         let requests_idx2 = vec![
-            PutRequest {
+            RemotePutRequest {
                 id: "3".to_string(),
                 payload: "data3".to_string(),
                 node_id: 0,
             },
-            PutRequest {
+            RemotePutRequest {
                 id: "4".to_string(),
                 payload: "data4".to_string(),
                 node_id: 0,
