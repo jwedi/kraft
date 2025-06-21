@@ -70,7 +70,7 @@ impl WriteQueue {
     pub fn next_write_batch(&mut self, max_batch_size: u64) -> Vec<WriteBatch> {
         let mut responses: Vec<WriteBatch> = vec![];
         let mut current_size: u64 = 0u64;
-        if let Some(mut val) = self.shelved_batch.take() {
+        if let Some(val) = self.shelved_batch.take() {
             current_size += &val.size();
             responses.push(val)
         }

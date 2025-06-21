@@ -2,10 +2,12 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::error::Error;
 use std::future::Future;
+use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::{Arc, Condvar};
 use std::thread::sleep;
 use std::time::Duration;
+use arc_swap::ArcSwap;
 use crossbeam_queue::SegQueue;
 use futures::{FutureExt, StreamExt, TryFuture};
 use log::{error, info};
@@ -28,6 +30,7 @@ use crate::server::raftproto::raft_client::RaftClient;
 use crate::server::raftproto::{AppendEntriesAcknowledge, AppendEntriesRequest, AppendEntriesResponse, LogEntry, QuorumMessage, VoteRequest, VoteResponse};
 use crate::server::raftproto::quorum_message::MessagePayload;
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
+use crate::service_utils::storage_utils::{SerializationData, SerializedData};
 use crate::transport::stream_manager::{StreamManager, StreamManagerImpl};
 use crate::transport::write_proxy::WriteResponse;
 
@@ -121,7 +124,7 @@ impl QuorumWorker {
             propagator: opentelemetry_zipkin::Propagator::new(),
             grpc_channel: SharedGrpcChannel::new(member_endpoint.as_str(), member_id as u32),
             stream_manager,
-            task_queue
+            task_queue,
         }
     }
 
@@ -293,7 +296,7 @@ impl QuorumWorker {
                         break;
                     }
                     Some(Err(err)) => {
-                        log::error!("Receive stream message error, invalidating it: {}", err);
+                        log::error!("Receive stream message error, invalidating both send and receive streams: {}", err);
                         // Kill receive stream
                         receive_error = true;
                         break;
@@ -307,7 +310,10 @@ impl QuorumWorker {
 
             if receive_error {
                 drop(receive_stream);
-                self.stream_manager.reset_receive_stream(self.member_id as u32).await
+                self.stream_manager.reset_receive_stream(self.member_id as u32).await;
+                drop(send_stream);
+                self.stream_manager.reset_send_stream(self.member_id as u32).await;
+                continue
             }
 
             let now = now_millis();
@@ -385,7 +391,7 @@ impl QuorumWorker {
                             }
                         }
                         QuorumTaskType::AppendEntries {id, req, parent_span} => {
-                            // TODO not unwrap
+                            // TODO benchmark copying log entries 3 times and writing to segqueues vs cloning Vectors.
                             send_stream.send(QuorumMessage{message_payload: Some(MessagePayload::AppendEntriesRequestOption(req))}).unwrap();
                             self.last_heartbeat = now_millis();
                         }

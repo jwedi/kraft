@@ -1,4 +1,4 @@
-mod server;
+pub mod server;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar};
@@ -32,6 +32,9 @@ use crate::persistence::worker::{PersistenceConfig, PersistenceResponseType, Per
 use crate::quorum::worker::{QuorumResponse, QuorumTask, QuorumWorker};
 use crate::raft::raft_sm::{OutstandingMessage, RaftMessage, RaftServerState, RaftVolatileState, SharedState};
 use crate::server::raftproto::QuorumMessage;
+use crate::service_utils::app_time::now_millis;
+use crate::service_utils::storage_utils;
+use crate::service_utils::storage_utils::SerializationData;
 use crate::transport::datastore::datastoreproto::datastore_server::DatastoreServer;
 use crate::transport::datastore::DatastoreServerImpl;
 use crate::transport::stream_manager::StreamManagerImpl;
@@ -42,7 +45,7 @@ mod raft_runtime {
     pub mod runtime;
 }
 
-mod service_utils {
+pub mod service_utils {
     pub mod errors;
     pub mod app_time;
     pub mod storage_utils;
@@ -139,6 +142,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Recovered {} votes from disk", num_votes);
 
+    let replication_log_bytes = persistence_worker.read_log()?;
+    let start_deserialization = now_millis();
+    let replication_log: Vec<SerializationData> = if replication_log_bytes.is_empty() {
+        log::warn!("Replication log is empty, starting with an empty log");
+        vec![]
+    } else {
+        log::info!("Recovered replication log with {} bytes", replication_log_bytes.len());
+        storage_utils::deserialize_all_data(replication_log_bytes.as_slice()).unwrap_or_else(|_| {
+            log::warn!("Failed to deserialize replication log, starting with empty log");
+            vec![]
+        })
+    };
+    let last_entry = replication_log.last().clone();
+    let last_log_index = last_entry.map_or(0, |e| e.index);
+    let last_log_term = last_entry.map_or(0, |e| e.term);
+    log::info!("Recovered replication log with {} entries, last index: {}, last term: {}. Deserialization took {} ms", replication_log.len(), last_log_index, last_log_term, now_millis()-start_deserialization);
+
     // TODO read these from append entries? last entry would be the current term, but votes might be higher...
     let default_vote = VoteRow{term: 0, candidate_id: 0};
     let mut maybe_max_vote = votes.iter().max_by(|x, y|  x.term.cmp(&y.term));
@@ -150,10 +170,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let volatile_server_state = RaftVolatileState {
         commit_index: 0,
         last_applied: 0,
-        last_log_index: 0,
-        last_log_term: 0,
+        last_log_index: last_log_index,
+        last_log_term: last_log_term,
         next_term: server_state.current_term+1,
-        next_log_index: 1,
+        next_log_index: last_log_index + 1,
     };
 
 
@@ -288,7 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
 
-    join!(worker_handle, persistence_handle, write_proxy_handle);
+    let _ = join!(worker_handle, persistence_handle, write_proxy_handle);
     join_all(cw_join_handles);
     opentelemetry::global::shutdown_tracer_provider();
     Ok(())

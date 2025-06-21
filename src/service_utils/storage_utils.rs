@@ -1,3 +1,4 @@
+use prost::bytes::Bytes;
 use crate::server::raftproto::PutRequest;
 use sbe_kraft_replication_schema::command_type::CommandType;
 use sbe_kraft_replication_schema::log_entry_codec::encoder::CommandsEncoder;
@@ -12,6 +13,12 @@ pub struct SerializationData {
     pub timestamp: u64,
     pub requests: Vec<PutRequest>,
 }
+
+#[derive(Clone)]
+pub struct SerializedData {
+    pub data: Vec<u8>,
+}
+
 pub fn serialize_data(serialization_data: SerializationData, mut buffer: Vec<u8>, offset: usize) -> (usize, Vec<u8>) {
     let mut entry = LogEntryEncoder::default();
     let mut commands_encoder = CommandsEncoder::default();
@@ -52,7 +59,7 @@ pub fn deserialize_data(data: &[u8], offset: usize) -> Result<(usize, Serializat
     let entries = command_decoder.count();
     let mut requests = Vec::with_capacity(entries as usize);
     for _ in 0..entries {
-        command_decoder.advance();
+        command_decoder.advance().expect("Expected command to be present when decoding");
         if command_decoder.command_type() == CommandType::PUT {
             let coord = command_decoder.payload_decoder();
             let payload = command_decoder.payload_slice(coord); // TODO parse
@@ -74,6 +81,22 @@ pub fn deserialize_data(data: &[u8], offset: usize) -> Result<(usize, Serializat
         },
     ));
 }
+
+pub fn deserialize_all_data(data: &[u8]) -> Result<(Vec<SerializationData>), String> {
+    let mut offset = 0;
+    let mut results = Vec::new();
+    while offset < data.len() {
+        match deserialize_data(data, offset) {
+            Ok((new_offset, serialization_data)) => {
+                results.push(serialization_data);
+                offset = new_offset;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(results)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -181,6 +204,68 @@ mod tests {
         assert_eq!(offset3, offset1);
         assert_eq!(offset4, offset2);
         assert_eq!(buffer.len(), offset2);
+    }
+
+    #[test]
+    fn test_deserialize_all() {
+
+        let requests_idx1 = vec![
+            PutRequest {
+                id: "1".to_string(),
+                payload: "data1".to_string(),
+                node_id: 0,
+            },
+            PutRequest {
+                id: "2".to_string(),
+                payload: "data2".to_string(),
+                node_id: 0,
+            },
+        ];
+        let serialization_data_idx1 = SerializationData {
+            index: 1,
+            term: 1,
+            timestamp: 1234567890,
+            requests: requests_idx1,
+        };
+
+        let requests_idx2 = vec![
+            PutRequest {
+                id: "3".to_string(),
+                payload: "data3".to_string(),
+                node_id: 0,
+            },
+            PutRequest {
+                id: "4".to_string(),
+                payload: "data4".to_string(),
+                node_id: 0,
+            },
+        ];
+        let serialization_data_idx2 = SerializationData {
+            index: 2,
+            term: 2,
+            timestamp: 1234567891,
+            requests: requests_idx2,
+        };
+
+        let mut buffer = vec![0u8; 2048];
+        let (offset1, buffer) = serialize_data(serialization_data_idx1, buffer, 0usize);
+        let (offset2, mut buffer) = serialize_data(serialization_data_idx2, buffer, offset1);
+        buffer.truncate(offset2);
+
+        let data = deserialize_all_data(&buffer).unwrap();
+
+        assert_eq!(data[0].index, 1);
+        assert_eq!(data[0].term, 1);
+        assert_eq!(data[0].timestamp, 1234567890);
+        assert_eq!(data[0].requests.len(), 2);
+        assert_eq!(data[0].requests[0].payload, "data1");
+        assert_eq!(data[0].requests[1].payload, "data2");
+        assert_eq!(data[1].index, 2);
+        assert_eq!(data[1].term, 2);
+        assert_eq!(data[1].timestamp, 1234567891);
+        assert_eq!(data[1].requests.len(), 2);
+        assert_eq!(data[1].requests[0].payload, "data3");
+        assert_eq!(data[1].requests[1].payload, "data4");
     }
 
     #[test]

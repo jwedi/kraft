@@ -66,7 +66,7 @@ impl Datastore for DatastoreServerImpl {
         self.task_queue.push(msg);
         let receive_resp = callback.1.instrument(span).await;
 
-        let ok: bool = match receive_resp {
+        let _: bool = match receive_resp {
             Ok(resp) => {
                 tracing::debug!("put record returned ok");
                 resp.status_code.is_success()

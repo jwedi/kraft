@@ -94,7 +94,23 @@ Performance thoughts.
   - Maybe one NodeHandler per node in the cluster. Is also a State machine, where it continously polls heartbeats while in Leader state.
 
 
+Backfill and copy prevention:
+1. To backfill log entries the leader needs to be able to go back to an arbitrary index in the log and re-issue append entries requests for those entries.
+2. Right now no copies of past append entries requests is kept, so this is non-trivial.
+3. If instead of each quorum worker and persistence worker getting their own copy of the append entries data there would be a shared datastructure with all of the data. Then no copying of data would need to be done by the leader to send it to the actor. The quorum workers could also backfill on their own by reading the log. The event passing between the leader and actors would also be simpler because the meat of the data would be in the shared log and not in the messages.
+4. Alternatives:
+5. im:Vector. Seem to have overall good performance characteristics both for reads and writes
+6. Normal Vec. Good performance characteristics as long as the vec doesn't need to get expanded. Doesn't handle chunking very well AFAIK.
+7. To know which index to start backfilling from given that there are terms, would need some indexing to say which term starts where so you can get index with index of term start + index.
+8. Backfill means that the restarted node tells the leader quorum worker it's last term + index, the quorum node looks up the term start index and fetches index = term_start + prev_index + 1.
+9. On leader write batch. Validate, create new sequence number, append to shared log, write message to actors. Actors read payload from log.
 
+Leader maintains a vec of all previous append entries requests or log entries.
+When a follower needs to backfill it sends a message to the leader with the last term and index it has.
+The leader finds the term start and calculates the index offset. It returns a slice of the log, a Vec<Arc<LogEntry>> that the follower can use to backfill.
+The followers instead of immediately issuing a append entries request when receiving a message from the leader, they add it to a local work backlog and each worker iteration it proceeds with the next entry.
+This way means that the worker only needs one flow for sending append entries request and doesn't get weird when backfilling is in progress.
+The quorum workers should get append entries requests as Arcs from the leader
 
 
 
@@ -146,8 +162,8 @@ TODOs update:
 1. Verify append entries prev index being sent correctly. Done
 2. Respect append entries prev index in follower, i.e don't commit if append entries prev index doesn't match follower last index. Done
 3. Some sort of backfilling in follower, notify leader of the services last index and term so that leader can send log entries for backfilling.
-4. Read log entries from disk on bootup and bootstrap config based on persisted log stuff.
-5. Fix log replication on restarted node. Currently starts up with previous log index being 0.
+4. Read log entries from disk on bootup and bootstrap config based on persisted log stuff. Done
+5. Fix log replication on restarted node. Currently starts up with previous log index being 0. Done
 6. Actually serialize real data and persist to disk. Done
 7. Metrics
 8. Metrics exporter
@@ -160,3 +176,7 @@ TODOs update:
 13. Performance profiling. 
 14. Emit writes to learners?
 15. Send commit index in append entries after persisted on quorum of nodes.
+16. Implement query data structure for reads such as btree.
+17. Don't copy/allocate serialized data for persistence worker and quorum workers.
+- Might not even be possible with prost, doesn't sound like it by researching on the web.
+- Consider pure io_uring or glommio / monoio
