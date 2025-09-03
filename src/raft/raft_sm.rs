@@ -13,6 +13,7 @@ use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::server::raftproto::{RemoteLogEntry, RemotePutRequest, RemotePutResponse};
 use crate::server::raftproto::raft_server::Raft;
 use crate::service_utils::app_time::now_millis;
+use crate::service_utils::storage_utils::SerializationData;
 use crate::transport::write_proxy::{WriteBatch, WriteResponse};
 
 #[derive(Copy, Clone)]
@@ -29,7 +30,7 @@ pub struct TermVote {
     pub node_id: u64
 }
 
-#[derive(Copy, Clone)]
+//#[derive(Copy, Clone)]
 pub struct RaftVolatileState {
     pub commit_index: u64,
     pub last_applied: u64,
@@ -37,6 +38,8 @@ pub struct RaftVolatileState {
     pub last_log_term: u64,
     pub next_term: u64,// 1 more than the largest term value seen.
     pub next_log_index: u64,
+    pub replication_log: Vec<Arc<SerializationData>>,
+    pub replication_log_term_starts: HashMap<u64, u64>,
 }
 
 pub enum OutstandingMessageType {

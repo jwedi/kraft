@@ -23,7 +23,15 @@ use crate::service_utils::storage_utils::{SerializationData, serialize_data};
 pub struct RaftLeaderStateDelegate {
     election_timeout: u128,
     rng: ThreadRng,
-    initialized: bool
+    initialized: bool,
+    max_message_size: usize,
+}
+
+fn clone_subset<T>(data: &[Arc<T>], start: usize, end: usize) -> Vec<Arc<T>> {
+    data[start..end]
+        .iter()
+        .map(Arc::clone) // increments Arc ref count, not deep copy
+        .collect()
 }
 
 impl RaftLeaderStateDelegate {
@@ -34,7 +42,8 @@ impl RaftLeaderStateDelegate {
         Self {
             election_timeout: now + election_timout,
             rng,
-            initialized: false
+            initialized: false,
+            max_message_size: 4096
         }
     }
 }
@@ -57,10 +66,24 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         let _enter = span.enter();
         // TODO validate request
         // TODO serialize valid request bits
-        let buffer = vec![0u8; 2048];
+        let buffer = vec![0u8; self.max_message_size];
         let offset = 0usize;
-        let (limit, mut data) = serialize_data(SerializationData{index: idx, term: shared_state.server_state.current_term, timestamp: now_millis() as u64, requests: write_batch_request.requests}, buffer, offset);
+        let serialization_data = SerializationData{
+            index: idx,
+            term: shared_state.server_state.current_term,
+            timestamp: now_millis() as u64,
+            prev_index: shared_state.volatile_server_state.last_log_index,
+            prev_term: shared_state.volatile_server_state.last_log_term,
+            message_id,
+            requests: write_batch_request.requests
+        };
+        let (limit, mut data) = serialize_data(&serialization_data, buffer, offset);
         data.truncate(limit);
+        if idx == 0 {
+            shared_state.volatile_server_state.replication_log_term_starts.insert(shared_state.server_state.current_term, shared_state.volatile_server_state.replication_log.len() as u64);
+        }
+        shared_state.volatile_server_state.replication_log.push(Arc::new(serialization_data));
+
         // TODO no clone.
         let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: data.clone(), parent_span: Span::current(), request_id: message_id};
         shared_state.persistence_work.push(persistence_task);
@@ -71,7 +94,10 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                 index: idx,
                 data: data.clone(), // TODO maybe fundamental problem with the approach, doesn't support IO without copies...
                 batch_index: idx,
-                term: shared_state.server_state.current_term
+                term: shared_state.server_state.current_term,
+                prev_log_index: shared_state.volatile_server_state.last_log_index,
+                prev_log_term: shared_state.volatile_server_state.last_log_term,
+                message_id: message_id,
             };
             let req = RemoteAppendEntriesRequest {
                 term: shared_state.server_state.current_term,
@@ -102,6 +128,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             span: Span::current()
         };
         shared_state.outstanding_messages.insert(message_id, outstanding_message);
+        // TODO write log entry to volatile state replication log for backfills.
 
         shared_state.volatile_server_state.last_log_term = shared_state.server_state.current_term;
         shared_state.volatile_server_state.next_log_index = idx +1;
@@ -289,14 +316,32 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                             }
                         }
                     } else {
-                        log::error!("Received quorum event with no outstanding message registered {}", id);
+                        log::warn!("Received quorum event with no outstanding message registered {}, maybe backfill", id);
                     }
                 }
-                LocalQuorumTaskResponseType::BackfillLog {member_id: u64, prev_term, prev_index} => {
-                    log::info!("Received backfill log request for member {}, prev_term: {}, prev_index: {}", u64, prev_term, prev_index);
-                    // TODO
-
-
+                LocalQuorumTaskResponseType::BackfillLog { quorum_node_id, prev_term, prev_index} => {
+                    log::info!("Received backfill log request for member {}, prev_term: {}, prev_index: {}", quorum_node_id, prev_term, prev_index);
+                    let start_index = if prev_term == 0 && prev_index == 0 {
+                        0
+                    } else {
+                        // TODO slice index starts at 118923 but ends at 118921. Happens if a previous leader which is ahead asks for backfill.
+                        // https://trello.com/c/2AEY4e8E/2-bug-fix-issue-when-a-member-who-doesnt-have-the-highest-log-index-is-elected-leader
+                        shared_state.volatile_server_state.replication_log_term_starts.get(&prev_term).unwrap().clone() + prev_index + 1
+                    };
+                    let slice = shared_state.volatile_server_state.replication_log.as_slice();
+                    let data_slice = clone_subset(&slice, start_index as usize, slice.len()); // TODO maybe something with prev index
+                    let quorum_node_index = if quorum_node_id > shared_state.identity as u64 {
+                        quorum_node_id - 2
+                    } else {
+                        quorum_node_id - 1
+                    };
+                    let queue = shared_state.quorum_worker_tasks.get(quorum_node_index as usize).unwrap();
+                    queue.push(LocalQuorumWorkerTask{task_type: LocalQuorumWorkerTaskType::BackfillLog{
+                        data: data_slice,
+                    }});
+                }
+                LocalQuorumTaskResponseType::RequestVoteResponse { id, term, received_vote} => {
+                    log::info!("Received vote response for term: {} while already leader for term: {} received_vote: {}", term, shared_state.server_state.current_term, received_vote);
                 }
 
                 _ => {

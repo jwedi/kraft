@@ -176,8 +176,8 @@ impl WriteProxy {
             LocalRaftResponsePayload::WriteBatch (responses ) => {
                 WriteProxy::respond_to_put_responses(responses.responses, batch_callbacks)
             }
-            default => {
-                batch_callbacks.into_iter().for_each(|mut callback| {
+            _ => {
+                batch_callbacks.into_iter().for_each(|callback| {
                     let msg = WriteResponse {
                         responses: vec![],
                         status_code: StatusCode::INTERNAL_SERVER_ERROR

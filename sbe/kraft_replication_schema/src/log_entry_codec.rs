@@ -7,7 +7,7 @@ pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 24;
+pub const SBE_BLOCK_LENGTH: u16 = 48;
 pub const SBE_TEMPLATE_ID: u16 = 2;
 
 pub mod encoder {
@@ -107,6 +107,51 @@ pub mod encoder {
         #[inline]
         pub fn index(&mut self, value: u64) {
             let offset = self.offset + 16;
+            self.get_buf_mut().put_u64_at(offset, value);
+        }
+
+        /// primitive field 'prev_log_index'
+        /// - min value: 0
+        /// - max value: -2
+        /// - null value: 0xffffffffffffffff_u64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 24
+        /// - encodedLength: 8
+        /// - version: 0
+        #[inline]
+        pub fn prev_log_index(&mut self, value: u64) {
+            let offset = self.offset + 24;
+            self.get_buf_mut().put_u64_at(offset, value);
+        }
+
+        /// primitive field 'prev_log_term'
+        /// - min value: 0
+        /// - max value: -2
+        /// - null value: 0xffffffffffffffff_u64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 32
+        /// - encodedLength: 8
+        /// - version: 0
+        #[inline]
+        pub fn prev_log_term(&mut self, value: u64) {
+            let offset = self.offset + 32;
+            self.get_buf_mut().put_u64_at(offset, value);
+        }
+
+        /// primitive field 'message_id'
+        /// - min value: 0
+        /// - max value: -2
+        /// - null value: 0xffffffffffffffff_u64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 40
+        /// - encodedLength: 8
+        /// - version: 0
+        #[inline]
+        pub fn message_id(&mut self, value: u64) {
+            let offset = self.offset + 40;
             self.get_buf_mut().put_u64_at(offset, value);
         }
 
@@ -311,6 +356,24 @@ pub mod decoder {
             self.get_buf().get_u64_at(self.offset + 16)
         }
 
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn prev_log_index(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 24)
+        }
+
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn prev_log_term(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 32)
+        }
+
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn message_id(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 40)
+        }
+
         /// GROUP DECODER (id=8)
         #[inline]
         pub fn commands_decoder(self) -> CommandsDecoder<Self> {
@@ -371,7 +434,7 @@ pub mod decoder {
             self
         }
 
-        /// group token - Token{signal=BEGIN_GROUP, name='commands', referencedName='null', description='null', packageName='null', id=8, version=0, deprecated=0, encodedLength=1, offset=24, componentTokenCount=18, encoding=Encoding{presence=REQUIRED, primitiveType=null, byteOrder=LITTLE_ENDIAN, minValue=null, maxValue=null, nullValue=null, constValue=null, characterEncoding='null', epoch='null', timeUnit=null, semanticType='null'}}
+        /// group token - Token{signal=BEGIN_GROUP, name='commands', referencedName='null', description='null', packageName='null', id=8, version=0, deprecated=0, encodedLength=1, offset=48, componentTokenCount=18, encoding=Encoding{presence=REQUIRED, primitiveType=null, byteOrder=LITTLE_ENDIAN, minValue=null, maxValue=null, nullValue=null, constValue=null, characterEncoding='null', epoch='null', timeUnit=null, semanticType='null'}}
         #[inline]
         pub fn parent(&mut self) -> SbeResult<P> {
             self.parent.take().ok_or(SbeErr::ParentNotSet)

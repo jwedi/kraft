@@ -162,7 +162,6 @@ impl PersistenceWorker {
             // Notice that we need to provide a type hint for automatic
             // deserialization.
             let record: VoteRow = result?;
-            log::info!("{:?}", record);
             votes.push(record)
         }
         Ok(votes)

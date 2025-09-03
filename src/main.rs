@@ -138,22 +138,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         PersistenceConfig{out_dir: cfg.persistence_dir}
     );
     let votes = persistence_worker.read_votes()?;
-    let num_votes = votes.len().to_string();
 
-    log::info!("Recovered {} votes from disk", num_votes);
+    log::info!("Recovered {} votes from disk, last one for {:?}", votes.len(), votes.last());
 
     let replication_log_bytes = persistence_worker.read_log()?;
     let start_deserialization = now_millis();
-    let replication_log: Vec<SerializationData> = if replication_log_bytes.is_empty() {
+    let replication_log: Vec<Arc<SerializationData>> = if replication_log_bytes.is_empty() {
         log::warn!("Replication log is empty, starting with an empty log");
         vec![]
     } else {
         log::info!("Recovered replication log with {} bytes", replication_log_bytes.len());
-        storage_utils::deserialize_all_data(replication_log_bytes.as_slice()).unwrap_or_else(|_| {
+        storage_utils::deserialize_all_data_as_arc(replication_log_bytes.as_slice()).unwrap_or_else(|_| {
             log::warn!("Failed to deserialize replication log, starting with empty log");
             vec![]
         })
     };
+    let mut term_start_index: HashMap<u64, u64> = HashMap::new();
+
+    for (i, entry) in replication_log.iter().enumerate() {
+        if entry.index == 0 {
+            term_start_index.insert(entry.term, i as u64);
+        }
+    }
     let last_entry = replication_log.last().clone();
     let last_log_index = last_entry.map_or(0, |e| e.index);
     let last_log_term = last_entry.map_or(0, |e| e.term);
@@ -174,6 +180,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_log_term: last_log_term,
         next_term: server_state.current_term+1,
         next_log_index: last_log_index + 1,
+        replication_log,
+        replication_log_term_starts: term_start_index
     };
 
 
@@ -205,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // For each cluster_nodes_without_self
     let mut quorum_send_channels: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>> = vec![];
     let cluster_workers: Vec<QuorumWorker> = cluster_nodes_without_self.iter().map(|node| {
-        let mut c_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::<LocalQuorumWorkerTask>::new());
+        let c_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::<LocalQuorumWorkerTask>::new());
         let c_queue_clone = Arc::clone(&c_queue);
         quorum_send_channels.push(c_queue);
         let response_c = Arc::clone(&sm_quorum_response);

@@ -69,7 +69,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                     payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok)
                 }
             ).expect("sending append_entries response callback failed");
-        } else if append_entries_request.term == shared_state.server_state.current_term { // TODO maybe check leader id.
+        } else if append_entries_request.leader_id == shared_state.server_state.leader_id { // TODO maybe check leader id.
             tracing::debug!("received append_entries request from current leader: {}, term: {}", append_entries_request.leader_id, append_entries_request.term);
 
             // Check if heartbeat
@@ -77,11 +77,22 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 // Heartbeat request
                 self.election_timeout = now_plus_duration_millis(Duration::from_millis(self.rng.gen_range(self.election_timeout_min..self.election_timeout_max) as u64));
 
-                callback.send(
-                    LocalRaftResponseMessage {
-                        payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::WantedPreviousEntry { last_term: shared_state.volatile_server_state.last_log_term, last_index: shared_state.volatile_server_state.last_log_index})
-                    }
-                ).expect("sending append_entries response callback failed");
+                if append_entries_request.prev_term != shared_state.volatile_server_state.last_log_term || append_entries_request.prev_index != shared_state.volatile_server_state.last_log_index {
+                    log::info!("non-consecutive heartbeat request: prev term {}, req prev index: {}, state: last log term {}, state: last log index {}, requestId: {}, will request backfill", append_entries_request.prev_term, append_entries_request.prev_index, shared_state.volatile_server_state.last_log_term, shared_state.volatile_server_state.last_log_index, append_entries_request.request_id);
+                    callback.send(
+                        LocalRaftResponseMessage {
+                            payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::WantedPreviousEntry { last_term: shared_state.volatile_server_state.last_log_term, last_index: shared_state.volatile_server_state.last_log_index})
+                        }
+                    ).expect("sending append_entries response callback failed");
+                } else {
+                    log::debug!("consecutive heartbeat req: term {}, index: {}, state: term {}, index {}", append_entries_request.prev_term, append_entries_request.prev_index, shared_state.volatile_server_state.last_log_term, shared_state.volatile_server_state.last_log_index);
+                    callback.send(
+                        LocalRaftResponseMessage {
+                            payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok { })
+                        }
+                    ).expect("sending append_entries response callback failed");
+                }
+
                 return RaftMessageStateChange::None
             }
 
@@ -122,6 +133,10 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: data.to_vec(), parent_span: Span::current(), request_id: append_entries_request.request_id};
             shared_state.persistence_work.push(persistence_task);
 
+            // TODO write to log local replication log
+            // TODO maybe append to term index if first message of term.
+
+
             let message_type = OutstandingMessageType::AppendLog{ callback };
             let outstanding_message = OutstandingMessage{
                 id: message_id,
@@ -131,7 +146,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             };
             shared_state.outstanding_messages.insert(message_id, outstanding_message);
         } else {
-            tracing::info!("received append_entries request from non leader with lower term than current. caller: {}, term: {}, current term: {}", append_entries_request.leader_id, append_entries_request.term, shared_state.server_state.current_term);
+            log::info!("received append_entries request from non leader with lower term than current. caller: {}, term: {}, current term: {}", append_entries_request.leader_id, append_entries_request.term, shared_state.server_state.current_term);
             callback.send(
                 LocalRaftResponseMessage {
                     payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::UnrecognizedLeader)

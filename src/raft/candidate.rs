@@ -210,7 +210,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             }
             shared_state.volatile_server_state.next_term = next_term+1;
             let new_election = OngoingElection{ term: next_term, started_millis: now };
-            let last_term = shared_state.server_state.current_term;
+            let last_term = shared_state.volatile_server_state.last_log_term;
             let last_index = shared_state.volatile_server_state.last_log_index;
 
             self.ongoing_election = Some(new_election);

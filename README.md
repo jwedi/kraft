@@ -179,4 +179,18 @@ TODOs update:
 16. Implement query data structure for reads such as btree.
 17. Don't copy/allocate serialized data for persistence worker and quorum workers.
 - Might not even be possible with prost, doesn't sound like it by researching on the web.
-- Consider pure io_uring or glommio / monoio
+- Consider pure io_uring or glommio / monoio.
+
+TODOs update 2;
+1. Implement query data structure for reads such as btree.
+  - When commit index is updated, the associated log entry gets applied to the read data structure.
+2. Propagate commit index in append entries after persisted on quorum of nodes.
+3. Metrics / Tracing to help identify performance bottlenecks.
+4. Don't copy/allocate serialized data for persistence worker and quorum workers.
+   - Might not even be possible with prost, doesn't sound like it by researching on the web.
+   - Consider pure io_uring or glommio / monoio.
+5. Implement CRUD operations
+6. Refactor
+7. Rename since Kraft is taken already.
+
+Maybe when serving read requests the response is prepared but is only served when follower gets a hearbeat from the leader indicating that it's up to date.
