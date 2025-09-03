@@ -8,11 +8,12 @@ use std::sync::{Arc, Mutex};
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
-use crate::quorum::worker::{QuorumResponse, QuorumTask};
+use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask};
 use crate::raft::follower::RaftFollowerStateDelegate;
-use crate::server::raftproto::{LogEntry, PutRequest, PutResponse};
+use crate::server::raftproto::{RemoteLogEntry, RemotePutRequest, RemotePutResponse};
 use crate::server::raftproto::raft_server::Raft;
 use crate::service_utils::app_time::now_millis;
+use crate::service_utils::storage_utils::SerializationData;
 use crate::transport::write_proxy::{WriteBatch, WriteResponse};
 
 #[derive(Copy, Clone)]
@@ -29,7 +30,7 @@ pub struct TermVote {
     pub node_id: u64
 }
 
-#[derive(Copy, Clone)]
+//#[derive(Copy, Clone)]
 pub struct RaftVolatileState {
     pub commit_index: u64,
     pub last_applied: u64,
@@ -37,13 +38,15 @@ pub struct RaftVolatileState {
     pub last_log_term: u64,
     pub next_term: u64,// 1 more than the largest term value seen.
     pub next_log_index: u64,
+    pub replication_log: Vec<Arc<SerializationData>>,
+    pub replication_log_term_starts: HashMap<u64, u64>,
 }
 
 pub enum OutstandingMessageType {
-    RequestVote{callback: oneshot::Sender<RaftResponseMessage>}, // Request vote from someone else
+    RequestVote{callback: oneshot::Sender<LocalRaftResponseMessage>}, // Request vote from someone else
     CandidateElection{persistence_done: bool, quorum_votes: u32}, // Candidate election by this node.
-    AppendLog{callback: oneshot::Sender<RaftResponseMessage>},
-    WriteBatch{persistence_done: bool, quorum_acks: u32, callback: oneshot::Sender<RaftResponseMessage>}
+    AppendLog{callback: oneshot::Sender<LocalRaftResponseMessage>},
+    WriteBatch{persistence_done: bool, quorum_acks: u32, callback: oneshot::Sender<LocalRaftResponseMessage>}
 }
 
 pub struct OutstandingMessage {
@@ -58,14 +61,14 @@ pub struct SharedState {
     pub volatile_server_state: RaftVolatileState,
     pub persistence_work: Arc<SegQueue<PersistenceTaskType>>,
     pub persistence_response: Arc<SegQueue<PersistenceResponseType>>,
-    pub quorum_work: Arc<SegQueue<QuorumTask>>,
-    pub quorum_response: Arc<SegQueue<QuorumResponse>>,
+    pub quorum_work: Arc<SegQueue<LocalQuorumWorkerTask>>,
+    pub quorum_response: Arc<SegQueue<LocalQuorumResponse>>,
     pub identity: u32,
     pub term_votes: HashMap<u64, u32>, // Term -> candidate_id that was voted for.
     pub next_message_id: u64,
     pub outstanding_messages: HashMap<u64, OutstandingMessage>,
     pub quorum_size: u32,
-    pub quorum_worker_tasks: Vec<Arc<SegQueue<QuorumTask>>>,
+    pub quorum_worker_tasks: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>>,
 }
 
 pub struct StateMachineExecutorImpl {
@@ -102,12 +105,12 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
         }
     }
 
-    fn accept(&mut self, raft_message: RaftMessage) {
+    fn accept(&mut self, raft_message: LocalRaftMessage) {
 
         //log::debug!("delegating raft message to: {:?}", self.state_delegate.get_node_type());
         match raft_message.payload {
 
-            RaftMessagePayload::RequestVote(r) => {
+            LocalRaftMessagePayload::RequestVote(r) => {
                 let span = tracing::span!(Level::INFO, "sm_accept_request_vote");
                 let _enter_span = span.enter();
                 let state_change = self.state_delegate.request_vote(r, raft_message.callback, &mut self.shared_state);
@@ -124,7 +127,7 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                     }
                 }
             }
-            RaftMessagePayload::AppendEntries(r) => {
+            LocalRaftMessagePayload::AppendEntries(r) => {
                 let span = tracing::span!(Level::INFO, "sm_append_entries");
                 span.set_parent(raft_message.parent_span.context());
                 let _enter_span = span.enter();
@@ -142,18 +145,18 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                     }
                 }
             }
-            RaftMessagePayload::GetRaftState => {
+            LocalRaftMessagePayload::GetRaftState => {
                 let span = tracing::span!(Level::INFO, "sm_get_raft_state");
                 span.set_parent(raft_message.parent_span.context());
                 span.in_scope(|| {
-                    let resp_payload = RaftResponsePayload::RaftState {leader_id: self.shared_state.server_state.leader_id};
-                    let resp = RaftResponseMessage {
+                    let resp_payload = LocalRaftResponsePayload::RaftState {leader_id: self.shared_state.server_state.leader_id};
+                    let resp = LocalRaftResponseMessage {
                         payload: resp_payload
                     };
                     raft_message.callback.send(resp).expect("Sending raft callback should not fail")
                 })
             }
-            RaftMessagePayload::WriteBatch(batch) => {
+            LocalRaftMessagePayload::WriteBatch(batch) => {
                 let span = tracing::span!(Level::INFO, "sm_write_batch");
                 span.set_parent(raft_message.parent_span.context());
                 let _enter_span = span.enter();
@@ -162,12 +165,12 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                     self.state_delegate.write_batch(batch, raft_message.callback, &mut self.shared_state)
                 } else {
                     log::error!("Received write batch as non-leader. Leader is {}", self.shared_state.server_state.leader_id);
-                    let resp = RaftWriteBatchResponse{
+                    let resp = LocalRaftWriteBatchResponse {
                         responses: vec![],
                         err: Some("Received write batch as non-leader".to_string())
                     };
-                    let msg = RaftResponsePayload::WriteBatch(resp);
-                    raft_message.callback.send(RaftResponseMessage{payload: msg}).expect("Sending raft callback should not fail")
+                    let msg = LocalRaftResponsePayload::WriteBatch(resp);
+                    raft_message.callback.send(LocalRaftResponseMessage {payload: msg}).expect("Sending raft callback should not fail")
                 }
 
             }
@@ -176,7 +179,7 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
 }
 
 pub trait RaftStateMachineExecutor {
-    fn accept(&mut self, raft_message: RaftMessage);
+    fn accept(&mut self, raft_message: LocalRaftMessage);
 
     fn time_step(&mut self);
 }
@@ -187,16 +190,16 @@ pub trait RaftProtocol {
     fn init(&self);
 
     fn get_node_type(&self) -> RaftNodeType;
-    fn request_vote(&mut self, request_vote_request: RequestVoteRequest, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange;
-    fn append_entries(&mut self, append_entries_request: AppendEntries, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange;
+    fn request_vote(&mut self, request_vote_request: LocalRequestVoteRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange;
+    fn append_entries(&mut self, append_entries_request: LocalAppendEntries, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange;
 
-    fn write_batch(&mut self, write_batch_request: RaftWriteBatchRequest, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) {
+    fn write_batch(&mut self, write_batch_request: LocalRaftWriteBatchRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) {
         tracing::error!(message = "write batch not allowed in this node state");
     }
 
     fn time_step(&mut self, shared_state: &mut SharedState) -> RaftMessageStateChange;
 
-    fn validate_append_entries(&mut self, append_entries_request: &AppendEntries, prev_index: u64, prev_term: u64) -> bool {
+    fn validate_append_entries(&mut self, append_entries_request: &LocalAppendEntries, prev_index: u64, prev_term: u64) -> bool {
         if append_entries_request.prev_term != prev_term {
             return false
         }
@@ -229,65 +232,65 @@ pub struct StateMachineResponse {
 
 }
 
-pub struct RequestVoteRequest {
+pub struct LocalRequestVoteRequest {
     pub term: u64,
     pub candidate_id: u32,
     pub last_log_index: u64,
     pub last_log_term: u64
 }
 
-pub struct AppendEntries {
+pub struct LocalAppendEntries {
     pub term: u64,
     pub leader_id: u32,
-    pub entries: Vec<LogEntry>,
+    pub entries: Vec<RemoteLogEntry>,
     pub prev_index: u64,
     pub prev_term: u64,
     pub request_id: u64,
-    pub entry: Option<LogEntry>
+    pub entry: Option<RemoteLogEntry>
 }
 
-pub struct RaftMessage {
-    pub payload: RaftMessagePayload,
+pub struct LocalRaftMessage {
+    pub payload: LocalRaftMessagePayload,
     pub parent_span: Span,
-    pub callback: oneshot::Sender<RaftResponseMessage>,
+    pub callback: oneshot::Sender<LocalRaftResponseMessage>,
 }
 
 #[derive(Debug)]
-pub enum RaftResponsePayload {
+pub enum LocalRaftResponsePayload {
     None,
     RequestVote(bool), // granted
-    AppendEntries(AppendEntriesCallbackResponse), // OK
+    AppendEntries(LocalAppendEntriesCallbackResponse), // OK
     RaftState{leader_id: u32},
-    WriteBatch(RaftWriteBatchResponse)
+    WriteBatch(LocalRaftWriteBatchResponse)
 }
 
 #[derive(Debug)]
-pub enum AppendEntriesCallbackResponse {
+pub enum LocalAppendEntriesCallbackResponse {
     Ok,
     UnrecognizedLeader,
     WantedPreviousEntry{ last_term: u64, last_index: u64} // Want the entry that follows the given term and index
 }
 
 #[derive(Debug)]
-pub struct RaftWriteBatchResponse {
-    pub responses: Vec<PutResponse>,
+pub struct LocalRaftWriteBatchResponse {
+    pub responses: Vec<RemotePutResponse>,
     pub err: Option<String>
 }
 
 #[derive(Debug)]
-pub struct RaftResponseMessage {
-    pub payload: RaftResponsePayload,
+pub struct LocalRaftResponseMessage {
+    pub payload: LocalRaftResponsePayload,
 }
 
-pub struct RaftWriteBatchRequest {
-    pub requests: Vec<PutRequest>,
+pub struct LocalRaftWriteBatchRequest {
+    pub requests: Vec<RemotePutRequest>,
 }
 
-pub enum RaftMessagePayload {
-    RequestVote(RequestVoteRequest),
-    AppendEntries(AppendEntries),
+pub enum LocalRaftMessagePayload {
+    RequestVote(LocalRequestVoteRequest),
+    AppendEntries(LocalAppendEntries),
     GetRaftState,
-    WriteBatch(RaftWriteBatchRequest)
+    WriteBatch(LocalRaftWriteBatchRequest),
 }
 
 pub enum RaftMessageStateChange {
@@ -311,19 +314,19 @@ struct RaftState {
 pub struct FollowerState {
     pub current_term: u64,
     pub voted_for: Option<u64>,
-    pub log: Vec<LogEntry>
+    pub log: Vec<RemoteLogEntry>
 }
 
 pub struct LeaderState {
     pub current_term: u64,
-    pub log : Vec<LogEntry>,
+    pub log : Vec<RemoteLogEntry>,
     pub max_heartbeat_cadence: u64,
 }
 
 pub struct RaftSM {
     pub current_term: u64,
     pub voted_for: Option<u64>,
-    pub log: Vec<LogEntry>
+    pub log: Vec<RemoteLogEntry>
 
 }
 

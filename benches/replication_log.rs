@@ -250,6 +250,62 @@ fn solution_four(data: Vec<SerializedData>) {
     handle4.join().unwrap();
 }
 
+fn solution_five(data: Vec<SerializedData>) {
+
+    let queue_1: Arc<SegQueue<Arc<SerializedData>>> = Arc::new(SegQueue::new());
+    let write_queue_1 = Arc::clone(&queue_1);
+
+    let queue_2: Arc<SegQueue<Arc<SerializedData>>> = Arc::new(SegQueue::new());
+    let write_queue_2 = Arc::clone(&queue_2);
+
+    let queue_3: Arc<SegQueue<Vec<Arc<SerializedData>>>> = Arc::new(SegQueue::new());
+    let write_clone_queue_1: Arc<SegQueue<Vec<Arc<SerializedData>>>> = Arc::new(SegQueue::new());
+
+    let handle = thread::spawn(move || {
+        let mut local_vec: Vec<Arc<SerializedData>> = Vec::with_capacity(100000);
+        for item in data {
+            let arc_item = Arc::new(item);
+            write_queue_1.push(Arc::clone(&arc_item));
+            write_queue_2.push(Arc::clone(&arc_item));
+            local_vec.push(arc_item);
+        }
+        write_clone_queue_1.push(local_vec.clone());
+        black_box(local_vec);
+    });
+
+    let handle2 = thread::spawn(move || {
+        let mut i = 0;
+        while i < DATA_SIZE {
+            if let Some(data) = queue_1.pop() {
+                black_box(data);
+                i += 1;
+            }
+        }
+    });
+
+    let handle3 = thread::spawn(move || {
+        let mut i = 0;
+        while i < DATA_SIZE {
+            if let Some(data) = queue_2.pop() {
+                black_box(data);
+                i += 1;
+            }
+        }
+    });
+
+    let handle4 = thread::spawn(move || {
+        if let Some(data) = queue_3.pop() {
+            black_box(data);
+        }
+    });
+
+
+    handle.join().unwrap();
+    handle2.join().unwrap();
+    handle3.join().unwrap();
+    handle4.join().unwrap();
+}
+
 fn benchmark(c: &mut Criterion) {
     let mut serialized_data: Vec<SerializedData> = vec![];
     for i in 0..DATA_SIZE+2 {
@@ -262,6 +318,7 @@ fn benchmark(c: &mut Criterion) {
     c.bench_function("solution_two", |b| b.iter(|| solution_two(serialized_data.clone())));
     c.bench_function("solution_three", |b| b.iter(|| solution_three(serialized_data.clone())));
     c.bench_function("solution_four", |b| b.iter(|| solution_four(serialized_data.clone())));
+    c.bench_function("solution_five", |b| b.iter(|| solution_five(serialized_data.clone())));
 }
 
 criterion_group!(benches, benchmark);

@@ -11,15 +11,15 @@ use tokio::sync::oneshot::{Receiver, Sender};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use crate::runtime_core::task_buffer::TaskBufferImpl;
 use crate::runtime_core::types::{Command, RuntimeTask, RuntimeTaskResponse, CommandType};
-use crate::server::raftproto::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse, PutBatchRequest, PutBatchResponse, PutResponse, QuorumMessage, StreamResponse};
+use crate::server::raftproto::{RemoteAppendEntriesRequest, RemoteAppendEntriesResponse, RemoteVoteRequest, RemoteVoteResponse, RemotePutBatchRequest, RemotePutBatchResponse, RemotePutResponse, RemoteQuorumMessage, StreamResponse};
 use crate::service_utils::errors::ServiceError;
-use crate::raft::raft_sm::{RaftStateMachineExecutor, StateMachineExecutorImpl, RaftServerState, TermVote, RaftVolatileState, SharedState, RaftMessage, RaftMessagePayload, RequestVoteRequest, RaftResponseMessage, RaftResponsePayload, AppendEntries, RaftWriteBatchRequest, AppendEntriesCallbackResponse};
+use crate::raft::raft_sm::{RaftStateMachineExecutor, StateMachineExecutorImpl, RaftServerState, TermVote, RaftVolatileState, SharedState, LocalRaftMessage, LocalRaftMessagePayload, LocalRequestVoteRequest, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalAppendEntries, LocalRaftWriteBatchRequest, LocalAppendEntriesCallbackResponse};
 use crossbeam_queue::SegQueue;
 use futures::FutureExt;
 use tokio::sync::oneshot::error::RecvError;
 use tracing::{instrument, Instrument, Level, Span};
 use crate::persistence::worker::PersistenceTaskType;
-use crate::server::raftproto::quorum_message::MessagePayload;
+use crate::server::raftproto::remote_quorum_message::MessagePayload;
 use crate::transport::stream_manager::StreamManagerImpl;
 
 pub mod ping {
@@ -49,12 +49,12 @@ impl PingPong for PingServer {
 }
 
 pub struct QueueWorker {
-    work_queue: Arc<SegQueue<RaftMessage>>,
+    work_queue: Arc<SegQueue<LocalRaftMessage>>,
     state_machine: Box<StateMachineExecutorImpl>,
 }
 
 impl QueueWorker {
-    pub fn new(work_queue: Arc<SegQueue<RaftMessage>>, shared_state: SharedState) -> Self {
+    pub fn new(work_queue: Arc<SegQueue<LocalRaftMessage>>, shared_state: SharedState) -> Self {
         Self {
             work_queue,
             state_machine: Box::new(StateMachineExecutorImpl::new(shared_state))
@@ -82,7 +82,7 @@ impl QueueWorker {
 
 #[derive(Debug)]
 pub struct RaftServerImpl {
-    pub task_queue: Arc<SegQueue<RaftMessage>>,
+    pub task_queue: Arc<SegQueue<LocalRaftMessage>>,
     pub self_id: u32,
     pub stream_manager: Arc<StreamManagerImpl>
 }
@@ -90,7 +90,7 @@ pub struct RaftServerImpl {
 #[tonic::async_trait]
 impl Raft for RaftServerImpl {
 
-    async fn messages(&self, req: Request<tonic::Streaming<QuorumMessage>>) -> Result<Response<StreamResponse>, Status> {
+    async fn messages(&self, req: Request<tonic::Streaming<RemoteQuorumMessage>>) -> Result<Response<StreamResponse>, Status> {
         log::info!("Received stream connect request");
         let n_id = req.metadata().get("x-node-id");
         let node_id = n_id.unwrap().to_str().unwrap().parse::<u32>().unwrap();
@@ -105,17 +105,17 @@ impl Raft for RaftServerImpl {
     }
 
     #[instrument]
-    async fn put_batch(&self, request: Request<PutBatchRequest>) -> Result<Response<PutBatchResponse>, Status> {
+    async fn put_batch(&self, request: Request<RemotePutBatchRequest>) -> Result<Response<RemotePutBatchResponse>, Status> {
         tracing::info!("received put_batch request");
 
         let req = request.into_inner();
-        let callback: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
-        let payload = RaftMessagePayload::WriteBatch(RaftWriteBatchRequest{
+        let callback: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
+        let payload = LocalRaftMessagePayload::WriteBatch(LocalRaftWriteBatchRequest {
             requests: req.put_request,
         });
 
         let span = tracing::span!(Level::INFO, "awaiting_put_batch");
-        let msg = RaftMessage{
+        let msg = LocalRaftMessage {
             payload,
             callback: callback.0,
             parent_span: span.clone()
@@ -126,23 +126,23 @@ impl Raft for RaftServerImpl {
         let ok: bool = match receive_resp {
             Ok(resp) => {
                 match resp.payload {
-                    RaftResponsePayload::AppendEntries(_) => {
+                    LocalRaftResponsePayload::AppendEntries(_) => {
                         tracing::error!("put batch unexpected response type append entries");
                         false
                     }
-                    RaftResponsePayload::None => {
+                    LocalRaftResponsePayload::None => {
                         tracing::error!("put batch unexpected response type none");
                         false
                     }
-                    RaftResponsePayload::RequestVote(_) => {
+                    LocalRaftResponsePayload::RequestVote(_) => {
                         tracing::error!("put batch unexpected response type, request vote");
                         false
                     }
-                    RaftResponsePayload::RaftState { .. } => {
+                    LocalRaftResponsePayload::RaftState { .. } => {
                         tracing::error!("put batch unexpected response type, raft state");
                         false
                     }
-                    RaftResponsePayload::WriteBatch(resp) => {
+                    LocalRaftResponsePayload::WriteBatch(resp) => {
                         tracing::info!("write batch responses {}", resp.responses.len());
                         true
                     }
@@ -154,9 +154,9 @@ impl Raft for RaftServerImpl {
             }
         };
 
-        let response = PutBatchResponse {
+        let response = RemotePutBatchResponse {
             responses: vec![
-                PutResponse{
+                RemotePutResponse{
                     id: "1234".to_string(),
                     message: "".to_string(),
                     response_type: 0,
@@ -169,11 +169,11 @@ impl Raft for RaftServerImpl {
     }
 
     #[instrument]
-    async fn append_entries(&self, request: Request<AppendEntriesRequest>) -> Result<Response<AppendEntriesResponse>, Status> {
+    async fn append_entries(&self, request: Request<RemoteAppendEntriesRequest>) -> Result<Response<RemoteAppendEntriesResponse>, Status> {
         tracing::debug!("received append_entries request");
         let req = request.into_inner();
-        let callback: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
-        let payload = RaftMessagePayload::AppendEntries(AppendEntries {
+        let callback: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
+        let payload = LocalRaftMessagePayload::AppendEntries(LocalAppendEntries {
             term: req.term,
             leader_id: req.leader_id,
             prev_index: req.prev_log_index,
@@ -183,7 +183,7 @@ impl Raft for RaftServerImpl {
             entry: req.entry
         });
         let span = tracing::span!(Level::INFO, "awaiting_append_entries");
-        let msg = RaftMessage{
+        let msg = LocalRaftMessage {
             payload,
             callback: callback.0,
             parent_span: span.clone()
@@ -194,34 +194,34 @@ impl Raft for RaftServerImpl {
         let ok: bool = match receive_resp {
             Ok(resp) => {
                 match resp.payload {
-                    RaftResponsePayload::AppendEntries(append_entries_resp) => {
+                    LocalRaftResponsePayload::AppendEntries(append_entries_resp) => {
                         match append_entries_resp {
-                            AppendEntriesCallbackResponse::Ok => {
+                            LocalAppendEntriesCallbackResponse::Ok => {
                                 true
                             }
-                            AppendEntriesCallbackResponse::UnrecognizedLeader => {
+                            LocalAppendEntriesCallbackResponse::UnrecognizedLeader => {
                                 tracing::warn!("append entries response from channel received unrecognized leader: term: {}, leader {}", req.term, req.leader_id);
                                 false
                             }
-                            AppendEntriesCallbackResponse::WantedPreviousEntry { last_term, last_index } => {
+                            LocalAppendEntriesCallbackResponse::WantedPreviousEntry { last_term, last_index } => {
                                 tracing::warn!("append entries response from channel received wanted previous entry: last term {} last index {}, req term {} req index {}", last_term, last_index, req.prev_log_term, req.prev_log_index);
                                 false
                             }
                         }
                     }
-                    RaftResponsePayload::None => {
+                    LocalRaftResponsePayload::None => {
                         tracing::error!("append entries unexpected response type {} {}, None", req.term, req.leader_id);
                         false
                     }
-                    RaftResponsePayload::RequestVote(_) => {
+                    LocalRaftResponsePayload::RequestVote(_) => {
                         tracing::error!("append entries unexpected response type {} {}, RequestVote", req.term, req.leader_id);
                         false
                     }
-                    RaftResponsePayload::RaftState { .. } => {
+                    LocalRaftResponsePayload::RaftState { .. } => {
                         tracing::error!("append entries unexpected response type {} {}, RaftState", req.term, req.leader_id);
                         false
                     }
-                    RaftResponsePayload::WriteBatch(_) => {
+                    LocalRaftResponsePayload::WriteBatch(_) => {
                         tracing::error!("append entries unexpected response type {} {}, WriteBatch", req.term, req.leader_id);
                         false
                     }
@@ -233,26 +233,26 @@ impl Raft for RaftServerImpl {
             }
         };
         tracing::debug!("append entries response ok: {} term: {} leader: {}", ok, req.term, req.leader_id);
-        let response = AppendEntriesResponse {
+        let response = RemoteAppendEntriesResponse {
             ok
         };
         Ok(Response::new(response))
     }
 
     #[instrument]
-    async fn request_vote(&self, request: Request<VoteRequest>) -> Result<Response<VoteResponse>, Status> {
+    async fn request_vote(&self, request: Request<RemoteVoteRequest>) -> Result<Response<RemoteVoteResponse>, Status> {
         tracing::info!("received request_vote request");
 
-        let callback: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
+        let callback: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
         let req = request.into_inner();
-        let payload = RaftMessagePayload::RequestVote(RequestVoteRequest {
+        let payload = LocalRaftMessagePayload::RequestVote(LocalRequestVoteRequest {
             term: req.term,
             candidate_id: req.candidate_id,
             last_log_index: req.last_log_index,
             last_log_term: req.last_log_term,
         });
         let span = tracing::span!(Level::INFO, "awaiting_request_vote");
-        let msg = RaftMessage{
+        let msg = LocalRaftMessage {
             payload,
             callback: callback.0,
             parent_span: span.clone()
@@ -263,10 +263,10 @@ impl Raft for RaftServerImpl {
         let vote_granted: bool = match receive_resp {
             Ok(resp) => {
                 match resp.payload {
-                    RaftResponsePayload::None => {
+                    LocalRaftResponsePayload::None => {
                         false
                     }
-                    RaftResponsePayload::RequestVote(vote_granted) => {
+                    LocalRaftResponsePayload::RequestVote(vote_granted) => {
                         vote_granted
                     }
                     default => {
@@ -280,7 +280,7 @@ impl Raft for RaftServerImpl {
             }
         };
 
-        let response = VoteResponse {
+        let response = RemoteVoteResponse {
             vote_granted,
             term: req.term,
             request_id: req.request_id

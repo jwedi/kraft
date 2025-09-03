@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use ping::ping_pong_client::{PingPongClient};
 use ping::{PingRequest};
 use raftproto::raft_client::{RaftClient};
-use raftproto::{AppendEntriesRequest, VoteRequest};
+use raftproto::{RemoteAppendEntriesRequest, RemoteVoteRequest};
 use futures::future;
 use tonic::transport::Channel;
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use datastoreproto::datastore_client::{DatastoreClient};
 use crate::datastoreproto::PutDataStoreRecordRequest;
 use chrono::Utc;
 use uuid::Uuid;
-use crate::raftproto::LogEntry;
+use crate::raftproto::RemoteLogEntry;
 
 pub mod ping {
     tonic::include_proto!("ping"); // The string specified here must match the proto package name
@@ -41,18 +41,21 @@ async fn do_ping() -> Result<(), Box<dyn std::error::Error>> {
 async fn do_append_entries() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = RaftClient::connect("http://[::1]:50051").await?;
 
-    let request = tonic::Request::new(AppendEntriesRequest {
+    let request = tonic::Request::new(RemoteAppendEntriesRequest {
         request_id: 0,
         term: 1,
         leader_id: 1,
         prev_log_index: 0,
         prev_log_term: 0,
         entries: vec![],
-        entry: Some(LogEntry {
+        entry: Some(RemoteLogEntry {
             term: 1,
             index: 0,
             data: vec![1, 2, 3, 4],
-            batch_index: 0
+            batch_index: 0,
+            message_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
         }),
     });
     let response = client.append_entries(request).await?;
@@ -145,18 +148,21 @@ async fn do_append_entries_async() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut client = RaftClient::new(channel.clone());
         async move {
-            let request = tonic::Request::new(AppendEntriesRequest {
+            let request = tonic::Request::new(RemoteAppendEntriesRequest {
                 request_id: 0,
                 term: 1,
                 leader_id: 1,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: vec![],
-                entry: Some(LogEntry {
+                entry: Some(RemoteLogEntry {
                     term: 1,
                     index: 0,
                     data: vec![1, 2, 3, 4],
-                    batch_index: 0
+                    batch_index: 0,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    message_id: 0
                 }),
             });
 
@@ -188,15 +194,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_time = Instant::now();
     //do_write_batch_async().await?;
 
+
     loop {
         //do_append_entries_async().await?;
         do_write_batch_async().await?;
+
         iterations += 1;
         if iterations % 10 == 0 {
             log::info!("10 iterations completed after {}", last_time.elapsed().as_millis());
             last_time = Instant::now();
         }
     }
+
 
     Ok(())
 }

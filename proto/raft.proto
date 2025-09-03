@@ -1,35 +1,38 @@
 syntax = "proto3";
 package raftproto;
 
-message AppendEntriesRequest {
+message RemoteAppendEntriesRequest {
     uint64 term = 1;
     uint32 leader_id = 2;
     uint64 prev_log_index = 3;
     uint64 prev_log_term = 4;
-    repeated LogEntry entries = 5; // TODO delete this
+    repeated RemoteLogEntry entries = 5; // TODO delete this
     uint64 request_id = 6;
-    LogEntry entry = 7;
+    RemoteLogEntry entry = 7;
 }
 
-message AppendEntriesAcknowledge {
-    uint64 term = 1;
-    uint64 log_index = 2;
+message RemoteAppendEntriesAcknowledge {
+    uint64 last_log_term = 1;
+    uint64 last_log_index = 2;
     uint64 request_id = 3;
     bool ok = 4;
 }
 
-message AppendEntriesResponse {
+message RemoteAppendEntriesResponse {
     bool ok = 1;
 }
 
-message LogEntry {
+message RemoteLogEntry {
     uint64 index = 1;
     bytes data = 2;
     uint64 batch_index = 3;
     uint64 term = 4;
+    uint64 prev_log_term = 5;
+    uint64 prev_log_index = 6;
+    uint64 message_id = 7;
 }
 
-message VoteRequest {
+message RemoteVoteRequest {
     uint64 term = 1;
     uint32 candidate_id = 2;
     uint64 last_log_index = 3;
@@ -37,56 +40,56 @@ message VoteRequest {
     uint64 request_id = 5;
 }
 
-message VoteResponse {
+message RemoteVoteResponse {
     bool vote_granted = 1;
     uint64 request_id = 2;
     uint64 term = 3;
 }
 
-message PutRequest {
+message RemotePutRequest {
     string id = 1;
     string payload = 2;
     uint32 node_id = 3;
 }
 
-message PutBatchRequest {
-    repeated PutRequest put_request = 1;
+message RemotePutBatchRequest {
+    repeated RemotePutRequest put_request = 1;
 }
 
-enum ResponseType {
-    RESPONSE_TYPE_UNSPECIFIED = 0;
-    RESPONSE_TYPE_OK = 1;
-    RESPONSE_TYPE_INVALID = 2;
+enum RemoteResponseType {
+    REMOTE_RESPONSE_TYPE_UNSPECIFIED = 0;
+    REMOTE_RESPONSE_TYPE_OK = 1;
+    REMOTE_RESPONSE_TYPE_INVALID = 2;
 }
 
-message PutResponse {
+message RemotePutResponse {
     string id = 1;
-    ResponseType response_type = 2;
+    RemoteResponseType response_type = 2;
     string message = 3;
     uint32 node_id = 4;
     string batch_id = 5;
 }
 
-message PutBatchResponse {
-    repeated PutResponse responses = 1;
+message RemotePutBatchResponse {
+    repeated RemotePutResponse responses = 1;
 }
 
-message ConnectRequest {
+message RemoteConnectRequest {
     uint32 node_id = 1;
 }
 
-message ConnectResponse {
+message RemoteConnectResponse {
     bool ok = 1;
 }
 
-message QuorumMessage {
+message RemoteQuorumMessage {
     oneof message_payload {
-        ConnectRequest connect_request_option = 1;
-        ConnectResponse connect_response_option = 2;
-        VoteRequest vote_request_option = 3;
-        VoteResponse vote_response_option = 4;
-        AppendEntriesRequest append_entries_request_option = 5;
-        AppendEntriesAcknowledge append_entries_acknowledge_option = 6;
+        RemoteConnectRequest connect_request_option = 1;
+        RemoteConnectResponse connect_response_option = 2;
+        RemoteVoteRequest vote_request_option = 3;
+        RemoteVoteResponse vote_response_option = 4;
+        RemoteAppendEntriesRequest append_entries_request_option = 5;
+        RemoteAppendEntriesAcknowledge append_entries_acknowledge_option = 6;
     }
 }
 
@@ -95,9 +98,9 @@ message StreamResponse {
 }
 
 service Raft {
-    rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
-    rpc RequestVote (VoteRequest) returns (VoteResponse);
-    rpc PutBatch (PutBatchRequest) returns (PutBatchResponse);
-    rpc Messages(stream QuorumMessage) returns (StreamResponse);
+    rpc AppendEntries (RemoteAppendEntriesRequest) returns (RemoteAppendEntriesResponse);
+    rpc RequestVote (RemoteVoteRequest) returns (RemoteVoteResponse);
+    rpc PutBatch (RemotePutBatchRequest) returns (RemotePutBatchResponse);
+    rpc Messages(stream RemoteQuorumMessage) returns (StreamResponse);
 }
 

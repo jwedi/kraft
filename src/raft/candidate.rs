@@ -7,10 +7,10 @@ use tokio::sync::oneshot;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
-use crate::quorum::worker::{QuorumResponse, QuorumTask, QuorumTaskResponseType, QuorumTaskType};
+use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::raft::leader::RaftLeaderStateDelegate;
-use crate::raft::raft_sm::{AppendEntries, AppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, RaftResponseMessage, RaftResponsePayload, RaftServerState, RaftVolatileState, RequestVoteRequest, SharedState, TermVote};
+use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRequestVoteRequest, SharedState, TermVote};
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
 
 struct OngoingElection {
@@ -40,7 +40,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
     fn get_node_type(&self) -> RaftNodeType {
         RaftNodeType::Candidate
     }
-    fn append_entries(&mut self, append_entries_request: AppendEntries, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
+    fn append_entries(&mut self, append_entries_request: LocalAppendEntries, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
         tracing::debug!("handling append entries for term: {}, current term: {}", append_entries_request.term, shared_state.server_state.current_term);
         if append_entries_request.term >= shared_state.server_state.current_term {
             log::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
@@ -62,16 +62,16 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             }
 
             callback.send(
-                RaftResponseMessage{
-                    payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::Ok)
+                LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok)
                 }
             ).expect("Sending channel message failed");
             return RaftMessageStateChange::Follower(Box::new(RaftFollowerStateDelegate::new()));
 
         } else {
             callback.send(
-                RaftResponseMessage{
-                    payload: RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::UnrecognizedLeader)
+                LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::UnrecognizedLeader)
                 }
             ).expect("Sending channel message failed");
         }
@@ -90,8 +90,8 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                         let new_outstanding_resp = msg.outstanding_responses-1; // Maybe remove
                         match msg.message_type {
                             OutstandingMessageType::RequestVote{callback} => {
-                                let payload = RaftResponsePayload::RequestVote(true);
-                                let response = RaftResponseMessage{payload};
+                                let payload = LocalRaftResponsePayload::RequestVote(true);
+                                let response = LocalRaftResponseMessage {payload};
                                 callback.send(response).unwrap();
                             }
 
@@ -123,8 +123,8 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                         let _entered = msg.span.enter();
                         match msg.message_type {
                             OutstandingMessageType::AppendLog{callback} => {
-                                let payload = RaftResponsePayload::AppendEntries(AppendEntriesCallbackResponse::Ok);
-                                let response = RaftResponseMessage{payload};
+                                let payload = LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok);
+                                let response = LocalRaftResponseMessage {payload};
                                 callback.send(response).unwrap();
                             }
                             _ => {
@@ -141,7 +141,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
 
         while let Some(task) = shared_state.quorum_response.pop() {
             match task.response_type {
-                QuorumTaskResponseType::RequestVoteResponse { id, term, received_vote } => {
+                LocalQuorumTaskResponseType::RequestVoteResponse { id, term, received_vote } => {
                     if let Some(mut msg) = shared_state.outstanding_messages.remove(&id) {
                         let span_clone = msg.span.clone();
                         let _entered = span_clone.enter();
@@ -149,8 +149,8 @@ impl RaftProtocol for RaftCandidateStateDelegate {
 
                         match msg.message_type {
                             OutstandingMessageType::RequestVote{callback} => {
-                                let payload = RaftResponsePayload::RequestVote(received_vote);
-                                let response = RaftResponseMessage{payload};
+                                let payload = LocalRaftResponsePayload::RequestVote(received_vote);
+                                let response = LocalRaftResponseMessage {payload};
                                 callback.send(response).unwrap();
                             }
 
@@ -178,8 +178,8 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                 }
                             }
                             OutstandingMessageType::AppendLog{callback} => {
-                                let payload = RaftResponsePayload::RequestVote(received_vote);
-                                let response = RaftResponseMessage{payload};
+                                let payload = LocalRaftResponsePayload::RequestVote(received_vote);
+                                let response = LocalRaftResponseMessage {payload};
                                 callback.send(response).unwrap();
                             }
 
@@ -210,7 +210,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             }
             shared_state.volatile_server_state.next_term = next_term+1;
             let new_election = OngoingElection{ term: next_term, started_millis: now };
-            let last_term = shared_state.server_state.current_term;
+            let last_term = shared_state.volatile_server_state.last_log_term;
             let last_index = shared_state.volatile_server_state.last_log_index;
 
             self.ongoing_election = Some(new_election);
@@ -219,8 +219,8 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             let _enter = span.enter();
             shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
                 let quorum_span = Span::current();
-                let task = QuorumTaskType::RequestVote{ id: message_id, term: next_term, last_term, last_index, parent_span: quorum_span};
-                task_queue.push(QuorumTask{task_type: task});
+                let task = LocalQuorumWorkerTaskType::RequestVote{ id: message_id, term: next_term, last_term, last_index, parent_span: quorum_span};
+                task_queue.push(LocalQuorumWorkerTask {task_type: task});
             });
             let persistence_span = Span::current();
             let persistence_task = PersistenceTaskType::AppendVote{id: message_id, term: next_term, candidate_id: shared_state.identity, parent_span: persistence_span};
@@ -244,14 +244,14 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         RaftMessageStateChange::None
     }
 
-    fn request_vote(&mut self, request_vote_request: RequestVoteRequest, callback: oneshot::Sender<RaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
+    fn request_vote(&mut self, request_vote_request: LocalRequestVoteRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
         let span = tracing::span!(Level::INFO, "candidate_request_vote");
         let _enter = span.enter();
 
         if !self.should_accept_vote(request_vote_request.term, request_vote_request.last_log_term, request_vote_request.last_log_index, shared_state) {
             callback.send(
-                RaftResponseMessage{
-                    payload: RaftResponsePayload::RequestVote(false)
+                LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::RequestVote(false)
                 }
             ).expect("sending request_vote callback failed");
             return RaftMessageStateChange::None

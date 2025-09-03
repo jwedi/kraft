@@ -25,37 +25,40 @@ use tracing::{Instrument, Level, Span};
 use tracing::instrument::Instrumented;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::client::cluster_node_client::SharedGrpcChannel;
-use crate::raft::raft_sm::{AppendEntries, RaftMessage, RaftMessagePayload, RaftResponseMessage, RaftResponsePayload, RequestVoteRequest};
+use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftMessage, LocalRaftMessagePayload, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalRequestVoteRequest};
 use crate::server::raftproto::raft_client::RaftClient;
-use crate::server::raftproto::{AppendEntriesAcknowledge, AppendEntriesRequest, AppendEntriesResponse, LogEntry, QuorumMessage, VoteRequest, VoteResponse};
-use crate::server::raftproto::quorum_message::MessagePayload;
+use crate::server::raftproto::{RemoteAppendEntriesAcknowledge, RemoteAppendEntriesRequest, RemoteAppendEntriesResponse, RemoteLogEntry, RemoteQuorumMessage, RemoteVoteRequest, RemoteVoteResponse};
+use crate::server::raftproto::remote_quorum_message::MessagePayload;
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
-use crate::service_utils::storage_utils::{SerializationData, SerializedData};
+use crate::service_utils::storage_utils::{SerializationData, serialize_data, SerializedData};
 use crate::transport::stream_manager::{StreamManager, StreamManagerImpl};
 use crate::transport::write_proxy::WriteResponse;
 
-pub struct QuorumTask {
-    pub task_type: QuorumTaskType
+pub struct LocalQuorumWorkerTask {
+    pub task_type: LocalQuorumWorkerTaskType
     // New append entries
     // Request vote
     // Start heartbeats
     // Stop heartbeats
 }
 
-pub enum QuorumTaskType {
+pub enum LocalQuorumWorkerTaskType {
     StartHeartbeats{ id: u64, term: u64, prev_term: u64, prev_log_index: u64 },
     StopHeartbeats { id: u64 },
     RequestVote{ id: u64, term: u64, last_term: u64, last_index: u64, parent_span: Span}, // Term, last term, last index,
-    AppendEntries{ id: u64, req: AppendEntriesRequest, parent_span: Span},
+    AppendEntries{ id: u64, req: RemoteAppendEntriesRequest, parent_span: Span},
+    BackfillLog {data: Vec<Arc<SerializationData>>}
+    // TODO backfill
 }
 
-pub enum QuorumTaskResponseType {
+pub enum LocalQuorumTaskResponseType {
     RequestVoteResponse{ id: u64, term: u64, received_vote: bool},
-    AppendEntries{ id: u64, ok: bool} // TODO get next index
+    AppendEntries{ id: u64, ok: bool}, // TODO get next index
+    BackfillLog{ quorum_node_id: u64, prev_term: u64, prev_index: u64}
 }
 
-pub struct QuorumResponse {
-    pub response_type: QuorumTaskResponseType
+pub struct LocalQuorumResponse {
+    pub response_type: LocalQuorumTaskResponseType
 }
 
 // Responsible for communication with other nodes in the cluster if this node is the leader.
@@ -63,8 +66,8 @@ pub struct QuorumResponse {
 // Sends RequestVote when asked to.
 // Sends AppendEntries heartbeats regardless to keep up constant load.
 pub struct QuorumWorker {
-    work_queue: Arc<SegQueue<QuorumTask>>,
-    response_queue: Arc<SegQueue<QuorumResponse>>,
+    work_queue: Arc<SegQueue<LocalQuorumWorkerTask>>,
+    response_queue: Arc<SegQueue<LocalQuorumResponse>>,
     send_heartbeats: bool,
     self_id: u32,
     next_index: u64,
@@ -77,7 +80,8 @@ pub struct QuorumWorker {
     propagator: Propagator,
     grpc_channel: SharedGrpcChannel,
     stream_manager: Arc<StreamManagerImpl>,
-    task_queue: Arc<SegQueue<RaftMessage>>,
+    task_queue: Arc<SegQueue<LocalRaftMessage>>,
+    ongoing_backfill: Option<OngoingBackfill>
 
     // TODO needs work task queue since all requests will now come through the quorum worker instead of the gRPC server
     // VoteRequest comes in, is sent to task worker queue
@@ -88,26 +92,32 @@ pub struct QuorumWorker {
 
 
 #[derive(Debug)]
-pub enum PendingTaskEnum {
-    Vote(VoteRequest),
+pub enum PendingQuorumTaskEnum {
+    Vote(RemoteVoteRequest),
     AppendEntries{request_id: u64, log_index: u64, term: u64}
 }
 #[derive(Debug)]
-struct pendingTask {
-    callback: Receiver<RaftResponseMessage>,
-    task: PendingTaskEnum
+struct PendingQuorumTask {
+    callback: Receiver<LocalRaftResponseMessage>,
+    task: PendingQuorumTaskEnum
+}
+
+struct OngoingBackfill {
+    from_term: u64,
+    from_index: u64,
 }
 
 impl QuorumWorker {
     pub fn new(
-        work_queue: Arc<SegQueue<QuorumTask>>,
-        response_queue: Arc<SegQueue<QuorumResponse>>,
+        work_queue: Arc<SegQueue<LocalQuorumWorkerTask>>,
+        response_queue: Arc<SegQueue<LocalQuorumResponse>>,
         self_id: u32,
         next_index: u64,
         member_id: u64,
         member_endpoint: String,
         stream_manager: Arc<StreamManagerImpl>,
-        task_queue: Arc<SegQueue<RaftMessage>>,
+        task_queue: Arc<SegQueue<LocalRaftMessage>>,
+
     ) -> Self {
         Self {
             work_queue,
@@ -125,6 +135,7 @@ impl QuorumWorker {
             grpc_channel: SharedGrpcChannel::new(member_endpoint.as_str(), member_id as u32),
             stream_manager,
             task_queue,
+            ongoing_backfill: None
         }
     }
 
@@ -132,7 +143,7 @@ impl QuorumWorker {
 
     pub async fn run(&mut self) {
         log::info!("Running quorum worker");
-        let mut pending_tasks: Vec<pendingTask> = vec![];
+        let mut pending_tasks: Vec<PendingQuorumTask> = vec![];
 
         loop {
             let mut maybe_receive_stream = self.stream_manager.get_receive_stream(self.member_id as u32).await;
@@ -176,22 +187,31 @@ impl QuorumWorker {
                         match resp {
                             Ok(val) => {
                                 match val.payload {
-                                    RaftResponsePayload::RequestVote(rv) => {
+                                    LocalRaftResponsePayload::RequestVote(rv) => {
                                         match &pt.task {
-                                            PendingTaskEnum::Vote(task) => {
-                                                send_stream.send(QuorumMessage{message_payload: Some(MessagePayload::VoteResponseOption(VoteResponse{vote_granted: rv, request_id: task.request_id, term: task.term}))}).expect("sending on stream shouldn't fail");
+                                            PendingQuorumTaskEnum::Vote(task) => {
+                                                send_stream.send(RemoteQuorumMessage{message_payload: Some(MessagePayload::VoteResponseOption(RemoteVoteResponse{vote_granted: rv, request_id: task.request_id, term: task.term}))}).expect("sending on stream shouldn't fail");
                                             }
                                             default => {
                                                 log::error!("unexpected pending task type for request vote")
                                             }
                                         }
                                     }
-                                    RaftResponsePayload::AppendEntries(ae) => {
-                                        // TODO check if OK or not
+                                    LocalRaftResponsePayload::AppendEntries(ae) => {
 
                                         match &pt.task {
-                                            PendingTaskEnum::AppendEntries{request_id, log_index, term} => {
-                                                send_stream.send(QuorumMessage{message_payload: Some(MessagePayload::AppendEntriesAcknowledgeOption(AppendEntriesAcknowledge{log_index: *log_index, term: *term, request_id: *request_id, ok: true}))}).expect("sending on stream shouldn't fail");
+                                            PendingQuorumTaskEnum::AppendEntries{request_id, log_index, term} => {
+                                                match ae {
+                                                    LocalAppendEntriesCallbackResponse::Ok => {
+                                                        send_stream.send(RemoteQuorumMessage{message_payload: Some(MessagePayload::AppendEntriesAcknowledgeOption(RemoteAppendEntriesAcknowledge{last_log_index: *log_index, last_log_term: *term, request_id: *request_id, ok: true}))}).expect("sending on stream shouldn't fail");
+                                                    }
+                                                    LocalAppendEntriesCallbackResponse::UnrecognizedLeader => {
+                                                        send_stream.send(RemoteQuorumMessage{message_payload: Some(MessagePayload::AppendEntriesAcknowledgeOption(RemoteAppendEntriesAcknowledge{last_log_index: *log_index, last_log_term: *term, request_id: *request_id, ok: false}))}).expect("sending on stream shouldn't fail");
+                                                    }
+                                                    LocalAppendEntriesCallbackResponse::WantedPreviousEntry { last_term, last_index } => {
+                                                        send_stream.send(RemoteQuorumMessage{message_payload: Some(MessagePayload::AppendEntriesAcknowledgeOption(RemoteAppendEntriesAcknowledge{last_log_index: last_index, last_log_term: last_term, request_id: *request_id, ok: false}))}).expect("sending on stream shouldn't fail");
+                                                    }
+                                                }
                                             }
                                             default => {
                                                 log::error!("unexpected pending task type for append entries")
@@ -234,36 +254,52 @@ impl QuorumWorker {
                             }
                             Some(MessagePayload::VoteResponseOption(vote)) => {
                                 log::info!("received vote response id: {}, member: {}, term: {}, granted: {}", vote.request_id, self.member_id, vote.term, vote.vote_granted);
-                                let resp = QuorumTaskResponseType::RequestVoteResponse{id: vote.request_id, term: vote.term, received_vote: vote.vote_granted};
-                                self.response_queue.push(QuorumResponse{response_type: resp})
+                                let resp = LocalQuorumTaskResponseType::RequestVoteResponse{id: vote.request_id, term: vote.term, received_vote: vote.vote_granted};
+                                self.response_queue.push(LocalQuorumResponse {response_type: resp})
                             }
                             Some(MessagePayload::AppendEntriesAcknowledgeOption(append_entries)) => {
-                                if append_entries.log_index > 0 {
-                                    log::info!("received append entries acknowledge from: {}", self.member_id);
+                                if !append_entries.ok {
+                                    log::info!("received append entries acknowledge from: {}, but it was not ok, backfilling log from term {} and index {}", self.member_id, append_entries.last_log_term, append_entries.last_log_index);
+                                    if self.ongoing_backfill.is_none() {
+                                        self.ongoing_backfill = Some(OngoingBackfill {from_term: append_entries.last_log_term, from_index: append_entries.last_log_index});
+                                        let resp = LocalQuorumTaskResponseType::BackfillLog{quorum_node_id: self.member_id, prev_term: append_entries.last_log_term, prev_index: append_entries.last_log_index};
+                                        self.response_queue.push(LocalQuorumResponse {response_type: resp})
+                                    } else {
+                                        log::warn!("Ongoing backfill already in progress, ignoring new backfill request");
+                                    }
                                 }
+
                                 if append_entries.request_id != 0 {
-                                    let resp = QuorumTaskResponseType::AppendEntries{id: append_entries.request_id, ok: append_entries.ok};
-                                    self.response_queue.push(QuorumResponse{response_type: resp})
+                                    // TODO if not ok
+                                    // set prev_log_term and prev_log_index based on response.
+                                    // Send backfill log request to leader.
+                                    log::debug!("received append entries acknowledge from: {}", self.member_id);
+
+
+                                    let resp = LocalQuorumTaskResponseType::AppendEntries{id: append_entries.request_id, ok: append_entries.ok};
+                                    self.response_queue.push(LocalQuorumResponse {response_type: resp})
+
                                 }
                             }
                             Some(MessagePayload::AppendEntriesRequestOption(mut append_entries)) => {
                                 //log::info!("received append entries request from: {}", self.member_id);
-                                let callback: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
+                                let callback: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
+                                // TODO get all of the data from the log entry.
 
                                 let index = append_entries.entry.as_ref().map(|entry| entry.index).unwrap_or_else(|| 0);
                                 let term = append_entries.entry.as_ref().map(|entry| entry.term).unwrap_or_else(|| 0);
 
                                 let span = tracing::span!(Level::INFO, "awaiting_append_entries_response");
 
-                                self.task_queue.push(RaftMessage{
-                                    payload: RaftMessagePayload::AppendEntries(AppendEntries{ leader_id: append_entries.leader_id, term: append_entries.term, prev_term: append_entries.prev_log_term, prev_index: append_entries.prev_log_index, entries: append_entries.entries, request_id: append_entries.request_id, entry: append_entries.entry}),
+                                self.task_queue.push(LocalRaftMessage {
+                                    payload: LocalRaftMessagePayload::AppendEntries(LocalAppendEntries { leader_id: append_entries.leader_id, term: append_entries.term, prev_term: append_entries.prev_log_term, prev_index: append_entries.prev_log_index, entries: append_entries.entries, request_id: append_entries.request_id, entry: append_entries.entry}),
                                     callback: callback.0,
                                     parent_span: span
 
                                 }, );
 
-                                let pending_task = pendingTask{
-                                    task: PendingTaskEnum::AppendEntries{request_id: append_entries.request_id, log_index: term, term: index},
+                                let pending_task = PendingQuorumTask {
+                                    task: PendingQuorumTaskEnum::AppendEntries{request_id: append_entries.request_id, log_index: term, term: index},
                                     callback: callback.1
                                 };
                                 pending_tasks.push(pending_task);
@@ -272,17 +308,17 @@ impl QuorumWorker {
                                 log::info!("received vote request from: {} for term: {}", self.member_id, vote_request.term);
                                 // TODO what do we do with the callbacks? Do we add a list of receivers that the quorum worker polls each iteration or does the queue worker send a message instead of invoking a callback?
                                 // Adding a list of pending callbacks is probably easiest since we don't need to re-write all state machines.
-                                let callback: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
+                                let callback: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
 
                                 let span = tracing::span!(Level::INFO, "awaiting_vote_response");
-                                self.task_queue.push(RaftMessage{
-                                    payload: RaftMessagePayload::RequestVote(RequestVoteRequest{term: vote_request.term, candidate_id: vote_request.candidate_id, last_log_index: vote_request.last_log_index, last_log_term: vote_request.last_log_term }),
+                                self.task_queue.push(LocalRaftMessage {
+                                    payload: LocalRaftMessagePayload::RequestVote(LocalRequestVoteRequest {term: vote_request.term, candidate_id: vote_request.candidate_id, last_log_index: vote_request.last_log_index, last_log_term: vote_request.last_log_term }),
                                     callback: callback.0,
                                     parent_span: span
 
                                 }, );
-                                let pending_task = pendingTask{
-                                    task: PendingTaskEnum::Vote(vote_request),
+                                let pending_task = PendingQuorumTask {
+                                    task: PendingQuorumTaskEnum::Vote(vote_request),
                                     callback: callback.1
                                 };
                                 pending_tasks.push(pending_task);
@@ -319,7 +355,7 @@ impl QuorumWorker {
             let now = now_millis();
             // SOmething here, maybe not...
             if self.send_heartbeats && (now-self.last_heartbeat > 50){
-                let request = AppendEntriesRequest{
+                let request = RemoteAppendEntriesRequest{
                     term: self.term,
                     leader_id: self.self_id,
                     prev_log_index: self.prev_log_index,
@@ -331,7 +367,7 @@ impl QuorumWorker {
 
                 let req = MessagePayload::AppendEntriesRequestOption(request);
 
-                let response = send_stream.send(QuorumMessage{message_payload: Some(req)});
+                let response = send_stream.send(RemoteQuorumMessage{message_payload: Some(req)});
 
                 match response {
                     Ok(resp) => {
@@ -353,20 +389,20 @@ impl QuorumWorker {
                 Some(task) => {
                     log::info!("Received quorum task");
                     match task.task_type {
-                        QuorumTaskType::StartHeartbeats{id, term, prev_term, prev_log_index} => {
+                        LocalQuorumWorkerTaskType::StartHeartbeats{id, term, prev_term, prev_log_index} => {
                             log::info!("received start heartbeat request id: {}, term: {}", id, term);
                             self.send_heartbeats = true;
                             self.term = term;
                             self.prev_log_term = prev_term;
                             self.prev_log_index = prev_log_index;
                         }
-                        QuorumTaskType::StopHeartbeats{id} => {
+                        LocalQuorumWorkerTaskType::StopHeartbeats{id} => {
                             log::info!("received stop heartbeat request id: {}", id);
                             self.send_heartbeats = false;
                         }
-                        QuorumTaskType::RequestVote{id, term, last_index, last_term, parent_span} => {
+                        LocalQuorumWorkerTaskType::RequestVote{id, term, last_index, last_term, parent_span} => {
                             log::info!("sending request vote with request id {} for term {}", id, term);
-                            let vote_req = VoteRequest{
+                            let vote_req = RemoteVoteRequest{
                                 term,
                                 candidate_id: self.self_id,
                                 last_log_index: last_index,
@@ -380,7 +416,7 @@ impl QuorumWorker {
                             stack backtrace:
                             note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
                              */
-                            match send_stream.send(QuorumMessage{message_payload: Some(MessagePayload::VoteRequestOption(vote_req))}) {
+                            match send_stream.send(RemoteQuorumMessage{message_payload: Some(MessagePayload::VoteRequestOption(vote_req))}) {
                                 Ok(_) => {}
                                 Err(e) => {
                                     drop(send_stream);
@@ -390,11 +426,44 @@ impl QuorumWorker {
                                 }
                             }
                         }
-                        QuorumTaskType::AppendEntries {id, req, parent_span} => {
+                        LocalQuorumWorkerTaskType::AppendEntries {id, req, parent_span} => {
                             // TODO benchmark copying log entries 3 times and writing to segqueues vs cloning Vectors.
-                            send_stream.send(QuorumMessage{message_payload: Some(MessagePayload::AppendEntriesRequestOption(req))}).unwrap();
+                            self.prev_log_term = req.entry.as_ref().unwrap().term;
+                            self.prev_log_index = req.entry.as_ref().unwrap().index;
+                            send_stream.send(RemoteQuorumMessage{message_payload: Some(MessagePayload::AppendEntriesRequestOption(req))}).unwrap();
                             self.last_heartbeat = now_millis();
                         }
+                        LocalQuorumWorkerTaskType::BackfillLog { data} => {
+                            log::info!("received backfill log request with {} entries. First entry: {}", data.len(), data.first().map_or("None".to_string(), |e| format!("prev_term: {}, prev_index: {}", e.prev_term, e.prev_index)));
+                            for entry in data {
+                                let buffer = vec![0u8; 2048];
+                                let (limit, mut serialized) = serialize_data(&entry, buffer, 0);
+                                serialized.truncate(limit);
+                                let entry = entry.deref();
+                                let remote_entry = RemoteLogEntry {
+                                    term: entry.term,
+                                    index: entry.index,
+                                    data: serialized,
+                                    batch_index: 0,
+                                    message_id: entry.message_id,
+                                    prev_log_index: entry.prev_index,
+                                    prev_log_term: entry.prev_term
+                                };
+                                let request = RemoteAppendEntriesRequest{
+                                    term: entry.term,
+                                    leader_id: self.self_id,
+                                    prev_log_index: entry.prev_index,
+                                    prev_log_term: entry.prev_term,
+                                    entries: vec![],
+                                    request_id: entry.message_id,
+                                    entry: Some(remote_entry)
+                                };
+                                send_stream.send(RemoteQuorumMessage{message_payload: Some(MessagePayload::AppendEntriesRequestOption(request))}).unwrap();
+                            }
+                            self.last_heartbeat = now_millis();
+                            self.ongoing_backfill = None;
+                        }
+
                     }
                 }
                 None => {

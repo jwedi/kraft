@@ -7,8 +7,8 @@ use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tonic::{Request, Status, Streaming};
 use crate::client::cluster_node_client::SharedGrpcChannel;
 use crate::config::config::ClusterNode;
-use crate::server::raftproto::{ConnectRequest, QuorumMessage};
-use crate::server::raftproto::quorum_message::MessagePayload;
+use crate::server::raftproto::{RemoteConnectRequest, RemoteQuorumMessage};
+use crate::server::raftproto::remote_quorum_message::MessagePayload;
 
 pub mod raftproto {
     tonic::include_proto!("raftproto"); // The string specified here must match the proto package name
@@ -16,12 +16,12 @@ pub mod raftproto {
 
 pub trait StreamManager {
 
-    async fn accept_stream(&mut self, read_stream: Streaming<QuorumMessage>, node_id: u32);
+    async fn accept_stream(&mut self, read_stream: Streaming<RemoteQuorumMessage>, node_id: u32);
 
-    async fn get_send_stream(&mut self, node_id: u32) -> Option<Arc<Mutex<mpsc::UnboundedSender<QuorumMessage>>>>;
+    async fn get_send_stream(&mut self, node_id: u32) -> Option<Arc<Mutex<mpsc::UnboundedSender<RemoteQuorumMessage>>>>;
 
-    async fn get_receive_stream(&mut self, node_id: u32) -> Option<Arc<Mutex<Streaming<QuorumMessage>>>>;
-    async fn try_connect(&mut self, node_id: u32) -> Result<Arc<Mutex<mpsc::UnboundedSender<QuorumMessage>>>, ConnectError>;
+    async fn get_receive_stream(&mut self, node_id: u32) -> Option<Arc<Mutex<Streaming<RemoteQuorumMessage>>>>;
+    async fn try_connect(&mut self, node_id: u32) -> Result<Arc<Mutex<mpsc::UnboundedSender<RemoteQuorumMessage>>>, ConnectError>;
 
     async fn reset_send_stream(&mut self, node_id: u32);
 
@@ -32,8 +32,8 @@ pub trait StreamManager {
 pub struct StreamManagerImpl {
     self_id: u32,
     cluster_nodes: Vec<ClusterNode>,
-    send_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<mpsc::UnboundedSender<QuorumMessage>>>>>>,
-    receiver_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<Streaming<QuorumMessage>>>>>>
+    send_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<mpsc::UnboundedSender<RemoteQuorumMessage>>>>>>,
+    receiver_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<Streaming<RemoteQuorumMessage>>>>>>
 }
 
 #[derive(Debug)]
@@ -52,7 +52,7 @@ impl ConnectError {
 }
 
 impl StreamManagerImpl {
-    pub fn new(self_id: u32, cluster_nodes: Vec<ClusterNode>, send_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<mpsc::UnboundedSender<QuorumMessage>>>>>>, receiver_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<tonic::Streaming<QuorumMessage>>>>>>) -> Self {
+    pub fn new(self_id: u32, cluster_nodes: Vec<ClusterNode>, send_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<mpsc::UnboundedSender<RemoteQuorumMessage>>>>>>, receiver_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<tonic::Streaming<RemoteQuorumMessage>>>>>>) -> Self {
         StreamManagerImpl{
             self_id,
             cluster_nodes,
@@ -61,7 +61,7 @@ impl StreamManagerImpl {
         }
     }
 
-    pub async fn try_connect(&self, node_id: u32) -> Result<Arc<Mutex<mpsc::UnboundedSender<QuorumMessage>>>, ConnectError> {
+    pub async fn try_connect(&self, node_id: u32) -> Result<Arc<Mutex<mpsc::UnboundedSender<RemoteQuorumMessage>>>, ConnectError> {
         let mut write_lock = self.send_streams.lock().await;
         let node = self.cluster_nodes.iter().find(|n| n.node_id == node_id).unwrap();
         let mut client = SharedGrpcChannel::new(node.endpoint.as_str(), node_id);
@@ -97,7 +97,7 @@ impl StreamManagerImpl {
         Ok(resp)
     }
 
-    pub async fn accept_stream(&self, read_stream: Streaming<QuorumMessage>, node_id: u32) {
+    pub async fn accept_stream(&self, read_stream: Streaming<RemoteQuorumMessage>, node_id: u32) {
         log::info!("Accepting stream from {}", node_id);
         let mut write_lock = self.receiver_streams.lock().await;
         let mut ns = write_lock.get_mut(&node_id);
@@ -114,7 +114,7 @@ impl StreamManagerImpl {
         }
     }
 
-    pub async fn get_receive_stream(&self, node_id: u32) -> Option<Arc<Mutex<Streaming<QuorumMessage>>>> {
+    pub async fn get_receive_stream(&self, node_id: u32) -> Option<Arc<Mutex<Streaming<RemoteQuorumMessage>>>> {
         let mut write_lock = self.receiver_streams.lock().await;
         let entry = write_lock.get(&node_id);
         match entry {
@@ -128,7 +128,7 @@ impl StreamManagerImpl {
         }
     }
 
-    pub async fn get_send_stream(&self, node_id: u32) -> Option<Arc<Mutex<mpsc::UnboundedSender<QuorumMessage>>>> {
+    pub async fn get_send_stream(&self, node_id: u32) -> Option<Arc<Mutex<mpsc::UnboundedSender<RemoteQuorumMessage>>>> {
         let mut write_lock = self.send_streams.lock().await;
         let entry = write_lock.get(&node_id);
         match entry {

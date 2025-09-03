@@ -24,8 +24,8 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::client::cluster_node_client::SharedGrpcChannel;
 use crate::config::config::ClusterNode;
 use crate::persistence::worker::{PersistenceConfig, PersistenceResponseType, PersistenceTaskType, PersistenceWorker};
-use crate::raft::raft_sm::{RaftMessage, RaftMessagePayload, RaftResponseMessage, RaftResponsePayload, RaftWriteBatchRequest};
-use crate::server::raftproto::{PutBatchRequest, PutBatchResponse, PutRequest, PutResponse};
+use crate::raft::raft_sm::{LocalRaftMessage, LocalRaftMessagePayload, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalRaftWriteBatchRequest};
+use crate::server::raftproto::{RemotePutBatchRequest, RemotePutBatchResponse, RemotePutRequest, RemotePutResponse};
 use crate::server::raftproto::raft_client::RaftClient;
 use crate::service_utils::app_time::now_millis;
 use sbe_kraft_replication_schema::{log_entry_codec, message_header_codec, WriteBuf};
@@ -35,14 +35,14 @@ use sbe_kraft_replication_schema::log_entry_codec::LogEntryEncoder;
 
 #[derive(Debug)]
 pub struct WriteResponse {
-    pub responses: Vec<PutResponse>,
+    pub responses: Vec<RemotePutResponse>,
     pub status_code: StatusCode
 }
 
 #[derive(Debug)]
 pub struct WriteBatch {
     pub batch_id: String,
-    pub requests: Vec<PutRequest>,
+    pub requests: Vec<RemotePutRequest>,
     pub span_parent: Option<Span>,
     pub callback: oneshot::Sender<WriteResponse>
 }
@@ -53,7 +53,7 @@ impl WriteBatch {
     }
 }
 
-impl PutRequest {
+impl RemotePutRequest {
     pub fn get_size(&self) -> u64 {
         self.payload.len() as u64
     }
@@ -103,7 +103,7 @@ impl WriteQueue {
 pub struct WriteProxy {
     write_queue: WriteQueue,
     max_batch_size: u64,
-    task_queue: Arc<SegQueue<RaftMessage>>,
+    task_queue: Arc<SegQueue<LocalRaftMessage>>,
     self_id: u32,
     cluster_nodes: Vec<ClusterNode>,
     current_leader_connection: SharedGrpcChannel,
@@ -114,7 +114,7 @@ impl WriteProxy {
     pub fn new(
         work_queue: Arc<SegQueue<WriteBatch>>,
         max_batch_size: u64,
-        task_queue: Arc<SegQueue<RaftMessage>>,
+        task_queue: Arc<SegQueue<LocalRaftMessage>>,
         self_id: u32,
         cluster_nodes: Vec<ClusterNode>
     ) -> Self {
@@ -147,8 +147,8 @@ impl WriteProxy {
 
     }
 
-    fn respond_to_put_responses(responses: Vec<PutResponse>, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
-        let mut grouped: HashMap<String, Vec<PutResponse>> = HashMap::new();
+    fn respond_to_put_responses(responses: Vec<RemotePutResponse>, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
+        let mut grouped: HashMap<String, Vec<RemotePutResponse>> = HashMap::new();
 
         for resp in responses {
             let entry = grouped.entry(resp.id.clone()); // TODO clone
@@ -170,14 +170,14 @@ impl WriteProxy {
         }
     }
 
-    fn handle_insert_completed(msg: RaftResponseMessage, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
+    fn handle_insert_completed(msg: LocalRaftResponseMessage, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
 
         match msg.payload {
-            RaftResponsePayload::WriteBatch ( responses ) => {
+            LocalRaftResponsePayload::WriteBatch (responses ) => {
                 WriteProxy::respond_to_put_responses(responses.responses, batch_callbacks)
             }
-            default => {
-                batch_callbacks.into_iter().for_each(|mut callback| {
+            _ => {
+                batch_callbacks.into_iter().for_each(|callback| {
                     let msg = WriteResponse {
                         responses: vec![],
                         status_code: StatusCode::INTERNAL_SERVER_ERROR
@@ -194,7 +194,7 @@ impl WriteProxy {
 
     }
 
-    async fn handle_local_write_response(receiver: Receiver<RaftResponseMessage>, parent_span: Span, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
+    async fn handle_local_write_response(receiver: Receiver<LocalRaftResponseMessage>, parent_span: Span, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
         let span = tracing::span!(Level::INFO, "write_proxy_local_batch_forward_response_await");
         span.set_parent(parent_span.context());
         let resp = receiver.instrument(span).await;
@@ -210,8 +210,8 @@ impl WriteProxy {
     }
 
 
-    fn prepare_batch_and_callbacks(batches: Vec<WriteBatch>) -> (Vec<PutRequest>, HashMap<String, Sender<WriteResponse>>) {
-        let mut all_requests: Vec<PutRequest> = vec![];
+    fn prepare_batch_and_callbacks(batches: Vec<WriteBatch>) -> (Vec<RemotePutRequest>, HashMap<String, Sender<WriteResponse>>) {
+        let mut all_requests: Vec<RemotePutRequest> = vec![];
         let mut batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>> = HashMap::new();
         for mut b in batches.into_iter() {
             all_requests.append(&mut b.requests);
@@ -220,8 +220,8 @@ impl WriteProxy {
         (all_requests, batch_callbacks)
     }
 
-    fn prepare_put_batch_request(put_requests: Vec<PutRequest>, span_parent: Span, propagator: &Propagator) -> Request<PutBatchRequest> {
-        let req = PutBatchRequest {
+    fn prepare_put_batch_request(put_requests: Vec<RemotePutRequest>, span_parent: Span, propagator: &Propagator) -> Request<RemotePutBatchRequest> {
+        let req = RemotePutBatchRequest {
             put_request: put_requests
         };
 
@@ -242,7 +242,7 @@ impl WriteProxy {
         request
     }
 
-    async fn send_remote_put_batch_and_handle_response(mut client: RaftClient<Channel>, request: Request<PutBatchRequest>, batch_callbacks: HashMap<String, Sender<WriteResponse>>, span: Span) {
+    async fn send_remote_put_batch_and_handle_response(mut client: RaftClient<Channel>, request: Request<RemotePutBatchRequest>, batch_callbacks: HashMap<String, Sender<WriteResponse>>, span: Span) {
 
         let s = span.clone();
         let resp = client.put_batch(request).instrument(s).await;
@@ -277,14 +277,14 @@ impl WriteProxy {
         if leader_id == self.self_id {
             tracing::debug!("local batch forward");
             // Node is the leader
-            let chan: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
-            let payload = RaftMessagePayload::WriteBatch(
-                RaftWriteBatchRequest {
+            let chan: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
+            let payload = LocalRaftMessagePayload::WriteBatch(
+                LocalRaftWriteBatchRequest {
                     requests: all_requests,
                 }
             );
             let span = tracing::span!(Level::INFO, "write_proxy_local_batch_forward_await");
-            let raft_message = RaftMessage {
+            let raft_message = LocalRaftMessage {
                 payload,
                 callback: chan.0,
                 parent_span: span.clone()
@@ -337,9 +337,9 @@ impl WriteProxy {
             //if current_leader_id <= 0 || leader_resync.elapsed().as_millis() > 10 {
             if true {
                 let span = Span::current();
-                let chan: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
-                let payload = RaftMessagePayload::GetRaftState;
-                let raft_message = RaftMessage {
+                let chan: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
+                let payload = LocalRaftMessagePayload::GetRaftState;
+                let raft_message = LocalRaftMessage {
                     payload,
                     callback: chan.0,
                     parent_span: span.clone()
@@ -349,7 +349,7 @@ impl WriteProxy {
                 match resp {
                     Ok(m) => {
                         match &m.payload {
-                            RaftResponsePayload::RaftState { leader_id } => {
+                            LocalRaftResponsePayload::RaftState { leader_id } => {
                                 if *leader_id <= 0 {
                                     log::warn!("No leader elected, retrying later");
                                     tokio::time::sleep(Duration::from_millis(3)).await;
@@ -401,15 +401,15 @@ impl WriteProxy {
 
                 if self.self_id == current_leader_id {
                     // Node is the leader
-                    let chan: (Sender<RaftResponseMessage>, Receiver<RaftResponseMessage>) = oneshot::channel();
-                    let payload = RaftMessagePayload::WriteBatch(
-                        RaftWriteBatchRequest {
+                    let chan: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
+                    let payload = LocalRaftMessagePayload::WriteBatch(
+                        LocalRaftWriteBatchRequest {
                             requests: all_requests,
                         }
                     );
                     let span = tracing::span!(Level::INFO, "write_proxy_local_batch_forward_await", num_requests=num_requests, request_size=request_size);
                     span.set_parent(new_root.context());
-                    let raft_message = RaftMessage {
+                    let raft_message = LocalRaftMessage {
                         payload,
                         callback: chan.0,
                         parent_span: span.clone()

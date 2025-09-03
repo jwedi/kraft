@@ -29,9 +29,9 @@ use tracing_opentelemetry::{OpenTelemetryLayer, OpenTelemetrySpanExt};
 use tracing_subscriber::{registry, layer::SubscriberExt, Registry, Layer};
 use crate::config::config::{ClusterNode, read_config};
 use crate::persistence::worker::{PersistenceConfig, PersistenceResponseType, PersistenceTaskType, PersistenceWorker, VoteRow};
-use crate::quorum::worker::{QuorumResponse, QuorumTask, QuorumWorker};
-use crate::raft::raft_sm::{OutstandingMessage, RaftMessage, RaftServerState, RaftVolatileState, SharedState};
-use crate::server::raftproto::QuorumMessage;
+use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask, QuorumWorker};
+use crate::raft::raft_sm::{OutstandingMessage, LocalRaftMessage, RaftServerState, RaftVolatileState, SharedState};
+use crate::server::raftproto::RemoteQuorumMessage;
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils;
 use crate::service_utils::storage_utils::SerializationData;
@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("[::1]:{}", cfg.port).parse()?;
     let pinger = PingServer::default();
 
-    let task_queue = Arc::new(SegQueue::<RaftMessage>::new());
+    let task_queue = Arc::new(SegQueue::<LocalRaftMessage>::new());
     let worker_queue = Arc::clone(&task_queue);
     let api_raft_queue = Arc::clone(&task_queue);
     let api_write_work_queue = Arc::new(SegQueue::<WriteBatch>::new());
@@ -138,22 +138,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         PersistenceConfig{out_dir: cfg.persistence_dir}
     );
     let votes = persistence_worker.read_votes()?;
-    let num_votes = votes.len().to_string();
 
-    log::info!("Recovered {} votes from disk", num_votes);
+    log::info!("Recovered {} votes from disk, last one for {:?}", votes.len(), votes.last());
 
     let replication_log_bytes = persistence_worker.read_log()?;
     let start_deserialization = now_millis();
-    let replication_log: Vec<SerializationData> = if replication_log_bytes.is_empty() {
+    let replication_log: Vec<Arc<SerializationData>> = if replication_log_bytes.is_empty() {
         log::warn!("Replication log is empty, starting with an empty log");
         vec![]
     } else {
         log::info!("Recovered replication log with {} bytes", replication_log_bytes.len());
-        storage_utils::deserialize_all_data(replication_log_bytes.as_slice()).unwrap_or_else(|_| {
+        storage_utils::deserialize_all_data_as_arc(replication_log_bytes.as_slice()).unwrap_or_else(|_| {
             log::warn!("Failed to deserialize replication log, starting with empty log");
             vec![]
         })
     };
+    let mut term_start_index: HashMap<u64, u64> = HashMap::new();
+
+    for (i, entry) in replication_log.iter().enumerate() {
+        if entry.index == 0 {
+            term_start_index.insert(entry.term, i as u64);
+        }
+    }
     let last_entry = replication_log.last().clone();
     let last_log_index = last_entry.map_or(0, |e| e.index);
     let last_log_term = last_entry.map_or(0, |e| e.term);
@@ -174,12 +180,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_log_term: last_log_term,
         next_term: server_state.current_term+1,
         next_log_index: last_log_index + 1,
+        replication_log,
+        replication_log_term_starts: term_start_index
     };
 
 
-    let quorum_queue: Arc<SegQueue<QuorumTask>> = Arc::new(SegQueue::<QuorumTask>::new());
+    let quorum_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::<LocalQuorumWorkerTask>::new());
     let sm_quorum_work = Arc::clone(&quorum_queue);
-    let quorum_response_queue = Arc::new(SegQueue::<QuorumResponse>::new());
+    let quorum_response_queue = Arc::new(SegQueue::<LocalQuorumResponse>::new());
     let sm_quorum_response = Arc::clone(&quorum_response_queue);
     let quorum_size = (cfg.cluster_nodes.len() as u32).div_ceil(2);
     let cluster_nodes_without_self: Vec<ClusterNode> = cfg.cluster_nodes.into_iter().filter(|item| item.node_id != cfg.node_id).map(|c| c).collect();
@@ -191,8 +199,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let outstanding_messages: HashMap<u64, OutstandingMessage> = HashMap::new();
 
-    let send_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<mpsc::UnboundedSender<QuorumMessage>>>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let receive_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<tonic::Streaming<QuorumMessage>>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let send_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<mpsc::UnboundedSender<RemoteQuorumMessage>>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let receive_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<tonic::Streaming<RemoteQuorumMessage>>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let sm: StreamManagerImpl = StreamManagerImpl::new(
         node_id,
         Vec::clone(&cluster_nodes_without_self),
@@ -203,9 +211,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_server = RaftServerImpl{task_queue: api_raft_queue, self_id: cfg.node_id, stream_manager: Arc::clone(&sm_arc)};
 
     // For each cluster_nodes_without_self
-    let mut quorum_send_channels: Vec<Arc<SegQueue<QuorumTask>>> = vec![];
+    let mut quorum_send_channels: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>> = vec![];
     let cluster_workers: Vec<QuorumWorker> = cluster_nodes_without_self.iter().map(|node| {
-        let mut c_queue: Arc<SegQueue<QuorumTask>> = Arc::new(SegQueue::<QuorumTask>::new());
+        let c_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::<LocalQuorumWorkerTask>::new());
         let c_queue_clone = Arc::clone(&c_queue);
         quorum_send_channels.push(c_queue);
         let response_c = Arc::clone(&sm_quorum_response);

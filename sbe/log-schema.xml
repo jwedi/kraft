@@ -37,6 +37,9 @@
         <field name="timestamp" id="1" type="timestamp" timeUnit="millisecond" semanticType="UTCTimestamp"/>
         <field name="term" id="2" type="uint64"/>
         <field name="index" id="3" type="uint64"/>
+        <field name="prev_log_index" id="4" type="uint64"/>
+        <field name="prev_log_term" id="5" type="uint64"/>
+        <field name="message_id" id="6" type="uint64"/>
         <group name="commands" id="8" dimensionType="groupSizeEncoding">
             <field name="commandType" id="9" type="CommandType"/>
             <data name="payload" id="10" type="varDataEncoding"/>
