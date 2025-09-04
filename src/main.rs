@@ -30,7 +30,7 @@ use tracing_subscriber::{registry, layer::SubscriberExt, Registry, Layer};
 use crate::config::config::{ClusterNode, read_config};
 use crate::persistence::worker::{PersistenceConfig, PersistenceResponseType, PersistenceTaskType, PersistenceWorker, VoteRow};
 use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask, QuorumWorker};
-use crate::raft::raft_sm::{OutstandingMessage, LocalRaftMessage, RaftServerState, RaftVolatileState, SharedState};
+use crate::raft::raft_sm::{OutstandingMessage, LocalRaftMessage, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig};
 use crate::server::raftproto::RemoteQuorumMessage;
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils;
@@ -241,7 +241,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_message_id: 0,
         outstanding_messages,
         quorum_size,
-        quorum_worker_tasks: quorum_send_channels
+        quorum_worker_tasks: quorum_send_channels,
+        state_machine_config: StateMachineConfig{ max_message_size_bytes: cfg.max_message_size_bytes},
     };
 
     let write_proxy_handle = spawn(
@@ -249,10 +250,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let proxy_raft_queue = Arc::clone(&task_queue);
             let mut wp = WriteProxy::new(
                 proxy_write_work_queue,
-                256,
+                cfg.max_batch_size,
                 proxy_raft_queue,
                 cfg.node_id,
-                cluster_nodes_without_self
+                cluster_nodes_without_self,
+                cfg.min_batch_interval_ms
             );
             tracing::info!(message = "Spawning write proxy handler");
             wp.run().await;

@@ -2,6 +2,7 @@
 port = 50052
 node_id = 2
 persistence_dir = "out2/"
+max_message_size_bytes = 4096
 [[cluster_nodes]]
 endpoint = "http://[::1]:50051"
 node_id = 1

@@ -107,7 +107,8 @@ pub struct WriteProxy {
     self_id: u32,
     cluster_nodes: Vec<ClusterNode>,
     current_leader_connection: SharedGrpcChannel,
-    propagator: Propagator
+    propagator: Propagator,
+    min_batch_interval: u128
 }
 
 impl WriteProxy {
@@ -116,7 +117,8 @@ impl WriteProxy {
         max_batch_size: u64,
         task_queue: Arc<SegQueue<LocalRaftMessage>>,
         self_id: u32,
-        cluster_nodes: Vec<ClusterNode>
+        cluster_nodes: Vec<ClusterNode>,
+        min_batch_interval: u64
     ) -> Self {
         let write_queue = WriteQueue {
             work_queue,
@@ -131,6 +133,7 @@ impl WriteProxy {
             cluster_nodes,
             current_leader_connection: default_leader_connection,
             propagator: opentelemetry_zipkin::Propagator::new(),
+            min_batch_interval: min_batch_interval as u128
         }
     }
 
@@ -443,7 +446,7 @@ impl WriteProxy {
                     }
                 }
                 let delta = now_millis() - start_time;
-                if delta < 5 {
+                if delta < self.min_batch_interval {
                     tokio::time::sleep(Duration::from_millis(delta as u64)).await;
                 }
                 //  Clean up completed tasks
