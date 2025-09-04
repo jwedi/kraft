@@ -56,6 +56,10 @@ pub struct OutstandingMessage {
     pub span: Span
 }
 
+pub struct StateMachineConfig {
+    pub max_message_size_bytes: usize,
+}
+
 pub struct SharedState {
     pub server_state: RaftServerState,
     pub volatile_server_state: RaftVolatileState,
@@ -69,6 +73,7 @@ pub struct SharedState {
     pub outstanding_messages: HashMap<u64, OutstandingMessage>,
     pub quorum_size: u32,
     pub quorum_worker_tasks: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>>,
+    pub state_machine_config: StateMachineConfig
 }
 
 pub struct StateMachineExecutorImpl {

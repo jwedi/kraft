@@ -10,7 +10,10 @@ pub struct AppConfig {
     pub persistence_dir: String,
     pub port: u32,
     pub node_id: u32,
-    pub cluster_nodes: Vec<ClusterNode>
+    pub cluster_nodes: Vec<ClusterNode>,
+    pub max_message_size_bytes: usize,
+    pub min_batch_interval_ms: u64,
+    pub max_batch_size: u64,
 }
 
 

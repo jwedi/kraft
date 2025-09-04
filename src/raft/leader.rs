@@ -24,7 +24,6 @@ pub struct RaftLeaderStateDelegate {
     election_timeout: u128,
     rng: ThreadRng,
     initialized: bool,
-    max_message_size: usize,
 }
 
 fn clone_subset<T>(data: &[Arc<T>], start: usize, end: usize) -> Vec<Arc<T>> {
@@ -43,7 +42,6 @@ impl RaftLeaderStateDelegate {
             election_timeout: now + election_timout,
             rng,
             initialized: false,
-            max_message_size: 4096
         }
     }
 }
@@ -66,7 +64,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         let _enter = span.enter();
         // TODO validate request
         // TODO serialize valid request bits
-        let buffer = vec![0u8; self.max_message_size];
+        let buffer = vec![0u8; shared_state.state_machine_config.max_message_size_bytes];
         let offset = 0usize;
         let serialization_data = SerializationData{
             index: idx,
