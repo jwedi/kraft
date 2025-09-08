@@ -72,6 +72,7 @@ fn solution_one(data: Vec<SerializedData>) {
 fn solution_two(data: Vec<SerializedData>) {
     // Create 10.000 x SerializedData
     // Send them over channels in writer thread to each reader thread
+    // Clones whole data and sends it over the channel
 
     let queue_1: Arc<SegQueue<SerializedData>> = Arc::new(SegQueue::new());
     let write_queue_1 = Arc::clone(&queue_1);
@@ -130,6 +131,7 @@ fn solution_two(data: Vec<SerializedData>) {
 fn solution_three(data: Vec<SerializedData>) {
     // Create 10.000 x SerializedData
     // Send them over channels in writer thread to each reader thread
+    // Use Arc to avoid cloning the data and clones just the Arc pointer
 
     let queue_1: Arc<SegQueue<Arc<SerializedData>>> = Arc::new(SegQueue::new());
     let write_queue_1 = Arc::clone(&queue_1);
@@ -306,6 +308,51 @@ fn solution_five(data: Vec<SerializedData>) {
     handle4.join().unwrap();
 }
 
+fn solution_six(data: Vec<SerializedData>) {
+
+    let queue_1: Arc<SegQueue<Arc<SerializedData>>> = Arc::new(SegQueue::new());
+    let write_queue_1 = Arc::clone(&queue_1);
+
+    let queue_2: Arc<SegQueue<Arc<SerializedData>>> = Arc::new(SegQueue::new());
+    let write_queue_2 = Arc::clone(&queue_2);
+
+    let queue_3: Arc<SegQueue<Vec<Arc<SerializedData>>>> = Arc::new(SegQueue::new());
+    let write_clone_queue_1: Arc<SegQueue<Vec<Arc<SerializedData>>>> = Arc::new(SegQueue::new());
+
+    let asd = Arc::new(data);
+
+    let clone1 = Arc::clone(&asd);
+    let clone2 = Arc::clone(&asd);
+    let clone3 = Arc::clone(&asd);
+    let handle = thread::spawn(move || {
+        let v = clone1;
+        for data in v.iter() {
+            black_box(data);
+        }
+    });
+
+    let handle2 = thread::spawn(move || {
+        let v = clone2;
+        let mut i = 0;
+        for data in v.iter() {
+            black_box(data);
+        }
+    });
+
+    let handle3 = thread::spawn(move || {
+        let v = clone3;
+        let mut i = 0;
+        for data in v.iter() {
+            black_box(data);
+        }
+    });
+
+
+    handle.join().unwrap();
+    handle2.join().unwrap();
+    handle3.join().unwrap();
+}
+
 fn benchmark(c: &mut Criterion) {
     let mut serialized_data: Vec<SerializedData> = vec![];
     for i in 0..DATA_SIZE+2 {
@@ -314,11 +361,13 @@ fn benchmark(c: &mut Criterion) {
         };
         serialized_data.push(d);
     }
+
     c.bench_function("solution_one", |b| b.iter(|| solution_one(serialized_data.clone())));
     c.bench_function("solution_two", |b| b.iter(|| solution_two(serialized_data.clone())));
     c.bench_function("solution_three", |b| b.iter(|| solution_three(serialized_data.clone())));
     c.bench_function("solution_four", |b| b.iter(|| solution_four(serialized_data.clone())));
     c.bench_function("solution_five", |b| b.iter(|| solution_five(serialized_data.clone())));
+    c.bench_function("solution_six", |b| b.iter(|| solution_six(serialized_data.clone())));
 }
 
 criterion_group!(benches, benchmark);

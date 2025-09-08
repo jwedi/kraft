@@ -1,11 +1,8 @@
 use std::sync::Arc;
-use prost::bytes::Bytes;
 use crate::server::raftproto::RemotePutRequest;
-use sbe_kraft_replication_schema::command_type::CommandType;
-use sbe_kraft_replication_schema::log_entry_codec::encoder::CommandsEncoder;
+use sbe_kraft_replication_schema::log_entry_codec::encoder::{Put_data_commandsEncoder};
 use sbe_kraft_replication_schema::log_entry_codec::{LogEntryDecoder, LogEntryEncoder};
 use sbe_kraft_replication_schema::message_header_codec::MessageHeaderDecoder;
-use sbe_kraft_replication_schema::put_data_record_codec::PutDataRecordEncoder;
 use sbe_kraft_replication_schema::{message_header_codec, Decoder, ReadBuf, WriteBuf, Encoder};
 
 pub struct SerializationData {
@@ -25,7 +22,7 @@ pub struct SerializedData {
 
 pub fn serialize_data(serialization_data: &SerializationData, mut buffer: Vec<u8>, offset: usize) -> (usize, Vec<u8>) {
     let mut entry = LogEntryEncoder::default();
-    let mut commands_encoder = CommandsEncoder::default();
+    let mut put_data_commands_encoder = Put_data_commandsEncoder::default();
     entry = entry.wrap(
         WriteBuf::new(buffer.as_mut_slice()),
         message_header_codec::ENCODED_LENGTH + offset,
@@ -39,15 +36,17 @@ pub fn serialize_data(serialization_data: &SerializationData, mut buffer: Vec<u8
     entry.prev_log_term(serialization_data.prev_term);
     entry.message_id(serialization_data.message_id);
 
-    commands_encoder =
-        entry.commands_encoder(serialization_data.requests.len() as u16, commands_encoder);
+    put_data_commands_encoder = entry.put_data_commands_encoder(
+        serialization_data.requests.len() as u16,
+        put_data_commands_encoder,
+    );
+
     for (request) in serialization_data.requests.iter() {
-        commands_encoder.advance();
-        commands_encoder.command_type(CommandType::PUT);
-        let mut put_data_encoder = PutDataRecordEncoder::default();
-        commands_encoder.payload(request.payload.as_bytes()); // TODO
+        put_data_commands_encoder.advance();
+        put_data_commands_encoder.key(request.id.as_str());
+        put_data_commands_encoder.value(request.payload.as_bytes());
     }
-    entry = commands_encoder.parent().unwrap();
+    entry = put_data_commands_encoder.parent().unwrap();
 
     (entry.get_limit(), buffer)
 }
@@ -65,20 +64,22 @@ pub fn deserialize_data(data: &[u8], offset: usize) -> Result<(usize, Serializat
     let prev_term = entry.prev_log_term();
     let message_id = entry.message_id();
 
-    let mut command_decoder = entry.commands_decoder();
+    let mut command_decoder = entry.put_data_commands_decoder();
     let entries = command_decoder.count();
     let mut requests = Vec::with_capacity(entries as usize);
     for _ in 0..entries {
         command_decoder.advance().expect("Expected command to be present when decoding");
-        if command_decoder.command_type() == CommandType::PUT {
-            let coord = command_decoder.payload_decoder();
-            let payload = command_decoder.payload_slice(coord); // TODO parse
-            requests.push(RemotePutRequest {
-                id: String::new(),
-                payload: String::from_utf8_lossy(payload).to_string(), // Assuming payload is UTF-8 encoded
-                node_id: 0,
-            });
-        }
+        let key_coords = command_decoder.key_decoder();
+        let key = command_decoder.key_slice(key_coords);
+        let id = String::from_utf8_lossy(key).to_string();
+        let value_coords = command_decoder.value_decoder();
+        let value = command_decoder.value_slice(value_coords);
+        let payload = String::from_utf8_lossy(value).to_string();
+        requests.push(RemotePutRequest {
+            id,
+            payload,
+            node_id: 0,
+        });
     }
     entry = command_decoder.parent().unwrap();
     return Ok((
@@ -158,7 +159,7 @@ mod tests {
 
         let mut buffer = vec![0u8; 2048];
         let offset = 0usize;
-        let (limit, mut serialized_data) = serialize_data(serialization_data, buffer, offset);
+        let (limit, mut serialized_data) = serialize_data(&serialization_data, buffer, offset);
         serialized_data.truncate(limit);
         let (offset, deserialized_data) = deserialize_data(&serialized_data, 0).unwrap();
 
@@ -170,7 +171,9 @@ mod tests {
         assert_eq!(deserialized_data.message_id, 123);
         assert_eq!(deserialized_data.requests.len(), 2);
         assert_eq!(deserialized_data.requests[0].payload, "data1");
+        assert_eq!(deserialized_data.requests[0].id, "1");
         assert_eq!(deserialized_data.requests[1].payload, "data2");
+        assert_eq!(deserialized_data.requests[1].id, "2");
         assert_eq!(offset, limit);
     }
 
@@ -222,8 +225,8 @@ mod tests {
         };
 
         let mut buffer = vec![0u8; 2048];
-        let (offset1, buffer) = serialize_data(serialization_data_idx1, buffer, 0usize);
-        let (offset2, mut buffer) = serialize_data(serialization_data_idx2, buffer, offset1);
+        let (offset1, buffer) = serialize_data(&serialization_data_idx1, buffer, 0usize);
+        let (offset2, mut buffer) = serialize_data(&serialization_data_idx2, buffer, offset1);
         buffer.truncate(offset2);
 
         let (offset3, deserialized_data_idx1) = deserialize_data(&buffer, 0usize).unwrap();
@@ -237,6 +240,8 @@ mod tests {
         assert_eq!(deserialized_data_idx1.message_id, 123);
         assert_eq!(deserialized_data_idx1.requests.len(), 2);
         assert_eq!(deserialized_data_idx1.requests[0].payload, "data1");
+        assert_eq!(deserialized_data_idx1.requests[0].id, "1");
+        assert_eq!(deserialized_data_idx1.requests[1].id, "2");
         assert_eq!(deserialized_data_idx1.requests[1].payload, "data2");
         assert_eq!(deserialized_data_idx2.index, 2);
         assert_eq!(deserialized_data_idx2.term, 2);
@@ -245,7 +250,9 @@ mod tests {
         assert_eq!(deserialized_data_idx2.prev_term, 1);
         assert_eq!(deserialized_data_idx2.message_id, 456);
         assert_eq!(deserialized_data_idx2.requests.len(), 2);
+        assert_eq!(deserialized_data_idx2.requests[0].id, "3");
         assert_eq!(deserialized_data_idx2.requests[0].payload, "data3");
+        assert_eq!(deserialized_data_idx2.requests[1].id, "4");
         assert_eq!(deserialized_data_idx2.requests[1].payload, "data4");
         assert_eq!(offset3, offset1);
         assert_eq!(offset4, offset2);
@@ -300,8 +307,8 @@ mod tests {
         };
 
         let mut buffer = vec![0u8; 2048];
-        let (offset1, buffer) = serialize_data(serialization_data_idx1, buffer, 0usize);
-        let (offset2, mut buffer) = serialize_data(serialization_data_idx2, buffer, offset1);
+        let (offset1, buffer) = serialize_data(&serialization_data_idx1, buffer, 0usize);
+        let (offset2, mut buffer) = serialize_data(&serialization_data_idx2, buffer, offset1);
         buffer.truncate(offset2);
 
         let data = deserialize_all_data(&buffer).unwrap();
@@ -314,7 +321,9 @@ mod tests {
         assert_eq!(data[0].message_id, 123);
         assert_eq!(data[0].requests.len(), 2);
         assert_eq!(data[0].requests[0].payload, "data1");
+        assert_eq!(data[0].requests[0].id, "1");
         assert_eq!(data[0].requests[1].payload, "data2");
+        assert_eq!(data[0].requests[1].id, "2");
         assert_eq!(data[1].index, 2);
         assert_eq!(data[1].term, 2);
         assert_eq!(data[1].timestamp, 1234567891);
@@ -323,7 +332,9 @@ mod tests {
         assert_eq!(data[1].message_id, 456);
         assert_eq!(data[1].requests.len(), 2);
         assert_eq!(data[1].requests[0].payload, "data3");
+        assert_eq!(data[1].requests[0].id, "3");
         assert_eq!(data[1].requests[1].payload, "data4");
+        assert_eq!(data[1].requests[1].id, "4");
     }
 
     // Manual test

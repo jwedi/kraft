@@ -30,7 +30,6 @@ use crate::server::raftproto::raft_client::RaftClient;
 use crate::service_utils::app_time::now_millis;
 use sbe_kraft_replication_schema::{log_entry_codec, message_header_codec, WriteBuf};
 use sbe_kraft_replication_schema::command_codec::CommandEncoder;
-use sbe_kraft_replication_schema::log_entry_codec::encoder::CommandsEncoder;
 use sbe_kraft_replication_schema::log_entry_codec::LogEntryEncoder;
 
 #[derive(Debug)]

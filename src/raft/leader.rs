@@ -4,7 +4,6 @@ use prost::bytes::{BufMut, Bytes};
 use rand::Rng;
 use rand::rngs::ThreadRng;
 use sbe_kraft_replication_schema::command_codec::CommandEncoder;
-use sbe_kraft_replication_schema::log_entry_codec::encoder::CommandsEncoder;
 use sbe_kraft_replication_schema::log_entry_codec::LogEntryEncoder;
 use sbe_kraft_replication_schema::{message_header_codec, WriteBuf};
 use sbe_kraft_replication_schema::command_type::CommandType;
@@ -66,6 +65,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         // TODO serialize valid request bits
         let buffer = vec![0u8; shared_state.state_machine_config.max_message_size_bytes];
         let offset = 0usize;
+
         let serialization_data = SerializationData{
             index: idx,
             term: shared_state.server_state.current_term,
@@ -116,7 +116,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             task_queue.push(LocalQuorumWorkerTask {task_type: task});
         });
 
-        let message_type = OutstandingMessageType::WriteBatch{persistence_done: false, quorum_acks: 0, callback};
+        let message_type = OutstandingMessageType::WriteBatch{persistence_done: false, quorum_acks: 0, callback, index: idx};
         //let response_span = tracing::span!(Level::INFO, "write_batch_outstanding_message_processing");
         //response_span.set_parent(span.context());
         let outstanding_message = OutstandingMessage{
@@ -217,11 +217,11 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                         tracing::event!(Level::INFO, "handling log persisted");
                         let new_outstanding_resp = msg.outstanding_responses-1; // Maybe remove
                         match msg.message_type {
-                            OutstandingMessageType::WriteBatch{persistence_done, quorum_acks, callback} => {
+                            OutstandingMessageType::WriteBatch{persistence_done, quorum_acks, callback, index} => {
                                 if quorum_acks >= shared_state.quorum_size {
                                     // Persistence done and replicated to quorum of nodes
                                     log::info!("Write batch with message id {} has been persisted on quorum of nodes", id);
-                                    // TODO update commit index and apply to data structure.
+                                    shared_state.volatile_server_state.commit_index = index;
                                     let r = LocalRaftWriteBatchResponse{
                                         responses: vec![], // TODO
                                         err: None
@@ -232,7 +232,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                 } else {
                                     msg.outstanding_responses = new_outstanding_resp;
                                     // TODO maybe not recreate this all of the time.
-                                    let new_state = OutstandingMessageType::WriteBatch { persistence_done: true, quorum_acks, callback};
+                                    let new_state = OutstandingMessageType::WriteBatch { persistence_done: true, quorum_acks, callback, index};
                                     msg.message_type = new_state;
                                     shared_state.outstanding_messages.insert(id, msg);
                                 }
@@ -287,11 +287,12 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                         let new_outstanding_resp = msg.outstanding_responses-1;
 
                         match msg.message_type {
-                            OutstandingMessageType::WriteBatch{persistence_done, quorum_acks, callback} => {
+                            OutstandingMessageType::WriteBatch{persistence_done, quorum_acks, callback, index} => {
                                 let new_acks = quorum_acks +1;
                                 if new_acks >= shared_state.quorum_size && persistence_done {
                                     // Log replication done
                                     log::info!("Write batch with message id {} has been persisted on quorum of nodes", id);
+                                    shared_state.volatile_server_state.commit_index = index;
                                     let r = LocalRaftWriteBatchResponse{
                                         responses: vec![], // TODO
                                         err: None
@@ -301,7 +302,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     callback.send(response).unwrap();
                                 } else if new_outstanding_resp > 0 {
                                     msg.outstanding_responses = new_outstanding_resp;
-                                    let new_state = OutstandingMessageType::WriteBatch { persistence_done, quorum_acks: new_acks, callback};
+                                    let new_state = OutstandingMessageType::WriteBatch { persistence_done, quorum_acks: new_acks, callback, index};
                                     msg.message_type = new_state;
                                     shared_state.outstanding_messages.insert(id, msg);
                                 } else {
