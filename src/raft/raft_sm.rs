@@ -46,7 +46,7 @@ pub enum OutstandingMessageType {
     RequestVote{callback: oneshot::Sender<LocalRaftResponseMessage>}, // Request vote from someone else
     CandidateElection{persistence_done: bool, quorum_votes: u32}, // Candidate election by this node.
     AppendLog{callback: oneshot::Sender<LocalRaftResponseMessage>},
-    WriteBatch{persistence_done: bool, quorum_acks: u32, callback: oneshot::Sender<LocalRaftResponseMessage>}
+    WriteBatch{persistence_done: bool, quorum_acks: u32, callback: oneshot::Sender<LocalRaftResponseMessage>, index: u64}
 }
 
 pub struct OutstandingMessage {

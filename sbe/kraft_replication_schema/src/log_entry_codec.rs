@@ -155,16 +155,16 @@ pub mod encoder {
             self.get_buf_mut().put_u64_at(offset, value);
         }
 
-        /// GROUP ENCODER (id=8)
+        /// GROUP ENCODER (id=11)
         #[inline]
-        pub fn commands_encoder(self, count: u16, commands_encoder: CommandsEncoder<Self>) -> CommandsEncoder<Self> {
-            commands_encoder.wrap(self, count)
+        pub fn put_data_commands_encoder(self, count: u16, put_data_commands_encoder: Put_data_commandsEncoder<Self>) -> Put_data_commandsEncoder<Self> {
+            put_data_commands_encoder.wrap(self, count)
         }
 
     }
 
     #[derive(Debug, Default)]
-    pub struct CommandsEncoder<P> {
+    pub struct Put_data_commandsEncoder<P> {
         parent: Option<P>,
         count: u16,
         index: usize,
@@ -172,7 +172,7 @@ pub mod encoder {
         initial_limit: usize,
     }
 
-    impl<'a, P> Writer<'a> for CommandsEncoder<P> where P: Writer<'a> + Default {
+    impl<'a, P> Writer<'a> for Put_data_commandsEncoder<P> where P: Writer<'a> + Default {
         #[inline]
         fn get_buf_mut(&mut self) -> &mut WriteBuf<'a> {
             if let Some(parent) = self.parent.as_mut() {
@@ -183,7 +183,7 @@ pub mod encoder {
         }
     }
 
-    impl<'a, P> Encoder<'a> for CommandsEncoder<P> where P: Encoder<'a> + Default {
+    impl<'a, P> Encoder<'a> for Put_data_commandsEncoder<P> where P: Encoder<'a> + Default {
         #[inline]
         fn get_limit(&self) -> usize {
             self.parent.as_ref().expect("parent missing").get_limit()
@@ -195,7 +195,7 @@ pub mod encoder {
         }
     }
 
-    impl<'a, P> CommandsEncoder<P> where P: Encoder<'a> + Default {
+    impl<'a, P> Put_data_commandsEncoder<P> where P: Encoder<'a> + Default {
         #[inline]
         pub fn wrap(
             mut self,
@@ -216,7 +216,7 @@ pub mod encoder {
 
         #[inline]
         pub fn block_length() -> u16 {
-            1
+            0
         }
 
         #[inline]
@@ -241,16 +241,19 @@ pub mod encoder {
             }
         }
 
-        /// REQUIRED enum
+        /// VAR_DATA ENCODER - character encoding: 'UTF-8'
         #[inline]
-        pub fn command_type(&mut self, value: command_type::CommandType) {
-            let offset = self.offset;
-            self.get_buf_mut().put_u8_at(offset, value as u8)
+        pub fn key(&mut self, value: &str) {
+            let limit = self.get_limit();
+            let data_length = value.len();
+            self.set_limit(limit + 4 + data_length);
+            self.get_buf_mut().put_u32_at(limit, data_length as u32);
+            self.get_buf_mut().put_slice_at(limit + 4, value.as_bytes());
         }
 
         /// VAR_DATA ENCODER - character encoding: 'None'
         #[inline]
-        pub fn payload(&mut self, value: &[u8]) {
+        pub fn value(&mut self, value: &[u8]) {
             let limit = self.get_limit();
             let data_length = value.len();
             self.set_limit(limit + 4 + data_length);
@@ -374,16 +377,16 @@ pub mod decoder {
             self.get_buf().get_u64_at(self.offset + 40)
         }
 
-        /// GROUP DECODER (id=8)
+        /// GROUP DECODER (id=11)
         #[inline]
-        pub fn commands_decoder(self) -> CommandsDecoder<Self> {
-            CommandsDecoder::default().wrap(self)
+        pub fn put_data_commands_decoder(self) -> Put_data_commandsDecoder<Self> {
+            Put_data_commandsDecoder::default().wrap(self)
         }
 
     }
 
     #[derive(Debug, Default)]
-    pub struct CommandsDecoder<P> {
+    pub struct Put_data_commandsDecoder<P> {
         parent: Option<P>,
         block_length: u16,
         count: u16,
@@ -391,21 +394,21 @@ pub mod decoder {
         offset: usize,
     }
 
-    impl<'a, P> ActingVersion for CommandsDecoder<P> where P: Reader<'a> + ActingVersion + Default {
+    impl<'a, P> ActingVersion for Put_data_commandsDecoder<P> where P: Reader<'a> + ActingVersion + Default {
         #[inline]
         fn acting_version(&self) -> u16 {
             self.parent.as_ref().unwrap().acting_version()
         }
     }
 
-    impl<'a, P> Reader<'a> for CommandsDecoder<P> where P: Reader<'a> + Default {
+    impl<'a, P> Reader<'a> for Put_data_commandsDecoder<P> where P: Reader<'a> + Default {
         #[inline]
         fn get_buf(&self) -> &ReadBuf<'a> {
             self.parent.as_ref().expect("parent missing").get_buf()
         }
     }
 
-    impl<'a, P> Decoder<'a> for CommandsDecoder<P> where P: Decoder<'a> + ActingVersion + Default {
+    impl<'a, P> Decoder<'a> for Put_data_commandsDecoder<P> where P: Decoder<'a> + ActingVersion + Default {
         #[inline]
         fn get_limit(&self) -> usize {
             self.parent.as_ref().expect("parent missing").get_limit()
@@ -417,7 +420,7 @@ pub mod decoder {
         }
     }
 
-    impl<'a, P> CommandsDecoder<P> where P: Decoder<'a> + ActingVersion + Default {
+    impl<'a, P> Put_data_commandsDecoder<P> where P: Decoder<'a> + ActingVersion + Default {
         pub fn wrap(
             mut self,
             mut parent: P,
@@ -434,7 +437,7 @@ pub mod decoder {
             self
         }
 
-        /// group token - Token{signal=BEGIN_GROUP, name='commands', referencedName='null', description='null', packageName='null', id=8, version=0, deprecated=0, encodedLength=1, offset=48, componentTokenCount=18, encoding=Encoding{presence=REQUIRED, primitiveType=null, byteOrder=LITTLE_ENDIAN, minValue=null, maxValue=null, nullValue=null, constValue=null, characterEncoding='null', epoch='null', timeUnit=null, semanticType='null'}}
+        /// group token - Token{signal=BEGIN_GROUP, name='put_data_commands', referencedName='null', description='null', packageName='null', id=11, version=0, deprecated=0, encodedLength=0, offset=48, componentTokenCount=18, encoding=Encoding{presence=REQUIRED, primitiveType=null, byteOrder=LITTLE_ENDIAN, minValue=null, maxValue=null, nullValue=null, constValue=null, characterEncoding='null', epoch='null', timeUnit=null, semanticType='null'}}
         #[inline]
         pub fn parent(&mut self) -> SbeResult<P> {
             self.parent.take().ok_or(SbeErr::ParentNotSet)
@@ -466,15 +469,9 @@ pub mod decoder {
             }
         }
 
-        /// REQUIRED enum
+        /// VAR_DATA DECODER - character encoding: 'UTF-8'
         #[inline]
-        pub fn command_type(&self) -> command_type::CommandType {
-            self.get_buf().get_u8_at(self.offset).into()
-        }
-
-        /// VAR_DATA DECODER - character encoding: 'None'
-        #[inline]
-        pub fn payload_decoder(&mut self) -> (usize, usize) {
+        pub fn key_decoder(&mut self) -> (usize, usize) {
             let offset = self.parent.as_ref().expect("parent missing").get_limit();
             let data_length = self.get_buf().get_u32_at(offset) as usize;
             self.parent.as_mut().unwrap().set_limit(offset + 4 + data_length);
@@ -482,7 +479,22 @@ pub mod decoder {
         }
 
         #[inline]
-        pub fn payload_slice(&'a self, coordinates: (usize, usize)) -> &'a [u8] {
+        pub fn key_slice(&'a self, coordinates: (usize, usize)) -> &'a [u8] {
+            debug_assert!(self.get_limit() >= coordinates.0 + coordinates.1);
+            self.get_buf().get_slice_at(coordinates.0, coordinates.1)
+        }
+
+        /// VAR_DATA DECODER - character encoding: 'None'
+        #[inline]
+        pub fn value_decoder(&mut self) -> (usize, usize) {
+            let offset = self.parent.as_ref().expect("parent missing").get_limit();
+            let data_length = self.get_buf().get_u32_at(offset) as usize;
+            self.parent.as_mut().unwrap().set_limit(offset + 4 + data_length);
+            (offset + 4, data_length)
+        }
+
+        #[inline]
+        pub fn value_slice(&'a self, coordinates: (usize, usize)) -> &'a [u8] {
             debug_assert!(self.get_limit() >= coordinates.0 + coordinates.1);
             self.get_buf().get_slice_at(coordinates.0, coordinates.1)
         }
