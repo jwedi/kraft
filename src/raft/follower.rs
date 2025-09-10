@@ -55,6 +55,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
             shared_state.volatile_server_state.next_term = append_entries_request.term + 1;
+            shared_state.volatile_server_state.replication_log_term_starts.insert(shared_state.server_state.current_term, shared_state.volatile_server_state.replication_log.len() as u64);
 
             // TODO this isn't correct, fix when log backfill and storage works
             //shared_state.volatile_server_state.last_log_term = append_entries_request.term;

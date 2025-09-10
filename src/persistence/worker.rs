@@ -121,8 +121,10 @@ impl PersistenceWorker {
                             let span = tracing::span!(Level::INFO, "persistence_append_log", id=id, bytes=data.len());
                             span.set_parent(parent_span.context());
                             let _enter = span.enter();
+                            tracing::info!("Appending log entry with id {} and data length {}", request_id, data.len());
                             self.append_log(&data, & mut log_write_buffer).unwrap();
-                            self.response_queue.push(PersistenceResponseType::LogPersisted{id})
+                            self.response_queue.push(PersistenceResponseType::LogPersisted{id});
+                            tracing::info!("Append log entry done");
                         }
                     }
                 }

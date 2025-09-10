@@ -82,6 +82,15 @@ message RemoteConnectResponse {
     bool ok = 1;
 }
 
+message TracingContext {
+    repeated TracingContextEntry entries = 1;
+}
+
+message TracingContextEntry {
+    string key = 1;
+    string value = 2;
+}
+
 message RemoteQuorumMessage {
     oneof message_payload {
         RemoteConnectRequest connect_request_option = 1;
@@ -91,6 +100,8 @@ message RemoteQuorumMessage {
         RemoteAppendEntriesRequest append_entries_request_option = 5;
         RemoteAppendEntriesAcknowledge append_entries_acknowledge_option = 6;
     }
+
+    TracingContext tracing_context = 16;
 }
 
 message StreamResponse {

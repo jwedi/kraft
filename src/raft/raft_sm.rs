@@ -167,6 +167,7 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                 let _enter_span = span.enter();
                 // If state machine is leader, forward, otherwise reject.
                 if self.state_delegate.get_node_type() == RaftNodeType::Leader {
+                    tracing::info!("Processing write batch as leader.");
                     self.state_delegate.write_batch(batch, raft_message.callback, &mut self.shared_state)
                 } else {
                     log::error!("Received write batch as non-leader. Leader is {}", self.shared_state.server_state.leader_id);
