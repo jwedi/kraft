@@ -57,6 +57,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         let message_id = shared_state.next_message_id;
         let mut idx = shared_state.volatile_server_state.next_log_index;
         log::info!("leader handling writing batches {} as message id: {} with index: {}", write_batch_request.requests.len(), message_id, idx);
+        tracing::info!("writing batches {} as message id: {} with index: {}", write_batch_request.requests.len(), message_id, idx);
         shared_state.next_message_id += 1;
 
         let span = tracing::span!(Level::INFO, "delegate_write_batch");
@@ -76,6 +77,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             requests: write_batch_request.requests
         };
         let (limit, mut data) = serialize_data(&serialization_data, buffer, offset);
+        tracing::info!("serialized data size: {}", limit);
         data.truncate(limit);
         if idx == 0 {
             shared_state.volatile_server_state.replication_log_term_starts.insert(shared_state.server_state.current_term, shared_state.volatile_server_state.replication_log.len() as u64);
@@ -115,6 +117,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             };
             task_queue.push(LocalQuorumWorkerTask {task_type: task});
         });
+        tracing::info!("tasks dispatched");
 
         let message_type = OutstandingMessageType::WriteBatch{persistence_done: false, quorum_acks: 0, callback, index: idx};
         //let response_span = tracing::span!(Level::INFO, "write_batch_outstanding_message_processing");
@@ -150,6 +153,8 @@ impl RaftProtocol for RaftLeaderStateDelegate {
 
             let message_id = shared_state.next_message_id;
             shared_state.next_message_id += 1;
+
+            shared_state.volatile_server_state.replication_log_term_starts.insert(shared_state.server_state.current_term, shared_state.volatile_server_state.replication_log.len() as u64);
 
             shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
                 let task = LocalQuorumWorkerTaskType::StopHeartbeats{ id: message_id };

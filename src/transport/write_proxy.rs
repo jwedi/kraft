@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::future::Future;
+use std::io::Read;
 use std::iter::Map;
 use std::rc::Rc;
 use std::sync::{Arc, Condvar};
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant};
 use crossbeam_queue::SegQueue;
 use opentelemetry::Context;
 use opentelemetry::propagation::TextMapPropagator;
-use opentelemetry::trace::SpanBuilder;
+use opentelemetry::trace::{SpanBuilder, TraceContextExt};
 use opentelemetry_zipkin::Propagator;
 use serde::Deserialize;
 use tokio::sync::oneshot;
@@ -270,60 +271,6 @@ impl WriteProxy {
         }
     }
 
-    async fn handle_write_batch_with_known_leader(&mut self, leader_id: u32, batches: Vec<WriteBatch>) {
-        let parent = Span::current();
-        let mut preparation = WriteProxy::prepare_batch_and_callbacks(batches);
-        let all_requests = preparation.0;
-        let mut batch_callbacks = preparation.1;
-
-        if leader_id == self.self_id {
-            tracing::debug!("local batch forward");
-            // Node is the leader
-            let chan: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
-            let payload = LocalRaftMessagePayload::WriteBatch(
-                LocalRaftWriteBatchRequest {
-                    requests: all_requests,
-                }
-            );
-            let span = tracing::span!(Level::INFO, "write_proxy_local_batch_forward_await");
-            let raft_message = LocalRaftMessage {
-                payload,
-                callback: chan.0,
-                parent_span: span.clone()
-            };
-            self.task_queue.push(raft_message);
-            WriteProxy::handle_local_write_response(chan.1, span.clone(), batch_callbacks).instrument(span).await;
-        } else {
-            let span = tracing::span!(Level::INFO, "write_proxy_remote_batch_forward_client");
-            tracing::debug!("remote batch forward");
-
-            // Get RPC client and do a remote PutBatch request.
-            match self.get_client(leader_id).instrument(span).await {
-                Ok(mut client) => {
-                    let put_batch_span = tracing::span!(Level::INFO, "write_proxy_remote_put_batch");
-                    put_batch_span.set_parent(parent.context());
-
-                    let rpc_put_batch_span = tracing::span!(Level::INFO, "write_proxy_remote_put_batch_send_rpc");
-                    rpc_put_batch_span.set_parent(put_batch_span.context());
-
-                    let request = WriteProxy::prepare_put_batch_request(all_requests, rpc_put_batch_span.clone(), &self.propagator);
-
-                    WriteProxy::send_remote_put_batch_and_handle_response(client, request, batch_callbacks, rpc_put_batch_span).instrument(put_batch_span).await;
-                }
-                Err(e) => {
-                    tracing::error!("Setting up remote client failed with error: {}", e);
-                    for b in batch_callbacks {
-                        let msg = WriteResponse {
-                            responses: vec![],
-                            status_code: StatusCode::INTERNAL_SERVER_ERROR
-                        };
-                        b.1.send(msg);
-                    }
-                }
-            }
-        }
-    }
-
     pub async fn run(&mut self) {
         tracing::info!("Write proxy worker running");
         let mut join_set = JoinSet::new();
@@ -382,10 +329,9 @@ impl WriteProxy {
             let mut batch = self.write_queue.next_write_batch(self.max_batch_size);
             let start_time = now_millis();
             if !batch.is_empty() {
-                let mut new_root = batch.first_mut().unwrap().span_parent.take().unwrap_or_else( || {
-                    log::error!("unexpected empty parent span from write queue batch");
-                    Span::none()
-                });
+                let mut new_root = tracing::span!(Level::INFO, "write_proxy_batch_process", batch_requests=batch.iter().map(|b| b.requests.len()).sum::<usize>(), num_batches=batch.len());
+                new_root.set_parent(Context::new());
+                let _enter = new_root.enter();
 
                 let batch_requests: u64 = batch.iter().map(|b| b.requests.len() as u64).sum();
                 let num_batches: u64 = batch.len() as u64;
@@ -410,26 +356,27 @@ impl WriteProxy {
                         }
                     );
                     let span = tracing::span!(Level::INFO, "write_proxy_local_batch_forward_await", num_requests=num_requests, request_size=request_size);
-                    span.set_parent(new_root.context());
                     let raft_message = LocalRaftMessage {
                         payload,
                         callback: chan.0,
                         parent_span: span.clone()
                     };
                     self.task_queue.push(raft_message);
+                    let span_clone = span.clone();
                     join_set.spawn(async {
-                        WriteProxy::handle_local_write_response(chan.1, span.clone(), batch_callbacks).instrument(span).await;
+                        WriteProxy::handle_local_write_response(chan.1, span_clone.clone(), batch_callbacks).instrument(span_clone).await;
                     });
                 } else {
-                    match self.get_client(current_leader_id).await {
+                    match self.get_client(current_leader_id).instrument(new_root.clone()).await {
                         Ok(mut client) => {
                             let put_batch_span = tracing::span!(Level::INFO, "write_proxy_remote_put_batch", num_requests=num_requests, request_size=request_size);
                             put_batch_span.set_parent(new_root.context());
+                            let _enter = put_batch_span.enter();
                             let request = WriteProxy::prepare_put_batch_request(all_requests, put_batch_span.clone(), &self.propagator);
 
-                            let p = new_root.clone();
+                            let p = put_batch_span.clone();
                             join_set.spawn(async {
-                                WriteProxy::send_remote_put_batch_and_handle_response(client, request, batch_callbacks, p).instrument(put_batch_span).await
+                                WriteProxy::send_remote_put_batch_and_handle_response(client, request, batch_callbacks, p.clone()).instrument(p).await
                             });
                         }
                         Err(e) => {

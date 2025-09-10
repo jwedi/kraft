@@ -49,6 +49,7 @@ pub mod service_utils {
     pub mod errors;
     pub mod app_time;
     pub mod storage_utils;
+    pub mod tracing_utils;
 }
 
 mod runtime_core {
@@ -86,8 +87,9 @@ mod client {
 }
 
 fn init_tracing(node_id: u32) -> SDKTracer {
+    let name = format!("kraft_node_{}", node_id);
     let tracer = opentelemetry_zipkin::new_pipeline()
-        .with_service_name("rraft")
+        .with_service_name(name)
         .with_collector_endpoint("http://localhost:9411/api/v2/spans")
         .with_trace_config(
             trace::Config::default()
