@@ -57,6 +57,7 @@ async fn do_append_entries() -> Result<(), Box<dyn std::error::Error>> {
             prev_log_index: 0,
             prev_log_term: 0,
         }),
+        commit_index: 0,
     });
     let response = client.append_entries(request).await?;
     println!("RESPONSE={:?}", response.into_inner());
@@ -164,6 +165,7 @@ async fn do_append_entries_async() -> Result<(), Box<dyn std::error::Error>> {
                     prev_log_term: 0,
                     message_id: 0
                 }),
+                commit_index: 0,
             });
 
             // Make the gRPC request

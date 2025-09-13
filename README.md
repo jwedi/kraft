@@ -194,3 +194,20 @@ TODOs update 2;
 7. Rename since Kraft is taken already.
 
 Maybe when serving read requests the response is prepared but is only served when follower gets a hearbeat from the leader indicating that it's up to date.
+
+
+
+Commit index work:
+All nodes should append to the replication log after they've saved the data to disk.
+When the leader receives successful append entries responses from a quorum of nodes it should update the commit index.
+The current commit index should be sent in each append entries request.
+If a follower receives an append entries request with a higher commit index that its own, it should update it.
+
+When a node start up it should learn the commit index from the current leader.
+
+
+If a node that just started receives append entries request from the current leader with a prev index and term that's lower than its own.
+It should undo its own log last log entries until it reaches the prev index and term of the requestor.
+
+Candidate state should delegate to follower state if receiving append entries request from a valid leader. 
+Probably happens automatically given that the first request from the leader is always the heartbeat which would trigger a state change from Candidate.

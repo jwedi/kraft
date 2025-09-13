@@ -9,6 +9,7 @@ message RemoteAppendEntriesRequest {
     repeated RemoteLogEntry entries = 5; // TODO delete this
     uint64 request_id = 6;
     RemoteLogEntry entry = 7;
+    uint64 commit_index = 8;
 }
 
 message RemoteAppendEntriesAcknowledge {

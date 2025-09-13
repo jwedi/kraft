@@ -136,7 +136,9 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                 let span = tracing::span!(Level::INFO, "sm_append_entries");
                 span.set_parent(raft_message.parent_span.context());
                 let _enter_span = span.enter();
+                tracing::info!("starting append entries processing of {} entries", r.entries.len());
                 let state_change = self.state_delegate.append_entries(r, raft_message.callback, &mut self.shared_state);
+                tracing::info!("finished append entries processing");
                 match state_change {
                     RaftMessageStateChange::None => {}
                     RaftMessageStateChange::Candidate(new_state) => {
@@ -252,7 +254,8 @@ pub struct LocalAppendEntries {
     pub prev_index: u64,
     pub prev_term: u64,
     pub request_id: u64,
-    pub entry: Option<RemoteLogEntry>
+    pub entry: Option<RemoteLogEntry>,
+    pub commit_index: u64
 }
 
 pub struct LocalRaftMessage {
@@ -335,15 +338,6 @@ pub struct RaftSM {
     pub log: Vec<RemoteLogEntry>
 
 }
-
-/*
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct LogEntry {
-    pub term: u64,
-    pub index: u64,
-    pub command: String
-}
- */
 
 
 

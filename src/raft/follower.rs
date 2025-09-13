@@ -14,6 +14,7 @@ use crate::quorum::worker::{LocalQuorumWorkerTask, LocalQuorumTaskResponseType, 
 use crate::raft::candidate::RaftCandidateStateDelegate;
 use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRaftWriteBatchResponse, LocalRequestVoteRequest, SharedState, TermVote};
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
+use crate::service_utils::storage_utils::deserialize_data;
 
 pub struct RaftFollowerStateDelegate {
     election_timeout: u128,
@@ -86,6 +87,10 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                         }
                     ).expect("sending append_entries response callback failed");
                 } else {
+                    if append_entries_request.commit_index > shared_state.volatile_server_state.commit_index {
+                        shared_state.volatile_server_state.commit_index = append_entries_request.commit_index;
+                        log::info!("Updated commit index to {}", append_entries_request.commit_index);
+                    }
                     log::debug!("consecutive heartbeat req: term {}, index: {}, state: term {}, index {}", append_entries_request.prev_term, append_entries_request.prev_index, shared_state.volatile_server_state.last_log_term, shared_state.volatile_server_state.last_log_index);
                     callback.send(
                         LocalRaftResponseMessage {
@@ -134,9 +139,17 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: data.to_vec(), parent_span: Span::current(), request_id: append_entries_request.request_id};
             shared_state.persistence_work.push(persistence_task);
 
-            // TODO write to log local replication log
-            // TODO maybe append to term index if first message of term.
-
+            match deserialize_data(&data, 0) {
+                Ok((_, deserialized)) => {
+                    shared_state.volatile_server_state.replication_log.push(Arc::new(deserialized));
+                }
+                Err(e) => {
+                    log::error!("Failed to deserialize append_entries data from leader: {}, term: {}, index: {}, error: {}", append_entries_request.leader_id, append_entries_request.term, append_entries_request.prev_index, e);
+                }
+            }
+            if append_entries_request.commit_index > shared_state.volatile_server_state.commit_index {
+                shared_state.volatile_server_state.commit_index = append_entries_request.commit_index;
+            }
 
             let message_type = OutstandingMessageType::AppendLog{ callback };
             let outstanding_message = OutstandingMessage{
@@ -256,5 +269,209 @@ impl RaftProtocol for RaftFollowerStateDelegate {
         };
         shared_state.outstanding_messages.insert(message_id, outstanding_message);
         RaftMessageStateChange::None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use super::*;
+    use crate::raft::raft_sm::*;
+    use tokio::sync::oneshot;
+    use std::sync::Arc;
+    use crate::server::raftproto::{RemoteLogEntry, RemotePutRequest};
+    use crate::service_utils::storage_utils::{SerializationData, serialize_data};
+
+    fn create_shared_state() -> SharedState {
+        SharedState {
+            server_state: RaftServerState {
+                current_term: 1,
+                leader_id: 1,
+            },
+            volatile_server_state: RaftVolatileState {
+                next_term: 2,
+                last_log_term: 1,
+                last_log_index: 0,
+                commit_index: 0,
+                replication_log: vec![],
+                replication_log_term_starts: std::collections::HashMap::new(),
+                last_applied: 0,
+                next_log_index: 1,
+            },
+            next_message_id: 1,
+            outstanding_messages: std::collections::HashMap::new(),
+            quorum_size: 3,
+            quorum_worker_tasks: vec![],
+            persistence_work: Arc::new(SegQueue::new()),
+            persistence_response: Arc::new(SegQueue::new()),
+            quorum_work: Arc::new(SegQueue::new()),
+            quorum_response: Arc::new(SegQueue::new()),
+            identity: 0,
+            term_votes: HashMap::new(),
+            state_machine_config: StateMachineConfig { max_message_size_bytes: 2048},
+        }
+    }
+
+    #[test]
+    fn test_new_delegate_initializes_election_timeout() {
+        let delegate = RaftFollowerStateDelegate::new();
+        assert!(delegate.election_timeout > 0);
+        assert!(delegate.election_timeout_min < delegate.election_timeout_max);
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_recognize_new_leader() {
+        let mut delegate = RaftFollowerStateDelegate::new();
+        let mut shared_state = create_shared_state();
+        let (tx, rx) = oneshot::channel();
+
+        let req = LocalAppendEntries {
+            term: 2,
+            leader_id: 2,
+            prev_term: 1,
+            prev_index: 0,
+            commit_index: 0,
+            request_id: 1,
+            entry: None,
+            entries: vec![]
+        };
+
+        let result = delegate.append_entries(req, tx, &mut shared_state);
+        let response = rx.await.unwrap();
+        match response.payload {
+            LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok) => {},
+            _ => panic!("Unexpected response"),
+        }
+        assert_eq!(shared_state.server_state.current_term, 2);
+        assert_eq!(shared_state.server_state.leader_id, 2);
+        assert!(matches!(result, RaftMessageStateChange::None));
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_heartbeat_updates_commit_index() {
+        let mut delegate = RaftFollowerStateDelegate::new();
+        let mut shared_state = create_shared_state();
+        let (tx, rx) = oneshot::channel();
+
+        let req = LocalAppendEntries {
+            term: 1,
+            leader_id: 1,
+            prev_term: 1,
+            prev_index: 0,
+            commit_index: 5,
+            request_id: 0,
+            entry: None,
+            entries: vec![]
+        };
+
+        let result = delegate.append_entries(req, tx, &mut shared_state);
+        let response = rx.await.unwrap();
+        match response.payload {
+            LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok { .. }) => {},
+            _ => panic!("Unexpected response"),
+        }
+        assert_eq!(shared_state.volatile_server_state.commit_index, 5);
+        assert!(matches!(result, RaftMessageStateChange::None));
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_appends_log_entry() {
+        let mut delegate = RaftFollowerStateDelegate::new();
+        let mut shared_state = create_shared_state();
+        let (tx, rx) = oneshot::channel();
+
+        let put_request = RemotePutRequest{
+            id: "put_1".to_string(),
+            payload: "test_payload".to_string(),
+            node_id: 42,
+        };
+        let serialisation_data = SerializationData{
+            index: 1,
+            term: 1,
+            timestamp: 123456789,
+            prev_index: 0,
+            prev_term: 0,
+            message_id: 100,
+            requests: vec![put_request],
+        };
+        let mut buffer = vec![0u8; 2048];
+        let (size, mut serialised_data) = serialize_data(&serialisation_data, buffer, 0);
+        serialised_data.truncate(size);
+        let req = LocalAppendEntries {
+            term: 1,
+            leader_id: 1,
+            prev_term: 1,
+            prev_index: 0,
+            commit_index: 1,
+            request_id: 1,
+            entry: Some(RemoteLogEntry {
+                term: 1,
+                index: 1,
+                data: serialised_data,
+                batch_index: 0,
+                message_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 1,
+            }),
+            entries: vec![]
+        };
+
+        let message_index = shared_state.next_message_id;
+        let result = delegate.append_entries(req, tx, &mut shared_state);
+        // Send persistence response to mock that entries have been written to disk
+        shared_state.persistence_response.push(PersistenceResponseType::LogPersisted { id: message_index });
+        // Should see the persisted log message and trigger the callback.
+        delegate.time_step(&mut shared_state);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await.expect("Timed out waiting for response").unwrap();
+        match response.payload {
+            LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok { .. }) => {},
+            _ => panic!("Unexpected response"),
+        }
+        assert_eq!(shared_state.volatile_server_state.last_log_index, 1, "last_log_index should be updated to 1");
+        assert_eq!(shared_state.volatile_server_state.last_log_term, 1, "last_log_term should be updated to 1");
+        assert_eq!(shared_state.volatile_server_state.commit_index, 1, "commit_index should be updated to 1");
+        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 1, "replication_log should contain one entry");
+        assert!(matches!(result, RaftMessageStateChange::None), "result should be RaftMessageStateChange::None");
+        let log_entry = &shared_state.volatile_server_state.replication_log[0];
+        assert_eq!(log_entry.index, 1, "Log entry index should be 1");
+        assert_eq!(log_entry.term, 1, "Log entry term should be 1");
+        assert_eq!(log_entry.requests.len(), 1, "Log entry should contain one request");
+        assert_eq!(log_entry.requests[0].id, "put_1", "Request ID should match");
+        assert_eq!(log_entry.requests[0].payload, "test_payload", "Request payload should match");
+    }
+
+    #[tokio::test]
+    async fn test_request_vote_rejects_invalid_vote() {
+        let mut delegate = RaftFollowerStateDelegate::new();
+        let mut shared_state = create_shared_state();
+        let (tx, rx) = oneshot::channel();
+
+        let req = LocalRequestVoteRequest {
+            term: 0,
+            candidate_id: 2,
+            last_log_term: 0,
+            last_log_index: 0,
+        };
+
+        let result = delegate.request_vote(req, tx, &mut shared_state);
+        let response = rx.await.unwrap();
+        match response.payload {
+            LocalRaftResponsePayload::RequestVote(false) => {},
+            _ => panic!("Unexpected response"),
+        }
+        assert!(matches!(result, RaftMessageStateChange::None));
+    }
+
+    #[tokio::test]
+    async fn test_time_step_triggers_candidate_transition() {
+        let mut delegate = RaftFollowerStateDelegate::new();
+        let mut shared_state = create_shared_state();
+        delegate.election_timeout = 0; // Simulate timeout
+
+        let result = delegate.time_step(&mut shared_state);
+        match result {
+            RaftMessageStateChange::Candidate(_) => {},
+            _ => panic!("Should transition to candidate"),
+        }
     }
 }
