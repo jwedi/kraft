@@ -67,6 +67,18 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         let buffer = vec![0u8; shared_state.state_machine_config.max_message_size_bytes];
         let offset = 0usize;
 
+        if write_batch_request.requests.is_empty() {
+            log::warn!("Received empty write batch request, ignoring");
+            let r = LocalRaftWriteBatchResponse{
+                responses: vec![],
+                err: Some("Empty write batch request".to_string())
+            };
+            let payload = LocalRaftResponsePayload::WriteBatch(r);
+            let response = LocalRaftResponseMessage {payload};
+            callback.send(response).unwrap();
+            return;
+        }
+
         let serialization_data = SerializationData{
             index: idx,
             term: shared_state.server_state.current_term,
@@ -106,7 +118,8 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                 prev_log_index: shared_state.volatile_server_state.last_log_index,
                 prev_log_term: shared_state.volatile_server_state.last_log_term,
                 request_id: message_id,
-                entry: Some(le)
+                entry: Some(le),
+                commit_index: shared_state.volatile_server_state.commit_index,
             };
 
             let quorum_span = Span::current();
@@ -184,13 +197,12 @@ impl RaftProtocol for RaftLeaderStateDelegate {
     }
 
     fn time_step(&mut self, shared_state: &mut SharedState) -> RaftMessageStateChange {
-        // Check heartbeat
-        // Poll persistence changes
 
         if !self.initialized {
             let message_id = shared_state.next_message_id;
             shared_state.next_message_id += 1;
             shared_state.volatile_server_state.next_log_index = 0;
+            shared_state.volatile_server_state.commit_index = 0;
 
             // Tell quorum workers to start sending heartbeats.
             shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
@@ -205,12 +217,6 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             self.initialized = true
         }
 
-        // TODO
-        // make sure quorum workers are sending heartbeats.
-
-        // TODO
-        // If a batch has been persisted, check if data has been persisted to quorum of workers
-        // If yes, update commit index and maybe delete outstanding message
         while let Some(task) = shared_state.persistence_response.pop() {
             match task {
 
@@ -297,7 +303,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                 if new_acks >= shared_state.quorum_size && persistence_done {
                                     // Log replication done
                                     log::info!("Write batch with message id {} has been persisted on quorum of nodes", id);
-                                    shared_state.volatile_server_state.commit_index = index;
+                                    if index > shared_state.volatile_server_state.commit_index {
+                                        shared_state.volatile_server_state.commit_index = index;
+                                    }
                                     let r = LocalRaftWriteBatchResponse{
                                         responses: vec![], // TODO
                                         err: None
@@ -334,8 +342,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                     };
                     let slice = shared_state.volatile_server_state.replication_log.as_slice();
                     let data_slice = clone_subset(&slice, start_index as usize, slice.len()); // TODO maybe something with prev index
-                    let quorum_node_index = if quorum_node_id > shared_state.identity as u64 {
-                        quorum_node_id - 2
+
+                    let quorum_node_index = if quorum_node_id == 0 {
+                        0
                     } else {
                         quorum_node_id - 1
                     };
@@ -392,5 +401,322 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         };
         shared_state.outstanding_messages.insert(message_id, outstanding_message);
         RaftMessageStateChange::None
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use super::*;
+    use crate::raft::raft_sm::*;
+    use tokio::sync::oneshot;
+    use std::sync::Arc;
+    use crate::quorum::worker::LocalQuorumResponse;
+    use crate::server::raftproto::{RemoteLogEntry, RemotePutRequest};
+    use crate::service_utils::storage_utils::{SerializationData, serialize_data};
+
+    fn create_shared_state() -> SharedState {
+        SharedState {
+            server_state: RaftServerState {
+                current_term: 1,
+                leader_id: 1,
+            },
+            volatile_server_state: RaftVolatileState {
+                next_term: 2,
+                last_log_term: 1,
+                last_log_index: 0,
+                commit_index: 0,
+                replication_log: vec![],
+                replication_log_term_starts: std::collections::HashMap::new(),
+                last_applied: 0,
+                next_log_index: 1,
+            },
+            next_message_id: 1,
+            outstanding_messages: std::collections::HashMap::new(),
+            quorum_size: 3,
+            quorum_worker_tasks: vec![],
+            persistence_work: Arc::new(SegQueue::new()),
+            persistence_response: Arc::new(SegQueue::new()),
+            quorum_work: Arc::new(SegQueue::new()),
+            quorum_response: Arc::new(SegQueue::new()),
+            identity: 0,
+            term_votes: HashMap::new(),
+            state_machine_config: StateMachineConfig { max_message_size_bytes: 2048},
+        }
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_recognize_new_leader() {
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state();
+        let (tx, rx) = oneshot::channel();
+
+        let req = LocalAppendEntries {
+            term: 2,
+            leader_id: 2,
+            prev_term: 1,
+            prev_index: 0,
+            commit_index: 0,
+            request_id: 1,
+            entry: None,
+            entries: vec![]
+        };
+
+        let result = delegate.append_entries(req, tx, &mut shared_state);
+        let response = rx.await.unwrap();
+        match response.payload {
+            LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok) => {},
+            _ => panic!("Unexpected response"),
+        }
+        assert_eq!(shared_state.server_state.current_term, 2);
+        assert_eq!(shared_state.server_state.leader_id, 2);
+        assert!(matches!(result, RaftMessageStateChange::Follower(..)));
+    }
+
+    #[tokio::test]
+    async fn test_request_vote_rejects_invalid_vote() {
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state();
+        let (tx, rx) = oneshot::channel();
+
+        let req = LocalRequestVoteRequest {
+            term: 0,
+            candidate_id: 2,
+            last_log_term: 0,
+            last_log_index: 0,
+        };
+
+        let result = delegate.request_vote(req, tx, &mut shared_state);
+        let response = rx.await.unwrap();
+        match response.payload {
+            LocalRaftResponsePayload::RequestVote(false) => {},
+            _ => panic!("Unexpected response"),
+        }
+        assert!(matches!(result, RaftMessageStateChange::None));
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_happy_path() {
+        // Test that write_batch correctly appends a batch and dispatches tasks
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state();
+        let (tx, rx) = oneshot::channel();
+
+        // Prepare a write batch request
+        let put_request = RemotePutRequest {
+            id: "put_1".to_string(),
+            payload: "payload".to_string(),
+            node_id: 1,
+        };
+        let write_batch_request = LocalRaftWriteBatchRequest {
+            requests: vec![put_request.clone()],
+        };
+
+        // Add a dummy quorum worker task queue
+        shared_state.quorum_worker_tasks.push(Arc::new(SegQueue::new()));
+
+        // Call write_batch
+        delegate.write_batch(write_batch_request, tx, &mut shared_state);
+
+        // Check that the replication log was updated
+        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 1);
+        let entry = &shared_state.volatile_server_state.replication_log[0];
+        assert_eq!(entry.index, 1); // Indexes start at 1
+        assert_eq!(entry.term, shared_state.server_state.current_term);
+        assert_eq!(entry.requests.len(), 1);
+        assert_eq!(entry.requests[0].id, "put_1");
+
+        // Check that outstanding_messages contains the new message
+        assert!(shared_state.outstanding_messages.contains_key(&(shared_state.next_message_id - 1)));
+
+        // Check that persistence_work contains the append log task
+        let found = shared_state.persistence_work.pop().is_some();
+        assert!(found, "Persistence task should be queued");
+
+        // Check that a quorum worker task was dispatched
+        let queue = &shared_state.quorum_worker_tasks[0];
+        let found = queue.pop().is_some();
+        assert!(found, "Quorum worker task should be queued");
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_empty_requests_failure() {
+        // Test that write_batch does not append when requests are empty
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state();
+        let (tx, _rx) = oneshot::channel();
+
+        // Prepare an empty write batch request
+        let write_batch_request = LocalRaftWriteBatchRequest {
+            requests: vec![],
+        };
+
+        // Add a dummy quorum worker task queue
+        shared_state.quorum_worker_tasks.push(Arc::new(SegQueue::new()));
+
+        // Call write_batch
+        delegate.write_batch(write_batch_request, tx, &mut shared_state);
+
+        // Check that the replication log was still updated (current implementation does not reject empty)
+        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 0);
+    }
+
+
+    fn create_shared_state_with_quorum() -> SharedState {
+        let mut state = SharedState {
+            server_state: RaftServerState {
+                current_term: 1,
+                leader_id: 0,
+            },
+            volatile_server_state: RaftVolatileState {
+                next_term: 2,
+                last_log_term: 1,
+                last_log_index: 0,
+                commit_index: 0,
+                replication_log: vec![],
+                replication_log_term_starts: std::collections::HashMap::new(),
+                last_applied: 0,
+                next_log_index: 1,
+            },
+            next_message_id: 1,
+            outstanding_messages: std::collections::HashMap::new(),
+            quorum_size: 2,
+            quorum_worker_tasks: vec![Arc::new(SegQueue::new()), Arc::new(SegQueue::new())],
+            persistence_work: Arc::new(SegQueue::new()),
+            persistence_response: Arc::new(SegQueue::new()),
+            quorum_work: Arc::new(SegQueue::new()),
+            quorum_response: Arc::new(SegQueue::new()),
+            identity: 0,
+            term_votes: std::collections::HashMap::new(),
+            state_machine_config: StateMachineConfig { max_message_size_bytes: 2048},
+        };
+        state
+    }
+
+    #[test]
+    fn test_time_step_initializes_leader_and_sends_heartbeats() {
+        // Test that time_step initializes the leader and sends heartbeats
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state_with_quorum();
+
+        // Initially not initialized
+        assert!(!delegate.initialized);
+
+        // Call time_step
+        let result = delegate.time_step(&mut shared_state);
+
+        // Should be initialized now
+        assert!(delegate.initialized);
+
+        // Should have sent heartbeats to all quorum worker tasks
+        for queue in &shared_state.quorum_worker_tasks {
+            let task = queue.pop().unwrap();
+            match task.task_type {
+                LocalQuorumWorkerTaskType::StartHeartbeats { id, term, prev_term, prev_log_index } => {
+                    assert_eq!(id, 1);
+                    assert_eq!(term, 1);
+                    assert_eq!(prev_term, 1);
+                    assert_eq!(prev_log_index, 0);
+                }
+                _ => panic!("Expected StartHeartbeats task"),
+            }
+        }
+
+        // Should return None state change
+        assert!(matches!(result, RaftMessageStateChange::None));
+    }
+
+    #[test]
+    fn test_time_step_handles_log_persisted_and_quorum_ack_happy_path() {
+        // Test that time_step handles LogPersisted and quorum ack correctly
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state_with_quorum();
+
+        // Simulate an outstanding write batch message
+        let (callback_tx, mut callback_rx) = oneshot::channel();
+        let msg_id = shared_state.next_message_id;
+        let outstanding = OutstandingMessage {
+            id: msg_id,
+            outstanding_responses: 2,
+            message_type: OutstandingMessageType::WriteBatch {
+                persistence_done: false,
+                quorum_acks: 1,
+                callback: callback_tx,
+                index: 42,
+            },
+            span: tracing::span!(Level::INFO, "test"),
+        };
+        shared_state.outstanding_messages.insert(msg_id, outstanding);
+
+        shared_state.persistence_response.push(PersistenceResponseType::LogPersisted { id: msg_id });
+        shared_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::AppendEntries { id: msg_id, ok: true }
+        });
+
+        let result = delegate.time_step(&mut shared_state);
+
+        // Should have updated commit_index
+        assert_eq!(shared_state.volatile_server_state.commit_index, 42);
+
+        // Should have sent callback response
+        let response = callback_rx.try_recv().unwrap();
+        match response.payload {
+            LocalRaftResponsePayload::WriteBatch(r) => {
+                assert!(r.err.is_none());
+            }
+            _ => panic!("Expected WriteBatch response"),
+        }
+
+        // Should return None state change
+        assert!(matches!(result, RaftMessageStateChange::None));
+    }
+
+    #[test]
+    fn test_time_step_handles_backfill_log_request() {
+        // Test that time_step handles BackfillLog request
+        let mut delegate = RaftLeaderStateDelegate::new();
+        delegate.initialized = true;
+        let mut shared_state = create_shared_state_with_quorum();
+
+        shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+            index: 1,
+            term: 1,
+            timestamp: 0,
+            prev_index: 0,
+            prev_term: 0,
+            message_id: 1,
+            requests: vec![],
+        }));
+
+        // Simulate BackfillLog event
+        shared_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::BackfillLog {
+                quorum_node_id: 1,
+                prev_term: 0,
+                prev_index: 0,
+            }
+        });
+
+        let result = delegate.time_step(&mut shared_state);
+
+        // Should have dispatched a BackfillLog task to the quorum worker
+        let queue = &shared_state.quorum_worker_tasks[0];
+        let task = queue.pop().unwrap();
+        match task.task_type {
+            LocalQuorumWorkerTaskType::BackfillLog { data } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0].index, 1);
+                assert_eq!(data[0].term, 1);
+                assert_eq!(data[0].requests.len(), 0);
+                assert_eq!(data[0].message_id, 1);
+                assert_eq!(data[0].prev_index, 0);
+                assert_eq!(data[0].prev_term, 0);
+            }
+            v => panic!("Expected BackfillLog task"),
+        }
+
+        // Should return None state change
+        assert!(matches!(result, RaftMessageStateChange::None));
     }
 }

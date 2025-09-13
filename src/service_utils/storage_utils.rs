@@ -5,6 +5,7 @@ use sbe_kraft_replication_schema::log_entry_codec::{LogEntryDecoder, LogEntryEnc
 use sbe_kraft_replication_schema::message_header_codec::MessageHeaderDecoder;
 use sbe_kraft_replication_schema::{message_header_codec, Decoder, ReadBuf, WriteBuf, Encoder};
 
+#[derive(Clone, PartialEq)]
 pub struct SerializationData {
     pub index: u64,
     pub term: u64,

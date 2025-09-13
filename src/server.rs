@@ -180,7 +180,8 @@ impl Raft for RaftServerImpl {
             prev_term: req.prev_log_term,
             entries: req.entries,
             request_id: req.request_id,
-            entry: req.entry
+            entry: req.entry,
+            commit_index: req.commit_index,
         });
         let span = tracing::span!(Level::INFO, "awaiting_append_entries");
         let msg = LocalRaftMessage {

@@ -50,7 +50,6 @@ pub enum LocalQuorumWorkerTaskType {
     RequestVote{ id: u64, term: u64, last_term: u64, last_index: u64, parent_span: Span}, // Term, last term, last index,
     AppendEntries{ id: u64, req: RemoteAppendEntriesRequest, parent_span: Span},
     BackfillLog {data: Vec<Arc<SerializationData>>}
-    // TODO backfill
 }
 
 pub enum LocalQuorumTaskResponseType {
@@ -83,7 +82,8 @@ pub struct QuorumWorker {
     grpc_channel: SharedGrpcChannel,
     stream_manager: Arc<StreamManagerImpl>,
     task_queue: Arc<SegQueue<LocalRaftMessage>>,
-    ongoing_backfill: Option<OngoingBackfill>
+    ongoing_backfill: Option<OngoingBackfill>,
+    commit_index: u64
 
     // TODO needs work task queue since all requests will now come through the quorum worker instead of the gRPC server
     // VoteRequest comes in, is sent to task worker queue
@@ -119,7 +119,6 @@ impl QuorumWorker {
         member_endpoint: String,
         stream_manager: Arc<StreamManagerImpl>,
         task_queue: Arc<SegQueue<LocalRaftMessage>>,
-
     ) -> Self {
         Self {
             work_queue,
@@ -137,7 +136,8 @@ impl QuorumWorker {
             grpc_channel: SharedGrpcChannel::new(member_endpoint.as_str(), member_id as u32),
             stream_manager,
             task_queue,
-            ongoing_backfill: None
+            ongoing_backfill: None,
+            commit_index: 0,
         }
     }
 
@@ -160,9 +160,9 @@ impl QuorumWorker {
                     }
                     Err(e) => {
                         log::error!("Send stream connect error {} towards: {}", e.stringify(), self.member_endpoint);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
             if maybe_receive_stream.is_none() {
@@ -314,8 +314,8 @@ impl QuorumWorker {
                                     // TODO if not ok
                                     // set prev_log_term and prev_log_index based on response.
                                     // Send backfill log request to leader.
-                                    log::debug!("received append entries acknowledge from: {}", self.member_id);
-
+                                    //log::debug!("received append entries acknowledge from: {}", self.member_id);
+                                    tracing::info!("received append entries acknowledge from: {}, ok: {}, request id: {}, member: {}", self.member_id, append_entries.ok, append_entries.request_id, self.member_id);
 
                                     let resp = LocalQuorumTaskResponseType::AppendEntries{id: append_entries.request_id, ok: append_entries.ok};
                                     self.response_queue.push(LocalQuorumResponse {response_type: resp})
@@ -330,9 +330,10 @@ impl QuorumWorker {
                                 let index = append_entries.entry.as_ref().map(|entry| entry.index).unwrap_or_else(|| 0);
                                 let term = append_entries.entry.as_ref().map(|entry| entry.term).unwrap_or_else(|| 0);
                                 tracing::info!("received append entries request from {} as self {}, sending task to local state machine", self.member_id, self.self_id);
+                                self.commit_index = append_entries.commit_index;
 
                                 self.task_queue.push(LocalRaftMessage {
-                                    payload: LocalRaftMessagePayload::AppendEntries(LocalAppendEntries { leader_id: append_entries.leader_id, term: append_entries.term, prev_term: append_entries.prev_log_term, prev_index: append_entries.prev_log_index, entries: append_entries.entries, request_id: append_entries.request_id, entry: append_entries.entry}),
+                                    payload: LocalRaftMessagePayload::AppendEntries(LocalAppendEntries { leader_id: append_entries.leader_id, term: append_entries.term, prev_term: append_entries.prev_log_term, prev_index: append_entries.prev_log_index, entries: append_entries.entries, request_id: append_entries.request_id, entry: append_entries.entry, commit_index: append_entries.commit_index}),
                                     callback: callback.0,
                                     parent_span: span.clone()
 
@@ -403,7 +404,8 @@ impl QuorumWorker {
                     prev_log_term: self.prev_log_term,
                     entries: vec![],
                     request_id: 0,
-                    entry: None
+                    entry: None,
+                    commit_index: self.commit_index,
                 };
 
                 let req = MessagePayload::AppendEntriesRequestOption(request);
@@ -471,6 +473,7 @@ impl QuorumWorker {
                                 tracing::info!("sending append entries with request id {} to member {}, self id {}", id, self.member_id, self.self_id);
                                 self.prev_log_term = req.entry.as_ref().unwrap().term;
                                 self.prev_log_index = req.entry.as_ref().unwrap().index;
+                                self.commit_index = req.commit_index;
                                 let tracing_context = span_to_tracing_context(&s.context(), &self.propagator);
                                 send_stream.send(
                                     RemoteQuorumMessage{
@@ -503,7 +506,8 @@ impl QuorumWorker {
                                         prev_log_term: entry.prev_term,
                                         entries: vec![],
                                         request_id: entry.message_id,
-                                        entry: Some(remote_entry)
+                                        entry: Some(remote_entry),
+                                        commit_index: self.commit_index,
                                     };
                                     send_stream.send(
                                         RemoteQuorumMessage{
@@ -519,8 +523,6 @@ impl QuorumWorker {
                         }
                     }
                     None => {
-                        // Condvar wait or sleep
-                        tokio::time::sleep(Duration::from_micros(100)).await;
                         break;
                     }
                 }
