@@ -32,6 +32,7 @@ use crate::service_utils::app_time::now_millis;
 use sbe_kraft_replication_schema::{log_entry_codec, message_header_codec, WriteBuf};
 use sbe_kraft_replication_schema::command_codec::CommandEncoder;
 use sbe_kraft_replication_schema::log_entry_codec::LogEntryEncoder;
+use crate::quorum::worker::{LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
 
 #[derive(Debug)]
 pub struct WriteResponse {
@@ -67,7 +68,7 @@ pub struct WriteQueue {
 
 impl WriteQueue {
 
-    pub fn next_write_batch(&mut self, max_batch_size: u64) -> Vec<WriteBatch> {
+    pub fn next_write_batch(&mut self, max_batch_size: u64) -> (Vec<WriteBatch>, bool) {
         let mut responses: Vec<WriteBatch> = vec![];
         let mut current_size: u64 = 0u64;
         if let Some(val) = self.shelved_batch.take() {
@@ -86,16 +87,16 @@ impl WriteQueue {
                 } else {
                     // Doesn't fit current batch
                     self.shelved_batch = Some(next);
-                    break;
+                    return (responses, true)
                 }
             } else {
                 //tracing::info!("no more write requests");
                 // No more pending batches
-                break;
+                return (responses, false);
             }
         }
         //tracing::info!("returning batch with {} items", responses.len());
-        return responses;
+        return (responses, true);
     }
 }
 
@@ -108,7 +109,9 @@ pub struct WriteProxy {
     cluster_nodes: Vec<ClusterNode>,
     current_leader_connection: SharedGrpcChannel,
     propagator: Propagator,
-    min_batch_interval: u128
+    min_batch_interval: u128,
+    quorum_worker_tasks: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>>,
+    useQuorumForWrites: bool
 }
 
 impl WriteProxy {
@@ -118,7 +121,8 @@ impl WriteProxy {
         task_queue: Arc<SegQueue<LocalRaftMessage>>,
         self_id: u32,
         cluster_nodes: Vec<ClusterNode>,
-        min_batch_interval: u64
+        min_batch_interval: u64,
+        quorum_worker_tasks: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>>
     ) -> Self {
         let write_queue = WriteQueue {
             work_queue,
@@ -133,9 +137,12 @@ impl WriteProxy {
             cluster_nodes,
             current_leader_connection: default_leader_connection,
             propagator: opentelemetry_zipkin::Propagator::new(),
-            min_batch_interval: min_batch_interval as u128
+            min_batch_interval: min_batch_interval as u128,
+            quorum_worker_tasks,
+            useQuorumForWrites: true
         }
     }
+
 
     async fn get_client(&mut self, node_id: u32) -> Result<RaftClient<Channel>, String> {
         if node_id == self.current_leader_connection.node_id {
@@ -223,8 +230,9 @@ impl WriteProxy {
         (all_requests, batch_callbacks)
     }
 
-    fn prepare_put_batch_request(put_requests: Vec<RemotePutRequest>, span_parent: Span, propagator: &Propagator) -> Request<RemotePutBatchRequest> {
+    fn prepare_put_batch_request(batch_id: String, put_requests: Vec<RemotePutRequest>, span_parent: Span, propagator: &Propagator) -> Request<RemotePutBatchRequest> {
         let req = RemotePutBatchRequest {
+            batch_id,
             put_request: put_requests
         };
 
@@ -243,6 +251,35 @@ impl WriteProxy {
             }
         }
         request
+    }
+
+    async fn send_quorum_put_batch_and_handle_response(leader_quorum_worker: Arc<SegQueue<LocalQuorumWorkerTask>>, request: RemotePutBatchRequest, batch_callbacks: HashMap<String, Sender<WriteResponse>>, span: Span) {
+
+        let s = span.clone();
+        let callback: (Sender<WriteResponse>, Receiver<WriteResponse>) = oneshot::channel();
+        let wb = LocalQuorumWorkerTaskType::WriteBatch { write_batch: WriteBatch { batch_id: request.batch_id, requests: request.put_request, span_parent: Some(span.clone()), callback: callback.0 } };
+        leader_quorum_worker.push(LocalQuorumWorkerTask{task_type: wb});
+        let resp = callback.1.instrument(s).await;
+        match resp {
+            Ok(put_response) => {
+                let write_callback_span = tracing::span!(Level::INFO, "write_proxy_remote_success_callbacks");
+                write_callback_span.set_parent(span.context());
+                write_callback_span.in_scope(|| {
+                    tracing::event!(Level::INFO, "sending successful callback");
+                    WriteProxy::respond_to_put_responses(put_response.responses, batch_callbacks)
+                })
+            }
+            Err(e) => {
+                tracing::error!("Remote PutBatch request failed with error: {}", e);
+                for b in batch_callbacks {
+                    let msg = WriteResponse {
+                        responses: vec![],
+                        status_code: StatusCode::INTERNAL_SERVER_ERROR
+                    };
+                    b.1.send(msg);
+                }
+            }
+        }
     }
 
     async fn send_remote_put_batch_and_handle_response(mut client: RaftClient<Channel>, request: Request<RemotePutBatchRequest>, batch_callbacks: HashMap<String, Sender<WriteResponse>>, span: Span) {
@@ -300,7 +337,7 @@ impl WriteProxy {
                         match &m.payload {
                             LocalRaftResponsePayload::RaftState { leader_id } => {
                                 if *leader_id <= 0 {
-                                    log::warn!("No leader elected, retrying later");
+                                    //log::warn!("No leader elected, retrying later");
                                     tokio::time::sleep(Duration::from_millis(3)).await;
                                     continue
                                 } else if *leader_id == current_leader_id {
@@ -326,13 +363,13 @@ impl WriteProxy {
                 }
             }
 
-            let mut batch = self.write_queue.next_write_batch(self.max_batch_size);
+            let (mut batch, full_batch) = self.write_queue.next_write_batch(self.max_batch_size);
             let start_time = now_millis();
             if !batch.is_empty() {
                 let mut new_root = tracing::span!(Level::INFO, "write_proxy_batch_process", batch_requests=batch.iter().map(|b| b.requests.len()).sum::<usize>(), num_batches=batch.len());
                 new_root.set_parent(Context::new());
                 let _enter = new_root.enter();
-
+                let batch_id = uuid::Uuid::new_v4().to_string();
                 let batch_requests: u64 = batch.iter().map(|b| b.requests.len() as u64).sum();
                 let num_batches: u64 = batch.len() as u64;
                 let mut preparation = WriteProxy::prepare_batch_and_callbacks(batch);
@@ -367,33 +404,48 @@ impl WriteProxy {
                         WriteProxy::handle_local_write_response(chan.1, span_clone.clone(), batch_callbacks).instrument(span_clone).await;
                     });
                 } else {
-                    match self.get_client(current_leader_id).instrument(new_root.clone()).await {
-                        Ok(mut client) => {
-                            let put_batch_span = tracing::span!(Level::INFO, "write_proxy_remote_put_batch", num_requests=num_requests, request_size=request_size);
-                            put_batch_span.set_parent(new_root.context());
-                            let _enter = put_batch_span.enter();
-                            let request = WriteProxy::prepare_put_batch_request(all_requests, put_batch_span.clone(), &self.propagator);
+                    if self.useQuorumForWrites {
+                        let put_batch_span = tracing::span!(Level::INFO, "write_proxy_remote_put_batch", num_requests=num_requests, request_size=request_size);
+                        put_batch_span.set_parent(new_root.context());
+                        let _enter = put_batch_span.enter();
+                        let request = RemotePutBatchRequest{ put_request: all_requests, batch_id};
 
-                            let p = put_batch_span.clone();
-                            join_set.spawn(async {
-                                WriteProxy::send_remote_put_batch_and_handle_response(client, request, batch_callbacks, p.clone()).instrument(p).await
-                            });
-                        }
-                        Err(e) => {
-                            tracing::error!("Setting up remote client failed with error: {}", e);
-                            for b in batch_callbacks {
-                                let msg = WriteResponse {
-                                    responses: vec![],
-                                    status_code: StatusCode::INTERNAL_SERVER_ERROR
-                                };
-                                b.1.send(msg);
+                        let p = put_batch_span.clone();
+                        let leader_quorum_worker_index = if current_leader_id < self.self_id { (current_leader_id - 1) as usize } else { (current_leader_id - 2) as usize };
+                        let leader_quorum_worker = Arc::clone(&self.quorum_worker_tasks[leader_quorum_worker_index]);
+                        join_set.spawn(async {
+                            WriteProxy::send_quorum_put_batch_and_handle_response(leader_quorum_worker, request, batch_callbacks, p.clone()).instrument(p).await
+                        });
+                    } else {
+                        match self.get_client(current_leader_id).instrument(new_root.clone()).await {
+                            Ok(mut client) => {
+                                let put_batch_span = tracing::span!(Level::INFO, "write_proxy_remote_put_batch", num_requests=num_requests, request_size=request_size);
+                                put_batch_span.set_parent(new_root.context());
+                                let _enter = put_batch_span.enter();
+                                let request = WriteProxy::prepare_put_batch_request(batch_id, all_requests, put_batch_span.clone(), &self.propagator);
+
+                                let p = put_batch_span.clone();
+                                join_set.spawn(async {
+                                    WriteProxy::send_remote_put_batch_and_handle_response(client, request, batch_callbacks, p.clone()).instrument(p).await
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!("Setting up remote client failed with error: {}", e);
+                                for b in batch_callbacks {
+                                    let msg = WriteResponse {
+                                        responses: vec![],
+                                        status_code: StatusCode::INTERNAL_SERVER_ERROR
+                                    };
+                                    b.1.send(msg);
+                                }
                             }
                         }
                     }
                 }
                 let delta = now_millis() - start_time;
-                if delta < self.min_batch_interval {
-                    tokio::time::sleep(Duration::from_millis(delta as u64)).await;
+                // don't sleep if we've got a full batch to not fall behind.
+                if !full_batch && delta < self.min_batch_interval {
+                    tokio::time::sleep(Duration::from_millis((self.min_batch_interval - delta) as u64)).await;
                 }
                 //  Clean up completed tasks
                 while let Some(result) = join_set.try_join_next() {
@@ -407,7 +459,7 @@ impl WriteProxy {
                     }
                 }
             } else {
-                tokio::time::sleep(Duration::from_micros(300)).await;
+                tokio::time::sleep(Duration::from_millis(self.min_batch_interval as u64)).await;
             }
         }
 

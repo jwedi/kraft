@@ -101,6 +101,8 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                 if quorum_votes >= shared_state.quorum_size {
                                     // Candidate election done, Transition to leader.
                                     log::info!("Node elected leader for term {}", term);
+                                    shared_state.server_state.leader_id = shared_state.identity;
+                                    shared_state.server_state.current_term = term;
                                     return RaftMessageStateChange::Leader(Box::new(RaftLeaderStateDelegate::new()));
                                 } else {
                                     msg.outstanding_responses = new_outstanding_resp;

@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
 use std::ops::Deref;
@@ -20,21 +21,22 @@ use tokio::sync::oneshot::{Receiver, Sender};
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::task::JoinSet;
 use tonic::{Request, Response, Status};
+use tonic::codegen::http::StatusCode;
 use tonic::transport::{Channel};
 use tracing::{Instrument, Level, Span};
 use tracing::instrument::Instrumented;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::client::cluster_node_client::SharedGrpcChannel;
-use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftMessage, LocalRaftMessagePayload, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalRequestVoteRequest};
+use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftMessage, LocalRaftMessagePayload, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalRaftWriteBatchRequest, LocalRequestVoteRequest};
 use crate::server::raftproto::raft_client::RaftClient;
-use crate::server::raftproto::{RemoteAppendEntriesAcknowledge, RemoteAppendEntriesRequest, RemoteAppendEntriesResponse, RemoteLogEntry, RemoteQuorumMessage, RemoteVoteRequest, RemoteVoteResponse};
+use crate::server::raftproto::{RemoteAppendEntriesAcknowledge, RemoteAppendEntriesRequest, RemoteAppendEntriesResponse, RemoteLogEntry, RemotePutBatchRequest, RemotePutBatchResponse, RemoteQuorumMessage, RemoteVoteRequest, RemoteVoteResponse};
 use crate::server::raftproto::remote_quorum_message::MessagePayload;
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
 use crate::service_utils::storage_utils::{SerializationData, serialize_data, SerializedData};
 use crate::service_utils::tracing_utils::{span_to_tracing_context, tracing_context_to_span};
 use crate::transport::stream_manager::{StreamManager, StreamManagerImpl};
 use crate::transport::stream_manager::raftproto::TracingContext;
-use crate::transport::write_proxy::WriteResponse;
+use crate::transport::write_proxy::{WriteBatch, WriteResponse};
 
 pub struct LocalQuorumWorkerTask {
     pub task_type: LocalQuorumWorkerTaskType
@@ -49,7 +51,8 @@ pub enum LocalQuorumWorkerTaskType {
     StopHeartbeats { id: u64 },
     RequestVote{ id: u64, term: u64, last_term: u64, last_index: u64, parent_span: Span}, // Term, last term, last index,
     AppendEntries{ id: u64, req: RemoteAppendEntriesRequest, parent_span: Span},
-    BackfillLog {data: Vec<Arc<SerializationData>>}
+    BackfillLog {data: Vec<Arc<SerializationData>>},
+    WriteBatch{ write_batch: WriteBatch }
 }
 
 pub enum LocalQuorumTaskResponseType {
@@ -83,7 +86,8 @@ pub struct QuorumWorker {
     stream_manager: Arc<StreamManagerImpl>,
     task_queue: Arc<SegQueue<LocalRaftMessage>>,
     ongoing_backfill: Option<OngoingBackfill>,
-    commit_index: u64
+    commit_index: u64,
+    pending_write_batches: HashMap<String, Sender<WriteResponse>>
 
     // TODO needs work task queue since all requests will now come through the quorum worker instead of the gRPC server
     // VoteRequest comes in, is sent to task worker queue
@@ -96,7 +100,8 @@ pub struct QuorumWorker {
 #[derive(Debug)]
 pub enum PendingQuorumTaskEnum {
     Vote(RemoteVoteRequest),
-    AppendEntries{request_id: u64, log_index: u64, term: u64, parent_span: Span}
+    AppendEntries{request_id: u64, log_index: u64, term: u64, parent_span: Span},
+    WriteBatch{ batch_id: String, parent_span: Span}
 }
 #[derive(Debug)]
 struct PendingQuorumTask {
@@ -138,6 +143,7 @@ impl QuorumWorker {
             task_queue,
             ongoing_backfill: None,
             commit_index: 0,
+            pending_write_batches: HashMap::new()
         }
     }
 
@@ -148,6 +154,7 @@ impl QuorumWorker {
         let mut pending_tasks: Vec<PendingQuorumTask> = vec![];
 
         loop {
+            let current_time = now_millis();
             let mut maybe_receive_stream = self.stream_manager.get_receive_stream(self.member_id as u32).await;
             let mut maybe_send_stream = self.stream_manager.get_send_stream(self.member_id as u32).await;
 
@@ -244,6 +251,26 @@ impl QuorumWorker {
                                                 log::error!("unexpected pending task type for append entries")
                                             }
                                         } }
+                                    LocalRaftResponsePayload::WriteBatch(write_resp) => {
+                                        match &pt.task {
+                                            PendingQuorumTaskEnum::WriteBatch{batch_id, parent_span} => {
+                                                let span = tracing::span!(Level::INFO, "processing_write_batch_response");
+                                                span.set_parent(parent_span.context());
+                                                let _enter = span.enter();
+                                                tracing::info!("processing write batch response from member {} as self id {}", self.member_id, self.self_id);
+                                                let tracing_context = span_to_tracing_context(&span.context(), &self.propagator);
+                                                send_stream.send(
+                                                    RemoteQuorumMessage{
+                                                        message_payload: Some(MessagePayload::PutBatchResponseOption(RemotePutBatchResponse{responses: write_resp.responses, batch_id: batch_id.clone()})),
+                                                        tracing_context: Some(tracing_context)
+                                                    }
+                                                ).expect("sending on stream shouldn't fail");
+                                            }
+                                            default => {
+                                                log::error!("unexpected pending task type for write batch")
+                                            }
+                                        }
+                                    }
                                     unknown => {
                                         log::error!("unknown raft response payload")
                                     }
@@ -364,6 +391,36 @@ impl QuorumWorker {
                                 };
                                 pending_tasks.push(pending_task);
                             }
+                            Some(MessagePayload::PutBatchRequestOption(put_batch)) => {
+                                let callback: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
+
+                                tracing::info!("received put batch request from {} as self {}, sending task to local state machine", self.member_id, self.self_id);
+                                let pending_task = PendingQuorumTask {
+                                    task: PendingQuorumTaskEnum::WriteBatch{ batch_id: put_batch.batch_id.clone(), parent_span: span.clone()},
+                                    callback: callback.1
+                                };
+                                pending_tasks.push(pending_task);
+
+                                self.task_queue.push(LocalRaftMessage{
+                                    payload: LocalRaftMessagePayload::WriteBatch(LocalRaftWriteBatchRequest{
+                                        requests: put_batch.put_request,
+                                    }),
+                                    callback: callback.0,
+                                    parent_span: span.clone()
+                                });
+                            }
+                            Some(MessagePayload::PutBatchResponseOption(put_batch_response)) => {
+                                // Response from remote state machine, should trigger callbacks.
+                                let callback = self.pending_write_batches.remove(&put_batch_response.batch_id);
+                                match callback {
+                                    Some(cb) => {
+                                        let _ = cb.send(WriteResponse{ responses: put_batch_response.responses, status_code: StatusCode::OK});
+                                    }
+                                    None => {
+                                        log::error!("No pending write batch found for batch id: {}", put_batch_response.batch_id);
+                                    }
+                                }
+                            }
                             Some(payload) => {
                                 log::error!("Encountered unexpected receive stream message payload: {:?}", payload);
                             }
@@ -434,7 +491,6 @@ impl QuorumWorker {
                 let task = self.work_queue.pop();
                 match task {
                     Some(task) => {
-                        log::info!("Received quorum task");
                         match task.task_type {
                             LocalQuorumWorkerTaskType::StartHeartbeats{id, term, prev_term, prev_log_index} => {
                                 log::info!("received start heartbeat request id: {}, term: {}", id, term);
@@ -519,6 +575,30 @@ impl QuorumWorker {
                                 self.last_heartbeat = now_millis();
                                 self.ongoing_backfill = None;
                             }
+                            LocalQuorumWorkerTaskType::WriteBatch { write_batch} => {
+                                let s = tracing::span!(Level::INFO, "sending_write_batch");
+                                write_batch.span_parent.iter().for_each(|p| {
+                                    s.set_parent(p.context());
+                                });
+                                let _guard = s.enter();
+                                tracing::info!("sending write batch with id {} to member {}, self id {}, num requests: {}", write_batch.batch_id, self.member_id, self.self_id, write_batch.requests.len());
+
+                                let put_batch_request = RemotePutBatchRequest{
+                                    batch_id: write_batch.batch_id,
+                                    put_request: write_batch.requests
+                                };
+
+                                self.pending_write_batches.insert(put_batch_request.batch_id.clone(), write_batch.callback);
+
+                                let tracing_context = span_to_tracing_context(&s.context(), &self.propagator);
+                                send_stream.send(
+                                    RemoteQuorumMessage{
+                                        message_payload: Some(MessagePayload::PutBatchRequestOption(put_batch_request)),
+                                        tracing_context: Some(tracing_context)
+                                    }
+                                ).unwrap();
+
+                            }
 
                         }
                     }
@@ -534,6 +614,10 @@ impl QuorumWorker {
                 self.stream_manager.reset_receive_stream(self.member_id as u32).await;
                 drop(send_stream);
                 self.stream_manager.reset_send_stream(self.member_id as u32).await;
+            }
+            let elapsed = now_millis() - current_time;
+            if elapsed < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
     }

@@ -55,6 +55,7 @@ message RemotePutRequest {
 
 message RemotePutBatchRequest {
     repeated RemotePutRequest put_request = 1;
+    string batch_id = 2;
 }
 
 enum RemoteResponseType {
@@ -73,6 +74,7 @@ message RemotePutResponse {
 
 message RemotePutBatchResponse {
     repeated RemotePutResponse responses = 1;
+    string batch_id = 2;
 }
 
 message RemoteConnectRequest {
@@ -100,6 +102,8 @@ message RemoteQuorumMessage {
         RemoteVoteResponse vote_response_option = 4;
         RemoteAppendEntriesRequest append_entries_request_option = 5;
         RemoteAppendEntriesAcknowledge append_entries_acknowledge_option = 6;
+        RemotePutBatchRequest put_batch_request_option = 7;
+        RemotePutBatchResponse put_batch_response_option = 8;
     }
 
     TracingContext tracing_context = 16;
