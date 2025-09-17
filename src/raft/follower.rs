@@ -160,7 +160,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             };
             shared_state.outstanding_messages.insert(message_id, outstanding_message);
         } else {
-            log::info!("received append_entries request from non leader with lower term than current. caller: {}, term: {}, current term: {}", append_entries_request.leader_id, append_entries_request.term, shared_state.server_state.current_term);
+            log::info!("received append_entries request from non leader with lower term than current. caller: {}, current leader: {}, term: {}, current term: {}", append_entries_request.leader_id, shared_state.server_state.leader_id, append_entries_request.term, shared_state.server_state.current_term);
             callback.send(
                 LocalRaftResponseMessage {
                     payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::UnrecognizedLeader)

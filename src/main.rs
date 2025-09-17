@@ -172,16 +172,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut maybe_max_vote = votes.iter().max_by(|x, y|  x.term.cmp(&y.term));
     let highest_term_vote = maybe_max_vote.get_or_insert(&default_vote);
     let server_state = RaftServerState {
-        current_term: highest_term_vote.term,
-        leader_id: highest_term_vote.candidate_id,
+        current_term: 0,
+        leader_id: 0,
     };
+    let next_term = std::cmp::max(highest_term_vote.term, last_log_term) + 1;
     let volatile_server_state = RaftVolatileState {
         commit_index: 0,
         last_applied: 0,
         last_log_index: last_log_index,
         last_log_term: last_log_term,
-        next_term: server_state.current_term+1,
-        next_log_index: last_log_index + 1,
+        next_term: next_term,
+        next_log_index: last_log_index + 1, // TODO this is probably stupid.
         replication_log,
         replication_log_term_starts: term_start_index
     };
@@ -243,7 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_message_id: 0,
         outstanding_messages,
         quorum_size,
-        quorum_worker_tasks: quorum_send_channels,
+        quorum_worker_tasks: quorum_send_channels.clone(),
         state_machine_config: StateMachineConfig{ max_message_size_bytes: cfg.max_message_size_bytes},
     };
 
@@ -256,7 +257,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 proxy_raft_queue,
                 cfg.node_id,
                 cluster_nodes_without_self,
-                cfg.min_batch_interval_ms
+                cfg.min_batch_interval_ms,
+                quorum_send_channels
             );
             tracing::info!(message = "Spawning write proxy handler");
             wp.run().await;

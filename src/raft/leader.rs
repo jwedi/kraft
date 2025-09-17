@@ -341,10 +341,13 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                         shared_state.volatile_server_state.replication_log_term_starts.get(&prev_term).unwrap().clone() + prev_index + 1
                     };
                     let slice = shared_state.volatile_server_state.replication_log.as_slice();
+                    log::info!("Backfilling from index: {} to {}", start_index, slice.len());
                     let data_slice = clone_subset(&slice, start_index as usize, slice.len()); // TODO maybe something with prev index
 
                     let quorum_node_index = if quorum_node_id == 0 {
                         0
+                    } else if quorum_node_id > shared_state.identity as u64 {
+                        quorum_node_id - 2
                     } else {
                         quorum_node_id - 1
                     };

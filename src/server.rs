@@ -155,6 +155,7 @@ impl Raft for RaftServerImpl {
         };
 
         let response = RemotePutBatchResponse {
+            batch_id: req.batch_id,
             responses: vec![
                 RemotePutResponse{
                     id: "1234".to_string(),
