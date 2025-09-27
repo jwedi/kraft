@@ -36,6 +36,38 @@ impl RaftFollowerStateDelegate {
             election_timeout_max: max
         }
     }
+
+    fn truncate_log(&self, shared_state: &mut SharedState, prev_term: u64, prev_index: u64) {
+        log::info!("Truncating log to term {} index {}", prev_term, prev_index);
+
+        // Find the term start for the given term
+        if let Some(&term_start) = shared_state.volatile_server_state.replication_log_term_starts.get(&prev_term) {
+            let target_length = (term_start + prev_index + 1) as usize;
+
+            // Truncate the replication log to the specified point
+            if target_length < shared_state.volatile_server_state.replication_log.len() {
+                shared_state.volatile_server_state.replication_log.truncate(target_length);
+                log::info!("Truncated replication log to length {}", target_length);
+
+                // Update the volatile state to reflect the new log end
+                shared_state.volatile_server_state.last_log_term = prev_term;
+                shared_state.volatile_server_state.last_log_index = prev_index;
+                shared_state.volatile_server_state.next_log_index = prev_index + 1;
+
+                // Remove any term starts that are beyond the truncation point
+                shared_state.volatile_server_state.replication_log_term_starts.retain(|_term, start| {
+                    *start <= term_start + prev_index
+                });
+
+                log::info!("Updated log state: last_log_term={}, last_log_index={}, next_log_index={}",
+                          shared_state.volatile_server_state.last_log_term,
+                          shared_state.volatile_server_state.last_log_index,
+                          shared_state.volatile_server_state.next_log_index);
+            }
+        } else {
+            log::warn!("Cannot truncate to unknown term {}", prev_term);
+        }
+    }
 }
 
 impl RaftProtocol for RaftFollowerStateDelegate {
@@ -227,6 +259,12 @@ impl RaftProtocol for RaftFollowerStateDelegate {
 
         while let Some(task) = shared_state.quorum_response.pop() {
             match task.response_type {
+                LocalQuorumTaskResponseType::TruncateLog { quorum_node_id, prev_term, prev_index } => {
+                    log::info!("Received truncate log request from leader, truncating to term {} index {}", prev_term, prev_index);
+                    self.truncate_log(shared_state, prev_term, prev_index);
+                    // After truncation, request backfill again
+                    log::info!("After truncation, will request backfill from term {} index {}", prev_term, prev_index);
+                }
                 _ => {
                     tracing::error!(message = "Received invalid quorum response message in current state");
                 }
@@ -277,6 +315,7 @@ mod tests {
     use std::collections::HashMap;
     use super::*;
     use crate::raft::raft_sm::*;
+    use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumTaskResponseType};
     use tokio::sync::oneshot;
     use std::sync::Arc;
     use crate::server::raftproto::{RemoteLogEntry, RemotePutRequest};
@@ -473,5 +512,177 @@ mod tests {
             RaftMessageStateChange::Candidate(_) => {},
             _ => panic!("Should transition to candidate"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_truncate_log_basic_functionality() {
+        let delegate = RaftFollowerStateDelegate::new();
+        let mut shared_state = create_shared_state();
+
+        // Set up a log with multiple terms
+        shared_state.volatile_server_state.replication_log_term_starts.insert(1, 0);
+        shared_state.volatile_server_state.replication_log_term_starts.insert(2, 3);
+        shared_state.volatile_server_state.replication_log_term_starts.insert(3, 8);
+
+        // Add log entries for terms 1, 2, and 3
+        for i in 0..12 {
+            shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+                requests: vec![],
+                term: if i < 3 { 1 } else if i < 8 { 2 } else { 3 },
+                index: i,
+            }));
+        }
+
+        shared_state.volatile_server_state.last_log_term = 3;
+        shared_state.volatile_server_state.last_log_index = 11;
+        shared_state.volatile_server_state.next_log_index = 12;
+
+        // Truncate to term 2, index 1 (should keep entries 0,1,2,3,4)
+        delegate.truncate_log(&mut shared_state, 2, 1);
+
+        // Verify log was truncated correctly
+        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 5);
+        assert_eq!(shared_state.volatile_server_state.last_log_term, 2);
+        assert_eq!(shared_state.volatile_server_state.last_log_index, 1);
+        assert_eq!(shared_state.volatile_server_state.next_log_index, 2);
+
+        // Verify term starts were cleaned up - should only have terms 1 and 2
+        assert!(shared_state.volatile_server_state.replication_log_term_starts.contains_key(&1));
+        assert!(shared_state.volatile_server_state.replication_log_term_starts.contains_key(&2));
+        assert!(!shared_state.volatile_server_state.replication_log_term_starts.contains_key(&3));
+    }
+
+    #[tokio::test]
+    async fn test_truncate_log_to_term_boundary() {
+        let delegate = RaftFollowerStateDelegate::new();
+        let mut shared_state = create_shared_state();
+
+        // Set up a log with multiple terms
+        shared_state.volatile_server_state.replication_log_term_starts.insert(1, 0);
+        shared_state.volatile_server_state.replication_log_term_starts.insert(2, 5);
+
+        for i in 0..10 {
+            shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+                requests: vec![],
+                term: if i < 5 { 1 } else { 2 },
+                index: i,
+            }));
+        }
+
+        shared_state.volatile_server_state.last_log_term = 2;
+        shared_state.volatile_server_state.last_log_index = 9;
+
+        // Truncate to end of term 1 (index 4, term 1)
+        delegate.truncate_log(&mut shared_state, 1, 4);
+
+        // Should truncate to exactly the end of term 1
+        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 6); // 0-4 + 1 for next
+        assert_eq!(shared_state.volatile_server_state.last_log_term, 1);
+        assert_eq!(shared_state.volatile_server_state.last_log_index, 4);
+
+        // Should only have term 1 now
+        assert!(shared_state.volatile_server_state.replication_log_term_starts.contains_key(&1));
+        assert!(!shared_state.volatile_server_state.replication_log_term_starts.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn test_truncate_log_unknown_term_warning() {
+        let delegate = RaftFollowerStateDelegate::new();
+        let mut shared_state = create_shared_state();
+
+        // Set up a log with only term 3
+        shared_state.volatile_server_state.replication_log_term_starts.insert(3, 0);
+        for i in 0..5 {
+            shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+                requests: vec![],
+                term: 3,
+                index: i,
+            }));
+        }
+
+        shared_state.volatile_server_state.last_log_term = 3;
+        shared_state.volatile_server_state.last_log_index = 4;
+
+        let original_len = shared_state.volatile_server_state.replication_log.len();
+
+        // Try to truncate to unknown term 2
+        delegate.truncate_log(&mut shared_state, 2, 1);
+
+        // Should not modify the log since term 2 is unknown
+        assert_eq!(shared_state.volatile_server_state.replication_log.len(), original_len);
+        assert_eq!(shared_state.volatile_server_state.last_log_term, 3);
+        assert_eq!(shared_state.volatile_server_state.last_log_index, 4);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_log_no_truncation_needed() {
+        let delegate = RaftFollowerStateDelegate::new();
+        let mut shared_state = create_shared_state();
+
+        // Set up a log
+        shared_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
+        for i in 0..5 {
+            shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+                requests: vec![],
+                term: 2,
+                index: i,
+            }));
+        }
+
+        shared_state.volatile_server_state.last_log_term = 2;
+        shared_state.volatile_server_state.last_log_index = 4;
+
+        // Try to truncate to an index beyond current log
+        delegate.truncate_log(&mut shared_state, 2, 10);
+
+        // Should not modify the log since truncation point is beyond current log
+        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 5);
+        assert_eq!(shared_state.volatile_server_state.last_log_term, 2);
+        assert_eq!(shared_state.volatile_server_state.last_log_index, 4);
+    }
+
+    #[tokio::test]
+    async fn test_follower_handles_truncate_log_message() {
+        let mut delegate = RaftFollowerStateDelegate::new();
+        let mut shared_state = create_shared_state();
+
+        // Set up a log that will be truncated
+        shared_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
+        shared_state.volatile_server_state.replication_log_term_starts.insert(3, 5);
+
+        for i in 0..10 {
+            shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+                requests: vec![],
+                term: if i < 5 { 2 } else { 3 },
+                index: i,
+            }));
+        }
+
+        shared_state.volatile_server_state.last_log_term = 3;
+        shared_state.volatile_server_state.last_log_index = 9;
+
+        // Simulate receiving a truncate log message from leader
+        shared_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::TruncateLog {
+                quorum_node_id: 0, // Leader ID
+                prev_term: 2,
+                prev_index: 2,
+            }
+        });
+
+        let result = delegate.time_step(&mut shared_state);
+
+        // Should remain follower
+        assert!(matches!(result, RaftMessageStateChange::None));
+
+        // Log should be truncated
+        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 4); // 0,1,2 + 1 for next
+        assert_eq!(shared_state.volatile_server_state.last_log_term, 2);
+        assert_eq!(shared_state.volatile_server_state.last_log_index, 2);
+        assert_eq!(shared_state.volatile_server_state.next_log_index, 3);
+
+        // Term 3 should be removed from term starts
+        assert!(shared_state.volatile_server_state.replication_log_term_starts.contains_key(&2));
+        assert!(!shared_state.volatile_server_state.replication_log_term_starts.contains_key(&3));
     }
 }

@@ -209,6 +209,10 @@ impl Raft for RaftServerImpl {
                                 tracing::warn!("append entries response from channel received wanted previous entry: last term {} last index {}, req term {} req index {}", last_term, last_index, req.prev_log_term, req.prev_log_index);
                                 false
                             }
+                            LocalAppendEntriesCallbackResponse::TruncateLog { prev_term, prev_index } => {
+                                tracing::warn!("append entries response from channel received truncate log: prev term {} prev index {}", prev_term, prev_index);
+                                false
+                            }
                         }
                     }
                     LocalRaftResponsePayload::None => {

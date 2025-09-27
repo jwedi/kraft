@@ -277,7 +277,8 @@ pub enum LocalRaftResponsePayload {
 pub enum LocalAppendEntriesCallbackResponse {
     Ok,
     UnrecognizedLeader,
-    WantedPreviousEntry{ last_term: u64, last_index: u64} // Want the entry that follows the given term and index
+    WantedPreviousEntry{ last_term: u64, last_index: u64}, // Want the entry that follows the given term and index
+    TruncateLog{ prev_term: u64, prev_index: u64} // Leader is telling follower to truncate log to this point
 }
 
 #[derive(Debug)]
@@ -336,7 +337,278 @@ pub struct RaftSM {
     pub current_term: u64,
     pub voted_for: Option<u64>,
     pub log: Vec<RemoteLogEntry>
+}
 
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::raft::leader::RaftLeaderStateDelegate;
+    use crate::raft::follower::RaftFollowerStateDelegate;
+    use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumTaskResponseType, LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
+    use crate::service_utils::storage_utils::SerializationData;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use crossbeam_queue::SegQueue;
+
+    fn create_shared_state() -> SharedState {
+        SharedState {
+            server_state: RaftServerState {
+                current_term: 1,
+                leader_id: 1,
+            },
+            volatile_server_state: RaftVolatileState {
+                next_term: 2,
+                last_log_term: 1,
+                last_log_index: 0,
+                commit_index: 0,
+                replication_log: vec![],
+                replication_log_term_starts: std::collections::HashMap::new(),
+                last_applied: 0,
+                next_log_index: 1,
+            },
+            next_message_id: 1,
+            outstanding_messages: std::collections::HashMap::new(),
+            quorum_size: 3,
+            quorum_worker_tasks: vec![Arc::new(SegQueue::new()); 3],
+            persistence_work: Arc::new(SegQueue::new()),
+            persistence_response: Arc::new(SegQueue::new()),
+            quorum_work: Arc::new(SegQueue::new()),
+            quorum_response: Arc::new(SegQueue::new()),
+            identity: 0,
+            term_votes: HashMap::new(),
+            state_machine_config: StateMachineConfig { max_message_size_bytes: 2048},
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_truncate_flow_leader_missing_entries() {
+        // This test simulates the exact scenario described in the bug:
+        // 1. Follower requests backfill for term 2 and index 5
+        // 2. Leader is leader of term 3 and only has term 2 index 3
+        // 3. Leader finds last entry of term 2, sees it's less than requested index 5
+        // 4. Leader sends a truncate signal with prev term 2 and prev index 3
+        // 5. Follower truncates its local log to term 2 index 3
+        // 6. Follower should then request backfill again
+
+        let mut leader_delegate = RaftLeaderStateDelegate::new();
+        let mut leader_state = create_shared_state();
+
+        // Set up leader state: leader of term 3, only has term 2 up to index 3
+        leader_state.server_state.current_term = 3;
+        leader_state.server_state.leader_id = 0;
+        leader_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
+        leader_state.volatile_server_state.replication_log_term_starts.insert(3, 4);
+
+        // Leader has term 2 entries 0,1,2,3 and term 3 entries 4,5,6
+        for i in 0..7 {
+            leader_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+                requests: vec![],
+                term: if i < 4 { 2 } else { 3 },
+                index: i,
+            }));
+        }
+
+        // Step 1: Follower requests backfill for term 2 index 5 (which leader doesn't have)
+        leader_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::BackfillLog {
+                quorum_node_id: 1,
+                prev_term: 2,
+                prev_index: 5, // Leader only has up to index 3 for term 2
+            }
+        });
+
+        // Step 2 & 3: Leader processes the request and detects it doesn't have the entries
+        let result = leader_delegate.time_step(&mut leader_state);
+        assert!(matches!(result, RaftMessageStateChange::None));
+
+        // Step 4: Verify leader sent truncate signal
+        let queue = &leader_state.quorum_worker_tasks[0]; // quorum_node_id 1 maps to index 0
+        assert_eq!(queue.len(), 1);
+
+        let truncate_task = queue.pop().expect("Should have truncate task");
+        let (truncate_prev_term, truncate_prev_index) = match truncate_task.task_type {
+            LocalQuorumWorkerTaskType::TruncateLog { prev_term, prev_index, .. } => {
+                assert_eq!(prev_term, 2);
+                assert_eq!(prev_index, 3); // Last index leader has for term 2
+                (prev_term, prev_index)
+            }
+            _ => panic!("Expected TruncateLog task"),
+        };
+
+        // Now simulate the follower side
+        let mut follower_delegate = RaftFollowerStateDelegate::new();
+        let mut follower_state = create_shared_state();
+
+        // Set up follower state: has term 2 entries up to index 5 (the problematic entries)
+        follower_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
+        for i in 0..6 {
+            follower_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+                requests: vec![],
+                term: 2,
+                index: i,
+            }));
+        }
+        follower_state.volatile_server_state.last_log_term = 2;
+        follower_state.volatile_server_state.last_log_index = 5;
+        follower_state.volatile_server_state.next_log_index = 6;
+
+        // Step 5: Follower receives truncate signal
+        follower_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::TruncateLog {
+                quorum_node_id: 0, // From leader
+                prev_term: truncate_prev_term,
+                prev_index: truncate_prev_index,
+            }
+        });
+
+        let result = follower_delegate.time_step(&mut follower_state);
+        assert!(matches!(result, RaftMessageStateChange::None));
+
+        // Verify follower truncated correctly to term 2 index 3
+        assert_eq!(follower_state.volatile_server_state.replication_log.len(), 4); // 0,1,2,3
+        assert_eq!(follower_state.volatile_server_state.last_log_term, 2);
+        assert_eq!(follower_state.volatile_server_state.last_log_index, 3);
+        assert_eq!(follower_state.volatile_server_state.next_log_index, 4);
+
+        // Step 6: Now if follower requests backfill again, leader should be able to provide it
+        leader_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::BackfillLog {
+                quorum_node_id: 1,
+                prev_term: 2,
+                prev_index: 3, // Now leader has this
+            }
+        });
+
+        let result = leader_delegate.time_step(&mut leader_state);
+        assert!(matches!(result, RaftMessageStateChange::None));
+
+        // Should have sent backfill data, not another truncate
+        let queue = &leader_state.quorum_worker_tasks[0];
+        assert_eq!(queue.len(), 1);
+
+        let backfill_task = queue.pop().expect("Should have backfill task");
+        match backfill_task.task_type {
+            LocalQuorumWorkerTaskType::BackfillLog { data } => {
+                assert!(data.len() > 0); // Should have data to backfill
+            }
+            _ => panic!("Expected BackfillLog task, got {:?}", backfill_task.task_type),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_truncate_flow_with_new_leader_entries() {
+        // Test scenario where new leader has written additional entries in a higher term
+        let mut leader_delegate = RaftLeaderStateDelegate::new();
+        let mut leader_state = create_shared_state();
+
+        // Leader is in term 4, has entries for terms 2, 3, and 4
+        leader_state.server_state.current_term = 4;
+        leader_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
+        leader_state.volatile_server_state.replication_log_term_starts.insert(3, 3);
+        leader_state.volatile_server_state.replication_log_term_starts.insert(4, 7);
+
+        // Leader has: term 2 (0,1,2), term 3 (3,4,5,6), term 4 (7,8,9)
+        for i in 0..10 {
+            leader_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+                requests: vec![],
+                term: if i < 3 { 2 } else if i < 7 { 3 } else { 4 },
+                index: i,
+            }));
+        }
+
+        // Follower requests backfill for term 3 index 5 (leader has term 3 up to index 6)
+        leader_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::BackfillLog {
+                quorum_node_id: 1,
+                prev_term: 3,
+                prev_index: 5,
+            }
+        });
+
+        let result = leader_delegate.time_step(&mut leader_state);
+        assert!(matches!(result, RaftMessageStateChange::None));
+
+        // Should send backfill, not truncate, since leader has the requested entries
+        let queue = &leader_state.quorum_worker_tasks[0];
+        assert_eq!(queue.len(), 1);
+
+        let task = queue.pop().expect("Should have task");
+        match task.task_type {
+            LocalQuorumWorkerTaskType::BackfillLog { data } => {
+                assert!(data.len() > 0);
+            }
+            _ => panic!("Expected BackfillLog task"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_truncate_flow_boundary_conditions() {
+        // Test edge cases like requesting the last entry of a term
+        let mut leader_delegate = RaftLeaderStateDelegate::new();
+        let mut leader_state = create_shared_state();
+
+        leader_state.server_state.current_term = 3;
+        leader_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
+        leader_state.volatile_server_state.replication_log_term_starts.insert(3, 5);
+
+        // Leader has term 2 entries 0,1,2,3,4 and term 3 entries 5,6
+        for i in 0..7 {
+            leader_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+                requests: vec![],
+                term: if i < 5 { 2 } else { 3 },
+                index: i,
+            }));
+        }
+
+        // Request exactly the last entry of term 2 (index 4)
+        leader_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::BackfillLog {
+                quorum_node_id: 1,
+                prev_term: 2,
+                prev_index: 4, // Last entry of term 2
+            }
+        });
+
+        let result = leader_delegate.time_step(&mut leader_state);
+        assert!(matches!(result, RaftMessageStateChange::None));
+
+        // Should send backfill since leader has this entry
+        let queue = &leader_state.quorum_worker_tasks[0];
+        assert_eq!(queue.len(), 1);
+
+        let task = queue.pop().expect("Should have task");
+        match task.task_type {
+            LocalQuorumWorkerTaskType::BackfillLog { .. } => {
+                // Success - leader has the entry
+            }
+            _ => panic!("Expected BackfillLog task"),
+        }
+
+        // Now request beyond the last entry of term 2 (index 5, but term 2 only goes to 4)
+        leader_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::BackfillLog {
+                quorum_node_id: 1,
+                prev_term: 2,
+                prev_index: 5, // Beyond last entry of term 2
+            }
+        });
+
+        let result = leader_delegate.time_step(&mut leader_state);
+        assert!(matches!(result, RaftMessageStateChange::None));
+
+        // Should send truncate since leader doesn't have term 2 index 5
+        let queue = &leader_state.quorum_worker_tasks[0];
+        assert_eq!(queue.len(), 1);
+
+        let task = queue.pop().expect("Should have task");
+        match task.task_type {
+            LocalQuorumWorkerTaskType::TruncateLog { prev_term, prev_index, .. } => {
+                assert_eq!(prev_term, 2);
+                assert_eq!(prev_index, 4); // Last entry leader has for term 2
+            }
+            _ => panic!("Expected TruncateLog task"),
+        }
+    }
 }
 
 

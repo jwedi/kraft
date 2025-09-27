@@ -29,7 +29,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::client::cluster_node_client::SharedGrpcChannel;
 use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftMessage, LocalRaftMessagePayload, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalRaftWriteBatchRequest, LocalRequestVoteRequest};
 use crate::server::raftproto::raft_client::RaftClient;
-use crate::server::raftproto::{RemoteAppendEntriesAcknowledge, RemoteAppendEntriesRequest, RemoteAppendEntriesResponse, RemoteLogEntry, RemotePutBatchRequest, RemotePutBatchResponse, RemoteQuorumMessage, RemoteVoteRequest, RemoteVoteResponse};
+use crate::server::raftproto::{RemoteAppendEntriesAcknowledge, RemoteAppendEntriesRequest, RemoteAppendEntriesResponse, RemoteLogEntry, RemotePutBatchRequest, RemotePutBatchResponse, RemoteQuorumMessage, RemoteTruncateLogRequest, RemoteTruncateLogResponse, RemoteVoteRequest, RemoteVoteResponse};
 use crate::server::raftproto::remote_quorum_message::MessagePayload;
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
 use crate::service_utils::storage_utils::{SerializationData, serialize_data, SerializedData};
@@ -52,13 +52,16 @@ pub enum LocalQuorumWorkerTaskType {
     RequestVote{ id: u64, term: u64, last_term: u64, last_index: u64, parent_span: Span}, // Term, last term, last index,
     AppendEntries{ id: u64, req: RemoteAppendEntriesRequest, parent_span: Span},
     BackfillLog {data: Vec<Arc<SerializationData>>},
-    WriteBatch{ write_batch: WriteBatch }
+    WriteBatch{ write_batch: WriteBatch },
+    TruncateLog{ id: u64, prev_term: u64, prev_index: u64, parent_span: Span }
 }
 
 pub enum LocalQuorumTaskResponseType {
     RequestVoteResponse{ id: u64, term: u64, received_vote: bool},
     AppendEntries{ id: u64, ok: bool}, // TODO get next index
-    BackfillLog{ quorum_node_id: u64, prev_term: u64, prev_index: u64}
+    BackfillLog{ quorum_node_id: u64, prev_term: u64, prev_index: u64},
+    TruncateLog{ quorum_node_id: u64, prev_term: u64, prev_index: u64},
+    TruncateLogResponse{ id: u64, ok: bool}
 }
 
 pub struct LocalQuorumResponse {
@@ -87,7 +90,8 @@ pub struct QuorumWorker {
     task_queue: Arc<SegQueue<LocalRaftMessage>>,
     ongoing_backfill: Option<OngoingBackfill>,
     commit_index: u64,
-    pending_write_batches: HashMap<String, Sender<WriteResponse>>
+    pending_write_batches: HashMap<String, Sender<WriteResponse>>,
+    max_message_size_bytes: usize
 
     // TODO needs work task queue since all requests will now come through the quorum worker instead of the gRPC server
     // VoteRequest comes in, is sent to task worker queue
@@ -124,6 +128,7 @@ impl QuorumWorker {
         member_endpoint: String,
         stream_manager: Arc<StreamManagerImpl>,
         task_queue: Arc<SegQueue<LocalRaftMessage>>,
+        max_message_size_bytes: usize
     ) -> Self {
         Self {
             work_queue,
@@ -143,7 +148,8 @@ impl QuorumWorker {
             task_queue,
             ongoing_backfill: None,
             commit_index: 0,
-            pending_write_batches: HashMap::new()
+            pending_write_batches: HashMap::new(),
+            max_message_size_bytes
         }
     }
 
@@ -241,6 +247,17 @@ impl QuorumWorker {
                                                         send_stream.send(
                                                             RemoteQuorumMessage{
                                                                 message_payload: Some(MessagePayload::AppendEntriesAcknowledgeOption(RemoteAppendEntriesAcknowledge{last_log_index: last_index, last_log_term: last_term, request_id: *request_id, ok: false})),
+                                                                tracing_context: None
+                                                            }
+                                                        ).expect("sending on stream shouldn't fail");
+                                                    }
+                                                    LocalAppendEntriesCallbackResponse::TruncateLog { prev_term, prev_index } => {
+                                                        log::info!("Received truncate log response from leader, truncating to term {} index {}", prev_term, prev_index);
+                                                        let resp = LocalQuorumTaskResponseType::TruncateLog{quorum_node_id: self.member_id, prev_term, prev_index};
+                                                        self.response_queue.push(LocalQuorumResponse {response_type: resp});
+                                                        send_stream.send(
+                                                            RemoteQuorumMessage{
+                                                                message_payload: Some(MessagePayload::AppendEntriesAcknowledgeOption(RemoteAppendEntriesAcknowledge{last_log_index: prev_index, last_log_term: prev_term, request_id: *request_id, ok: false})),
                                                                 tracing_context: None
                                                             }
                                                         ).expect("sending on stream shouldn't fail");
@@ -421,6 +438,36 @@ impl QuorumWorker {
                                     }
                                 }
                             }
+                            Some(MessagePayload::TruncateLogRequestOption(truncate_request)) => {
+                                log::info!("Received truncate log request from leader {} for term {} index {}", truncate_request.leader_id, truncate_request.prev_term, truncate_request.prev_index);
+
+                                // Send to local task queue for processing
+                                let resp = LocalQuorumTaskResponseType::TruncateLog{
+                                    quorum_node_id: self.member_id,
+                                    prev_term: truncate_request.prev_term,
+                                    prev_index: truncate_request.prev_index
+                                };
+                                self.response_queue.push(LocalQuorumResponse {response_type: resp});
+
+                                // Send acknowledgment back to leader
+                                send_stream.send(
+                                    RemoteQuorumMessage{
+                                        message_payload: Some(MessagePayload::TruncateLogResponseOption(RemoteTruncateLogResponse{
+                                            request_id: truncate_request.request_id,
+                                            ok: true
+                                        })),
+                                        tracing_context: None
+                                    }
+                                ).expect("sending truncate response on stream shouldn't fail");
+                            }
+                            Some(MessagePayload::TruncateLogResponseOption(truncate_response)) => {
+                                log::info!("Received truncate log response for request {}, ok: {}", truncate_response.request_id, truncate_response.ok);
+                                let resp = LocalQuorumTaskResponseType::TruncateLogResponse{
+                                    id: truncate_response.request_id,
+                                    ok: truncate_response.ok
+                                };
+                                self.response_queue.push(LocalQuorumResponse {response_type: resp});
+                            }
                             Some(payload) => {
                                 log::error!("Encountered unexpected receive stream message payload: {:?}", payload);
                             }
@@ -542,7 +589,7 @@ impl QuorumWorker {
                             LocalQuorumWorkerTaskType::BackfillLog { data} => {
                                 log::info!("received backfill log request with {} entries. First entry: {}", data.len(), data.first().map_or("None".to_string(), |e| format!("prev_term: {}, prev_index: {}", e.prev_term, e.prev_index)));
                                 for entry in data {
-                                    let buffer = vec![0u8; 2048];
+                                    let buffer = vec![0u8; self.max_message_size_bytes];
                                     let (limit, mut serialized) = serialize_data(&entry, buffer, 0);
                                     serialized.truncate(limit);
                                     let entry = entry.deref();
@@ -598,6 +645,28 @@ impl QuorumWorker {
                                     }
                                 ).unwrap();
 
+                            }
+                            LocalQuorumWorkerTaskType::TruncateLog { id, prev_term, prev_index, parent_span } => {
+                                let s = tracing::span!(Level::INFO, "sending_truncate_log");
+                                s.set_parent(parent_span.context());
+                                let _guard = s.enter();
+                                tracing::info!("sending truncate log with id {} to member {}, self id {}, prev_term: {}, prev_index: {}", id, self.member_id, self.self_id, prev_term, prev_index);
+
+                                let truncate_request = RemoteTruncateLogRequest{
+                                    prev_term,
+                                    prev_index,
+                                    term: self.term,
+                                    leader_id: self.self_id,
+                                    request_id: id,
+                                };
+
+                                let tracing_context = span_to_tracing_context(&s.context(), &self.propagator);
+                                send_stream.send(
+                                    RemoteQuorumMessage{
+                                        message_payload: Some(MessagePayload::TruncateLogRequestOption(truncate_request)),
+                                        tracing_context: Some(tracing_context)
+                                    }
+                                ).unwrap();
                             }
 
                         }

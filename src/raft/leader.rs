@@ -43,6 +43,31 @@ impl RaftLeaderStateDelegate {
             initialized: false,
         }
     }
+
+    fn send_truncate_signal(&self, shared_state: &mut SharedState, quorum_node_id: u64, prev_term: u64, last_index_for_term: u64) {
+        log::info!("Sending truncate signal to member {} for term {} index {}", quorum_node_id, prev_term, last_index_for_term);
+
+        let quorum_node_index = if quorum_node_id == 0 {
+            0
+        } else if quorum_node_id > shared_state.identity as u64 {
+            quorum_node_id.saturating_sub(2)
+        } else {
+            quorum_node_id.saturating_sub(1)
+        };
+
+        if let Some(queue) = shared_state.quorum_worker_tasks.get(quorum_node_index as usize) {
+            let message_id = shared_state.next_message_id;
+            shared_state.next_message_id += 1;
+
+            let task = LocalQuorumWorkerTaskType::TruncateLog{
+                id: message_id,
+                prev_term,
+                prev_index: last_index_for_term,
+                parent_span: tracing::Span::current(),
+            };
+            queue.push(LocalQuorumWorkerTask {task_type: task});
+        }
+    }
 }
 
 impl RaftProtocol for RaftLeaderStateDelegate {
@@ -333,23 +358,57 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                 }
                 LocalQuorumTaskResponseType::BackfillLog { quorum_node_id, prev_term, prev_index} => {
                     log::info!("Received backfill log request for member {}, prev_term: {}, prev_index: {}", quorum_node_id, prev_term, prev_index);
+
                     let start_index = if prev_term == 0 && prev_index == 0 {
                         0
                     } else {
-                        // TODO slice index starts at 118923 but ends at 118921. Happens if a previous leader which is ahead asks for backfill.
-                        // https://trello.com/c/2AEY4e8E/2-bug-fix-issue-when-a-member-who-doesnt-have-the-highest-log-index-is-elected-leader
-                        shared_state.volatile_server_state.replication_log_term_starts.get(&prev_term).unwrap().clone() + prev_index + 1
+                        // Check if we have entries for the requested term
+                        match shared_state.volatile_server_state.replication_log_term_starts.get(&prev_term) {
+                            Some(term_start) => {
+                                // Calculate the end index for this term by looking at the next term's start
+                                let term_end = {
+                                    let mut next_term_start = shared_state.volatile_server_state.replication_log.len() as u64;
+                                    for (&term, &start) in &shared_state.volatile_server_state.replication_log_term_starts {
+                                        if term > prev_term && start < next_term_start {
+                                            next_term_start = start;
+                                        }
+                                    }
+                                    next_term_start
+                                };
+
+                                let requested_absolute_index = term_start + prev_index;
+
+                                // Check if we have the requested entry for this term
+                                if requested_absolute_index < term_end {
+                                    term_start + prev_index + 1
+                                } else {
+                                    // We don't have entries up to the requested index for this term
+                                    // Find the last entry we have for this term and send truncate signal
+                                    let last_index_for_term = if term_end > *term_start { term_end - term_start - 1 } else { 0 };
+                                    log::info!("Leader doesn't have entries up to index {} for term {}, last available index for term: {}", prev_index, prev_term, last_index_for_term);
+                                    self.send_truncate_signal(shared_state, quorum_node_id, prev_term, last_index_for_term);
+                                    continue;
+                                }
+                            }
+                            None => {
+                                // We don't have any entries for the requested term
+                                log::info!("Leader doesn't have any entries for term {}, sending truncate signal", prev_term);
+                                self.send_truncate_signal(shared_state, quorum_node_id, prev_term, 0);
+                                continue;
+                            }
+                        }
                     };
+
                     let slice = shared_state.volatile_server_state.replication_log.as_slice();
                     log::info!("Backfilling from index: {} to {}", start_index, slice.len());
-                    let data_slice = clone_subset(&slice, start_index as usize, slice.len()); // TODO maybe something with prev index
+                    let data_slice = clone_subset(&slice, start_index as usize, slice.len());
 
                     let quorum_node_index = if quorum_node_id == 0 {
                         0
                     } else if quorum_node_id > shared_state.identity as u64 {
-                        quorum_node_id - 2
+                        quorum_node_id.saturating_sub(2)
                     } else {
-                        quorum_node_id - 1
+                        quorum_node_id.saturating_sub(1)
                     };
                     let queue = shared_state.quorum_worker_tasks.get(quorum_node_index as usize).unwrap();
                     queue.push(LocalQuorumWorkerTask{task_type: LocalQuorumWorkerTaskType::BackfillLog{
@@ -359,9 +418,13 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                 LocalQuorumTaskResponseType::RequestVoteResponse { id, term, received_vote} => {
                     log::info!("Received vote response for term: {} while already leader for term: {} received_vote: {}", term, shared_state.server_state.current_term, received_vote);
                 }
+                LocalQuorumTaskResponseType::TruncateLogResponse { id, ok } => {
+                    log::info!("Received truncate log response for message id: {}, ok: {}", id, ok);
+                    // The follower has truncated its log and should now request backfill again
+                    // No additional action needed from leader side
+                }
 
                 _ => {
-
                     log::error!("Received invalid quorum response message in current state");
                 }
             }
@@ -496,6 +559,180 @@ mod tests {
             LocalRaftResponsePayload::RequestVote(false) => {},
             _ => panic!("Unexpected response"),
         }
+        assert!(matches!(result, RaftMessageStateChange::None));
+    }
+
+    #[tokio::test]
+    async fn test_backfill_request_sends_truncate_signal_when_leader_missing_entries() {
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state();
+
+        // Initialize as leader for term 3
+        shared_state.server_state.current_term = 3;
+        shared_state.server_state.leader_id = 0;
+        shared_state.volatile_server_state.next_term = 4;
+
+        // Leader only has entries for term 2 up to index 2 (term_start=10, so absolute indices 10,11,12)
+        shared_state.volatile_server_state.replication_log_term_starts.insert(2, 10);
+        shared_state.volatile_server_state.replication_log_term_starts.insert(3, 13);
+
+        // Add some dummy log entries
+        for _ in 0..15 {
+            shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+                requests: vec![],
+                term: 2,
+                index: 0,
+            }));
+        }
+
+        // Set up quorum worker task queues
+        shared_state.quorum_worker_tasks = vec![Arc::new(SegQueue::new()); 3];
+
+        // Follower requests backfill for term 2 index 5 (but leader only has up to index 2)
+        shared_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::BackfillLog {
+                quorum_node_id: 1,
+                prev_term: 2,
+                prev_index: 5, // Leader doesn't have this index for term 2
+            }
+        });
+
+        let result = delegate.time_step(&mut shared_state);
+
+        // Should remain leader
+        assert!(matches!(result, RaftMessageStateChange::None));
+
+        // Should have sent a truncate signal
+        let queue = &shared_state.quorum_worker_tasks[0]; // quorum_node_id 1 maps to index 0
+        assert_eq!(queue.len(), 1);
+
+        if let Some(task) = queue.pop() {
+            match task.task_type {
+                LocalQuorumWorkerTaskType::TruncateLog { id, prev_term, prev_index, .. } => {
+                    assert_eq!(prev_term, 2);
+                    assert_eq!(prev_index, 2); // Last index leader has for term 2
+                    assert!(id > 0); // Should have a valid message ID
+                }
+                _ => panic!("Expected TruncateLog task, got {:?}", task.task_type),
+            }
+        } else {
+            panic!("Expected task in queue");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backfill_request_sends_truncate_for_unknown_term() {
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state();
+
+        // Initialize as leader for term 3
+        shared_state.server_state.current_term = 3;
+        shared_state.server_state.leader_id = 0;
+
+        // Leader only has entries for term 3, no entries for term 2
+        shared_state.volatile_server_state.replication_log_term_starts.insert(3, 0);
+
+        // Set up quorum worker task queues
+        shared_state.quorum_worker_tasks = vec![Arc::new(SegQueue::new()); 3];
+
+        // Follower requests backfill for unknown term 2
+        shared_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::BackfillLog {
+                quorum_node_id: 1,
+                prev_term: 2,
+                prev_index: 3,
+            }
+        });
+
+        let result = delegate.time_step(&mut shared_state);
+
+        // Should remain leader
+        assert!(matches!(result, RaftMessageStateChange::None));
+
+        // Should have sent a truncate signal with index 0 for unknown term
+        let queue = &shared_state.quorum_worker_tasks[0];
+        assert_eq!(queue.len(), 1);
+
+        if let Some(task) = queue.pop() {
+            match task.task_type {
+                LocalQuorumWorkerTaskType::TruncateLog { prev_term, prev_index, .. } => {
+                    assert_eq!(prev_term, 2);
+                    assert_eq!(prev_index, 0); // Should send 0 for unknown term
+                }
+                _ => panic!("Expected TruncateLog task"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backfill_request_succeeds_when_leader_has_entries() {
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state();
+
+        // Initialize as leader
+        shared_state.server_state.current_term = 3;
+        shared_state.server_state.leader_id = 0;
+
+        // Leader has entries for term 2 up to index 5
+        shared_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
+        shared_state.volatile_server_state.replication_log_term_starts.insert(3, 6);
+
+        // Add log entries
+        for i in 0..10 {
+            shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+                requests: vec![],
+                term: if i < 6 { 2 } else { 3 },
+                index: i,
+            }));
+        }
+
+        // Set up quorum worker task queues
+        shared_state.quorum_worker_tasks = vec![Arc::new(SegQueue::new()); 3];
+
+        // Follower requests backfill for term 2 index 3 (leader has this)
+        shared_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::BackfillLog {
+                quorum_node_id: 1,
+                prev_term: 2,
+                prev_index: 3,
+            }
+        });
+
+        let result = delegate.time_step(&mut shared_state);
+
+        // Should remain leader
+        assert!(matches!(result, RaftMessageStateChange::None));
+
+        // Should have sent backfill data, not truncate
+        let queue = &shared_state.quorum_worker_tasks[0];
+        assert_eq!(queue.len(), 1);
+
+        if let Some(task) = queue.pop() {
+            match task.task_type {
+                LocalQuorumWorkerTaskType::BackfillLog { data } => {
+                    assert!(data.len() > 0); // Should have some data to backfill
+                }
+                _ => panic!("Expected BackfillLog task, got {:?}", task.task_type),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_truncate_log_response_handling() {
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state();
+
+        // Leader receives truncate log response
+        shared_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::TruncateLogResponse {
+                id: 123,
+                ok: true,
+            }
+        });
+
+        let result = delegate.time_step(&mut shared_state);
+
+        // Should remain leader and handle response gracefully
         assert!(matches!(result, RaftMessageStateChange::None));
     }
 

@@ -228,7 +228,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             node.node_id.into(),
             node.endpoint.clone(),
             Arc::clone(&sm_arc),
-            Arc::clone(&task_queue)
+            Arc::clone(&task_queue),
+            cfg.max_message_size_bytes
         )
     }).collect();
 
