@@ -144,6 +144,9 @@ impl RaftProtocol for RaftCandidateStateDelegate {
 
         while let Some(task) = shared_state.quorum_response.pop() {
             match task.response_type {
+                LocalQuorumTaskResponseType::TruncateLog { quorum_node_id, prev_term, prev_index } => {
+                    log::info!("Received truncate log request while candidate, ignoring");
+                }
                 LocalQuorumTaskResponseType::RequestVoteResponse { id, term, received_vote } => {
                     if let Some(mut msg) = shared_state.outstanding_messages.remove(&id) {
                         let span_clone = msg.span.clone();
