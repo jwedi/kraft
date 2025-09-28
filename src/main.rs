@@ -1,4 +1,6 @@
 pub mod server;
+pub mod metrics;
+pub mod metrics_server;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar};
@@ -114,6 +116,10 @@ fn init_tracing(node_id: u32) -> SDKTracer {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::builder().filter_level(log::LevelFilter::Info).init();
     opentelemetry::global::set_text_map_propagator(opentelemetry_zipkin::Propagator::new());
+
+    // Initialize metrics
+    crate::metrics::register_metrics();
+    crate::metrics::initialize_metrics();
 
     let cfg = read_config()?;
     let node_id = cfg.node_id;
@@ -293,6 +299,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(message = "Starting server.", %addr);
 
+    // Start metrics server
+    let metrics_port = cfg.port + 1000; // Use port + 1000 for metrics
+    let metrics_handle = tokio::spawn(async move {
+        if let Err(e) = crate::metrics_server::start_metrics_server(metrics_port as u16).await {
+            log::error!("Failed to start metrics server: {}", e);
+        }
+    });
+
     let propagator = opentelemetry_zipkin::Propagator::new();
 
     Server::builder()
@@ -323,7 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
 
-    let _ = join!(worker_handle, persistence_handle, write_proxy_handle);
+    let _ = join!(worker_handle, persistence_handle, write_proxy_handle, metrics_handle);
     join_all(cw_join_handles);
     opentelemetry::global::shutdown_tracer_provider();
     Ok(())

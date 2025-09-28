@@ -87,6 +87,14 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             // TODO check if prev term or prev index is same as our own, else inform new leader that we need backfill.
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
+
+            // Update Raft state metrics for new leader
+            crate::metrics::update_raft_state_metrics(
+                shared_state.volatile_server_state.commit_index,
+                shared_state.server_state.leader_id,
+                shared_state.server_state.current_term,
+                shared_state.volatile_server_state.replication_log.len()
+            );
             shared_state.volatile_server_state.next_term = append_entries_request.term + 1;
             shared_state.volatile_server_state.replication_log_term_starts.insert(shared_state.server_state.current_term, shared_state.volatile_server_state.replication_log.len() as u64);
 
@@ -122,6 +130,14 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                     if append_entries_request.commit_index > shared_state.volatile_server_state.commit_index {
                         shared_state.volatile_server_state.commit_index = append_entries_request.commit_index;
                         log::info!("Updated commit index to {}", append_entries_request.commit_index);
+
+                        // Update metrics for commit index change
+                        crate::metrics::update_raft_state_metrics(
+                            shared_state.volatile_server_state.commit_index,
+                            shared_state.server_state.leader_id,
+                            shared_state.server_state.current_term,
+                            shared_state.volatile_server_state.replication_log.len()
+                        );
                     }
                     log::debug!("consecutive heartbeat req: term {}, index: {}, state: term {}, index {}", append_entries_request.prev_term, append_entries_request.prev_index, shared_state.volatile_server_state.last_log_term, shared_state.volatile_server_state.last_log_index);
                     callback.send(
@@ -182,6 +198,14 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             if append_entries_request.commit_index > shared_state.volatile_server_state.commit_index {
                 shared_state.volatile_server_state.commit_index = append_entries_request.commit_index;
             }
+
+            // Update metrics after processing new entry and commit index
+            crate::metrics::update_raft_state_metrics(
+                shared_state.volatile_server_state.commit_index,
+                shared_state.server_state.leader_id,
+                shared_state.server_state.current_term,
+                shared_state.volatile_server_state.replication_log.len()
+            );
 
             let message_type = OutstandingMessageType::AppendLog{ callback };
             let outstanding_message = OutstandingMessage{

@@ -15,6 +15,7 @@ use crate::server::raftproto::raft_server::Raft;
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils::SerializationData;
 use crate::transport::write_proxy::{WriteBatch, WriteResponse};
+use std::time::Instant;
 
 #[derive(Copy, Clone)]
 
@@ -46,7 +47,7 @@ pub enum OutstandingMessageType {
     RequestVote{callback: oneshot::Sender<LocalRaftResponseMessage>}, // Request vote from someone else
     CandidateElection{persistence_done: bool, quorum_votes: u32}, // Candidate election by this node.
     AppendLog{callback: oneshot::Sender<LocalRaftResponseMessage>},
-    WriteBatch{persistence_done: bool, quorum_acks: u32, callback: oneshot::Sender<LocalRaftResponseMessage>, index: u64}
+    WriteBatch{persistence_done: bool, quorum_acks: u32, callback: oneshot::Sender<LocalRaftResponseMessage>, index: u64, start_time: Instant, batch_size: usize}
 }
 
 pub struct OutstandingMessage {
@@ -83,6 +84,14 @@ pub struct StateMachineExecutorImpl {
 
 impl StateMachineExecutorImpl {
     pub fn new(shared_state: SharedState) -> Self {
+        // Initialize metrics with current state
+        crate::metrics::update_raft_state_metrics(
+            shared_state.volatile_server_state.commit_index,
+            shared_state.server_state.leader_id,
+            shared_state.server_state.current_term,
+            shared_state.volatile_server_state.replication_log.len()
+        );
+
         Self {
             state_delegate: Box::new(RaftFollowerStateDelegate::new()),
             shared_state

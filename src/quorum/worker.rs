@@ -90,14 +90,9 @@ pub struct QuorumWorker {
     task_queue: Arc<SegQueue<LocalRaftMessage>>,
     ongoing_backfill: Option<OngoingBackfill>,
     commit_index: u64,
-    pending_write_batches: HashMap<String, Sender<WriteResponse>>,
-    max_message_size_bytes: usize
-
-    // TODO needs work task queue since all requests will now come through the quorum worker instead of the gRPC server
-    // VoteRequest comes in, is sent to task worker queue
-    // Task worker does the job and then sends the response to the quorum member queue and the quorum worker responds over the stream.
-    // Append entries comes in, is sent to task worker queue
-    // Task worker does the job and then sends the response to the quorum member quorum queue
+    pending_write_batches: HashMap<String, PendingWriteBatch>,
+    max_message_size_bytes: usize,
+    pending_append_entries: HashMap<u64, std::time::Instant>,
 }
 
 
@@ -110,12 +105,18 @@ pub enum PendingQuorumTaskEnum {
 #[derive(Debug)]
 struct PendingQuorumTask {
     callback: Receiver<LocalRaftResponseMessage>,
-    task: PendingQuorumTaskEnum
+    task: PendingQuorumTaskEnum,
+    start_time: std::time::Instant,
 }
 
 struct OngoingBackfill {
     from_term: u64,
     from_index: u64,
+}
+
+struct PendingWriteBatch {
+    callback: Sender<WriteResponse>,
+    start_time: std::time::Instant,
 }
 
 impl QuorumWorker {
@@ -149,7 +150,8 @@ impl QuorumWorker {
             ongoing_backfill: None,
             commit_index: 0,
             pending_write_batches: HashMap::new(),
-            max_message_size_bytes
+            max_message_size_bytes,
+            pending_append_entries: HashMap::new(),
         }
     }
 
@@ -275,6 +277,7 @@ impl QuorumWorker {
                                                 span.set_parent(parent_span.context());
                                                 let _enter = span.enter();
                                                 tracing::info!("processing write batch response from member {} as self id {}", self.member_id, self.self_id);
+
                                                 let tracing_context = span_to_tracing_context(&span.context(), &self.propagator);
                                                 send_stream.send(
                                                     RemoteQuorumMessage{
@@ -355,11 +358,14 @@ impl QuorumWorker {
                                 }
 
                                 if append_entries.request_id != 0 {
-                                    // TODO if not ok
-                                    // set prev_log_term and prev_log_index based on response.
-                                    // Send backfill log request to leader.
-                                    //log::debug!("received append entries acknowledge from: {}", self.member_id);
                                     tracing::info!("received append entries acknowledge from: {}, ok: {}, request id: {}, member: {}", self.member_id, append_entries.ok, append_entries.request_id, self.member_id);
+
+                                    if let Some(start_time) = self.pending_append_entries.remove(&append_entries.request_id) {
+                                        let latency_micros = start_time.elapsed().as_micros() as f64;
+                                        crate::metrics::QUORUM_APPEND_ENTRIES_LATENCY
+                                            .with_label_values(&[&self.member_id.to_string()])
+                                            .observe(latency_micros);
+                                    }
 
                                     let resp = LocalQuorumTaskResponseType::AppendEntries{id: append_entries.request_id, ok: append_entries.ok};
                                     self.response_queue.push(LocalQuorumResponse {response_type: resp})
@@ -367,7 +373,6 @@ impl QuorumWorker {
                                 }
                             }
                             Some(MessagePayload::AppendEntriesRequestOption(mut append_entries)) => {
-                                //log::info!("received append entries request from: {}", self.member_id);
                                 let callback: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
                                 // TODO get all of the data from the log entry.
 
@@ -385,7 +390,8 @@ impl QuorumWorker {
 
                                 let pending_task = PendingQuorumTask {
                                     task: PendingQuorumTaskEnum::AppendEntries{request_id: append_entries.request_id, log_index: term, term: index, parent_span: span.clone()},
-                                    callback: callback.1
+                                    callback: callback.1,
+                                    start_time: std::time::Instant::now(),
                                 };
                                 pending_tasks.push(pending_task);
                             }
@@ -404,7 +410,8 @@ impl QuorumWorker {
                                 }, );
                                 let pending_task = PendingQuorumTask {
                                     task: PendingQuorumTaskEnum::Vote(vote_request),
-                                    callback: callback.1
+                                    callback: callback.1,
+                                    start_time: std::time::Instant::now(),
                                 };
                                 pending_tasks.push(pending_task);
                             }
@@ -414,7 +421,8 @@ impl QuorumWorker {
                                 tracing::info!("received put batch request from {} as self {}, sending task to local state machine", self.member_id, self.self_id);
                                 let pending_task = PendingQuorumTask {
                                     task: PendingQuorumTaskEnum::WriteBatch{ batch_id: put_batch.batch_id.clone(), parent_span: span.clone()},
-                                    callback: callback.1
+                                    callback: callback.1,
+                                    start_time: std::time::Instant::now(),
                                 };
                                 pending_tasks.push(pending_task);
 
@@ -427,11 +435,15 @@ impl QuorumWorker {
                                 });
                             }
                             Some(MessagePayload::PutBatchResponseOption(put_batch_response)) => {
-                                // Response from remote state machine, should trigger callbacks.
-                                let callback = self.pending_write_batches.remove(&put_batch_response.batch_id);
-                                match callback {
-                                    Some(cb) => {
-                                        let _ = cb.send(WriteResponse{ responses: put_batch_response.responses, status_code: StatusCode::OK});
+                                let pending_batch = self.pending_write_batches.remove(&put_batch_response.batch_id);
+                                match pending_batch {
+                                    Some(batch) => {
+                                        let latency_micros = batch.start_time.elapsed().as_micros() as f64;
+                                        crate::metrics::QUORUM_PUT_BATCH_LATENCY
+                                            .with_label_values(&[&self.member_id.to_string()])
+                                            .observe(latency_micros);
+
+                                        let _ = batch.callback.send(WriteResponse{ responses: put_batch_response.responses, status_code: StatusCode::OK});
                                     }
                                     None => {
                                         log::error!("No pending write batch found for batch id: {}", put_batch_response.batch_id);
@@ -569,11 +581,13 @@ impl QuorumWorker {
                                 }
                             }
                             LocalQuorumWorkerTaskType::AppendEntries {id, req, parent_span} => {
-                                // TODO benchmark copying log entries 3 times and writing to segqueues vs cloning Vectors.
                                 let s = tracing::span!(Level::INFO, "sending_append_entries");
                                 s.set_parent(parent_span.context());
                                 let _guard = s.enter();
                                 tracing::info!("sending append entries with request id {} to member {}, self id {}", id, self.member_id, self.self_id);
+
+                                self.pending_append_entries.insert(id, std::time::Instant::now());
+
                                 self.prev_log_term = req.entry.as_ref().unwrap().term;
                                 self.prev_log_index = req.entry.as_ref().unwrap().index;
                                 self.commit_index = req.commit_index;
@@ -635,7 +649,13 @@ impl QuorumWorker {
                                     put_request: write_batch.requests
                                 };
 
-                                self.pending_write_batches.insert(put_batch_request.batch_id.clone(), write_batch.callback);
+                                self.pending_write_batches.insert(
+                                    put_batch_request.batch_id.clone(),
+                                    PendingWriteBatch {
+                                        callback: write_batch.callback,
+                                        start_time: std::time::Instant::now(),
+                                    }
+                                );
 
                                 let tracing_context = span_to_tracing_context(&s.context(), &self.propagator);
                                 send_stream.send(

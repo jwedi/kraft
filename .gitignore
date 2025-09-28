@@ -1,4 +1,6 @@
 /target
 /out
+/data
 out*
 .idea
+prometheus.yaml

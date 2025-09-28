@@ -81,8 +81,11 @@ impl RaftProtocol for RaftLeaderStateDelegate {
     fn write_batch(&mut self, write_batch_request: LocalRaftWriteBatchRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) {
         let message_id = shared_state.next_message_id;
         let mut idx = shared_state.volatile_server_state.next_log_index;
-        log::info!("leader handling writing batches {} as message id: {} with index: {}", write_batch_request.requests.len(), message_id, idx);
-        tracing::info!("writing batches {} as message id: {} with index: {}", write_batch_request.requests.len(), message_id, idx);
+        let batch_size = write_batch_request.requests.len();
+        let start_time = std::time::Instant::now();
+
+        log::info!("leader handling writing batches {} as message id: {} with index: {}", batch_size, message_id, idx);
+        tracing::info!("writing batches {} as message id: {} with index: {}", batch_size, message_id, idx);
         shared_state.next_message_id += 1;
 
         let span = tracing::span!(Level::INFO, "delegate_write_batch");
@@ -157,7 +160,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         });
         tracing::info!("tasks dispatched");
 
-        let message_type = OutstandingMessageType::WriteBatch{persistence_done: false, quorum_acks: 0, callback, index: idx};
+        let message_type = OutstandingMessageType::WriteBatch{persistence_done: false, quorum_acks: 0, callback, index: idx, start_time, batch_size};
         //let response_span = tracing::span!(Level::INFO, "write_batch_outstanding_message_processing");
         //response_span.set_parent(span.context());
         let outstanding_message = OutstandingMessage{
@@ -229,6 +232,14 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             shared_state.volatile_server_state.next_log_index = 0;
             shared_state.volatile_server_state.commit_index = 0;
 
+            // Update metrics for leader initialization
+            crate::metrics::update_raft_state_metrics(
+                shared_state.volatile_server_state.commit_index,
+                shared_state.server_state.leader_id,
+                shared_state.server_state.current_term,
+                shared_state.volatile_server_state.replication_log.len()
+            );
+
             // Tell quorum workers to start sending heartbeats.
             shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
                 let task = LocalQuorumWorkerTaskType::StartHeartbeats{
@@ -253,11 +264,26 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                         tracing::event!(Level::INFO, "handling log persisted");
                         let new_outstanding_resp = msg.outstanding_responses-1; // Maybe remove
                         match msg.message_type {
-                            OutstandingMessageType::WriteBatch{persistence_done, quorum_acks, callback, index} => {
+                            OutstandingMessageType::WriteBatch{persistence_done, quorum_acks, callback, index, start_time, batch_size} => {
                                 if quorum_acks >= shared_state.quorum_size {
                                     // Persistence done and replicated to quorum of nodes
                                     log::info!("Write batch with message id {} has been persisted on quorum of nodes", id);
                                     shared_state.volatile_server_state.commit_index = index;
+
+                                    // Update Raft state metrics
+                                    crate::metrics::update_raft_state_metrics(
+                                        shared_state.volatile_server_state.commit_index,
+                                        shared_state.server_state.leader_id,
+                                        shared_state.server_state.current_term,
+                                        shared_state.volatile_server_state.replication_log.len()
+                                    );
+
+                                    // Record metrics for completed write batch (in microseconds)
+                                    let duration = start_time.elapsed();
+                                    crate::metrics::record_write_batch_completion(duration.as_micros());
+                                    crate::metrics::WRITE_BATCH_SIZE.observe(batch_size as f64);
+                                    crate::metrics::WRITE_BATCH_TOTAL.inc();
+
                                     let r = LocalRaftWriteBatchResponse{
                                         responses: vec![], // TODO
                                         err: None
@@ -268,7 +294,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                 } else {
                                     msg.outstanding_responses = new_outstanding_resp;
                                     // TODO maybe not recreate this all of the time.
-                                    let new_state = OutstandingMessageType::WriteBatch { persistence_done: true, quorum_acks, callback, index};
+                                    let new_state = OutstandingMessageType::WriteBatch { persistence_done: true, quorum_acks, callback, index, start_time, batch_size};
                                     msg.message_type = new_state;
                                     shared_state.outstanding_messages.insert(id, msg);
                                 }
@@ -323,7 +349,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                         let new_outstanding_resp = msg.outstanding_responses-1;
 
                         match msg.message_type {
-                            OutstandingMessageType::WriteBatch{persistence_done, quorum_acks, callback, index} => {
+                            OutstandingMessageType::WriteBatch{persistence_done, quorum_acks, callback, index, start_time, batch_size} => {
                                 let new_acks = quorum_acks +1;
                                 if new_acks >= shared_state.quorum_size && persistence_done {
                                     // Log replication done
@@ -331,6 +357,21 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     if index > shared_state.volatile_server_state.commit_index {
                                         shared_state.volatile_server_state.commit_index = index;
                                     }
+
+                                    // Update Raft state metrics
+                                    crate::metrics::update_raft_state_metrics(
+                                        shared_state.volatile_server_state.commit_index,
+                                        shared_state.server_state.leader_id,
+                                        shared_state.server_state.current_term,
+                                        shared_state.volatile_server_state.replication_log.len()
+                                    );
+
+                                    // Record metrics for completed write batch (in microseconds)
+                                    let duration = start_time.elapsed();
+                                    crate::metrics::record_write_batch_completion(duration.as_micros());
+                                    crate::metrics::WRITE_BATCH_SIZE.observe(batch_size as f64);
+                                    crate::metrics::WRITE_BATCH_TOTAL.inc();
+
                                     let r = LocalRaftWriteBatchResponse{
                                         responses: vec![], // TODO
                                         err: None
@@ -340,7 +381,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     callback.send(response).unwrap();
                                 } else if new_outstanding_resp > 0 {
                                     msg.outstanding_responses = new_outstanding_resp;
-                                    let new_state = OutstandingMessageType::WriteBatch { persistence_done, quorum_acks: new_acks, callback, index};
+                                    let new_state = OutstandingMessageType::WriteBatch { persistence_done, quorum_acks: new_acks, callback, index, start_time, batch_size};
                                     msg.message_type = new_state;
                                     shared_state.outstanding_messages.insert(id, msg);
                                 } else {
