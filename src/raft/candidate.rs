@@ -62,6 +62,14 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                 log::debug!("updating last log term {} and index {}", entry.term, entry.index);
             }
 
+            // Update metrics when candidate recognizes new leader
+            crate::metrics::update_raft_state_metrics(
+                shared_state.volatile_server_state.commit_index,
+                shared_state.server_state.leader_id,
+                shared_state.server_state.current_term,
+                shared_state.volatile_server_state.replication_log.len()
+            );
+
             callback.send(
                 LocalRaftResponseMessage {
                     payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok)
@@ -103,6 +111,15 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                     log::info!("Node elected leader for term {}", term);
                                     shared_state.server_state.leader_id = shared_state.identity;
                                     shared_state.server_state.current_term = term;
+
+                                    // Update Raft state metrics for new leadership
+                                    crate::metrics::update_raft_state_metrics(
+                                        shared_state.volatile_server_state.commit_index,
+                                        shared_state.server_state.leader_id,
+                                        shared_state.server_state.current_term,
+                                        shared_state.volatile_server_state.replication_log.len()
+                                    );
+
                                     return RaftMessageStateChange::Leader(Box::new(RaftLeaderStateDelegate::new()));
                                 } else {
                                     msg.outstanding_responses = new_outstanding_resp;
@@ -172,6 +189,15 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                     log::info!("Node was elected leader for term: {}, node id: {}", term, shared_state.identity);
                                     shared_state.server_state.leader_id = shared_state.identity;
                                     shared_state.server_state.current_term = term;
+
+                                    // Update Raft state metrics for new leadership
+                                    crate::metrics::update_raft_state_metrics(
+                                        shared_state.volatile_server_state.commit_index,
+                                        shared_state.server_state.leader_id,
+                                        shared_state.server_state.current_term,
+                                        shared_state.volatile_server_state.replication_log.len()
+                                    );
+
                                     return RaftMessageStateChange::Leader(Box::new(RaftLeaderStateDelegate::new()));
                                 } else if new_outstanding_resp > 0 {
                                     msg.outstanding_responses = new_outstanding_resp;

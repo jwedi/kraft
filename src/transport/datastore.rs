@@ -42,11 +42,13 @@ impl Datastore for DatastoreServerImpl {
     // Alternative would be to have a local carry-over variable and a local poll that checks carry-over and then queue
 
     async fn get_record(&self, request: Request<GetDataStoreRecordRequest>) -> Result<Response<GetDataStoreRecordResponse>, Status> {
+        let _timing_guard = crate::metrics::record_rpc_request("get_record");
         todo!()
     }
 
     #[instrument(skip_all)]
     async fn put_record(&self, request: Request<PutDataStoreRecordRequest>) -> Result<Response<PutDataStoreRecordResponse>, Status> {
+        let _timing_guard = crate::metrics::record_rpc_request("put_record");
         tracing::debug!("received put_records request");
 
         let req = request.into_inner();

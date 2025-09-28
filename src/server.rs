@@ -106,6 +106,7 @@ impl Raft for RaftServerImpl {
 
     #[instrument]
     async fn put_batch(&self, request: Request<RemotePutBatchRequest>) -> Result<Response<RemotePutBatchResponse>, Status> {
+        let _timing_guard = crate::metrics::record_rpc_request("put_batch");
         tracing::info!("received put_batch request");
 
         let req = request.into_inner();
@@ -171,6 +172,8 @@ impl Raft for RaftServerImpl {
 
     #[instrument]
     async fn append_entries(&self, request: Request<RemoteAppendEntriesRequest>) -> Result<Response<RemoteAppendEntriesResponse>, Status> {
+        let _timing_guard = crate::metrics::record_rpc_request("append_entries");
+        crate::metrics::record_append_entries();
         tracing::debug!("received append_entries request");
         let req = request.into_inner();
         let callback: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
@@ -247,6 +250,8 @@ impl Raft for RaftServerImpl {
 
     #[instrument]
     async fn request_vote(&self, request: Request<RemoteVoteRequest>) -> Result<Response<RemoteVoteResponse>, Status> {
+        let _timing_guard = crate::metrics::record_rpc_request("request_vote");
+        crate::metrics::record_vote_request();
         tracing::info!("received request_vote request");
 
         let callback: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();

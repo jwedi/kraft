@@ -9,6 +9,7 @@ use serde::Deserialize;
 pub struct AppConfig {
     pub persistence_dir: String,
     pub port: u32,
+    pub metrics_port: u32,
     pub node_id: u32,
     pub cluster_nodes: Vec<ClusterNode>,
     pub max_message_size_bytes: usize,

@@ -43,6 +43,9 @@ tokio-stream = "0.1.17"
 sbe_kraft_replication_schema = { version = "0.1.0", path = "./sbe/kraft_replication_schema" }
 arc-swap = "1.7.1"
 im = "15.1.0"
+prometheus = { version = "0.13", features = ["process"] }
+lazy_static = "1.4.0"
+hyper = { version = "0.14", features = ["full"] }
 
 [dev-dependencies]
 criterion = "0.5"
