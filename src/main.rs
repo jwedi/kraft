@@ -300,9 +300,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(message = "Starting server.", %addr);
 
     // Start metrics server
-    let metrics_port = cfg.port + 1000; // Use port + 1000 for metrics
     let metrics_handle = tokio::spawn(async move {
-        if let Err(e) = crate::metrics_server::start_metrics_server(metrics_port as u16).await {
+        if let Err(e) = crate::metrics_server::start_metrics_server(cfg.metrics_port as u16).await {
             log::error!("Failed to start metrics server: {}", e);
         }
     });
