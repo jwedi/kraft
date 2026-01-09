@@ -5,6 +5,7 @@ use std::fmt::{Debug, Display, Formatter};
 use tokio::sync::oneshot;
 use crossbeam_queue::SegQueue;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicU64;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
@@ -16,6 +17,7 @@ use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils::SerializationData;
 use crate::transport::write_proxy::{WriteBatch, WriteResponse};
 use std::time::Instant;
+use bus::Bus;
 
 #[derive(Copy, Clone)]
 
@@ -41,6 +43,13 @@ pub struct RaftVolatileState {
     pub next_log_index: u64,
     pub replication_log: Vec<Arc<SerializationData>>,
     pub replication_log_term_starts: HashMap<u64, u64>,
+    pub commit_state: Arc<CommitState>
+}
+
+pub struct CommitState {
+    pub commit_index: AtomicU64,
+    pub term: AtomicU64,
+    pub version: AtomicU64,
 }
 
 pub enum OutstandingMessageType {
@@ -74,7 +83,8 @@ pub struct SharedState {
     pub outstanding_messages: HashMap<u64, OutstandingMessage>,
     pub quorum_size: u32,
     pub quorum_worker_tasks: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>>,
-    pub state_machine_config: StateMachineConfig
+    pub state_machine_config: StateMachineConfig,
+    pub log_entry_bus: Bus<Arc<SerializationData>>
 }
 
 pub struct StateMachineExecutorImpl {
@@ -100,6 +110,15 @@ impl StateMachineExecutorImpl {
 }
 
 impl RaftStateMachineExecutor for StateMachineExecutorImpl {
+
+    fn initialize(&mut self) {
+        log::info!("Starting state machine initialize");
+        for entry in &self.shared_state.volatile_server_state.replication_log {
+            self.shared_state.log_entry_bus.broadcast(Arc::clone(entry));
+        }
+        log::info!("State machine initialize completed");
+    }
+
     fn time_step(&mut self) {
         let state_change = self.state_delegate.time_step(&mut self.shared_state);
         match state_change {
@@ -199,6 +218,8 @@ pub trait RaftStateMachineExecutor {
     fn accept(&mut self, raft_message: LocalRaftMessage);
 
     fn time_step(&mut self);
+
+    fn initialize(&mut self);
 }
 
 // Per-state implementation of the Raft protocol. Handles requests, returns responses through callbacks and notifies about state changes.
@@ -374,6 +395,11 @@ mod integration_tests {
                 replication_log_term_starts: std::collections::HashMap::new(),
                 last_applied: 0,
                 next_log_index: 1,
+                commit_state: Arc::new(CommitState{
+                    commit_index: AtomicU64::new(0),
+                    term: AtomicU64::new(0),
+                    version: AtomicU64::new(0),
+                })
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),
@@ -386,6 +412,7 @@ mod integration_tests {
             identity: 0,
             term_votes: HashMap::new(),
             state_machine_config: StateMachineConfig { max_message_size_bytes: 2048},
+            log_entry_bus: Bus::new(5000)
         }
     }
 
@@ -400,6 +427,7 @@ mod integration_tests {
         // 6. Follower should then request backfill again
 
         let mut leader_delegate = RaftLeaderStateDelegate::new();
+        leader_delegate.initialized = true;
         let mut leader_state = create_shared_state();
 
         // Set up leader state: leader of term 3, only has term 2 up to index 3
@@ -413,7 +441,11 @@ mod integration_tests {
             leader_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
                 term: if i < 4 { 2 } else { 3 },
+                timestamp: 0,
+                prev_index: i,
+                prev_term: if i < 4 { 1 } else { 2 },
                 index: i,
+                message_id: i,
             }));
         }
 
@@ -454,7 +486,11 @@ mod integration_tests {
             follower_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
                 term: 2,
+                timestamp: 0,
+                prev_index: 0,
+                prev_term: 0,
                 index: i,
+                message_id: i,
             }));
         }
         follower_state.volatile_server_state.last_log_term = 2;
@@ -500,7 +536,7 @@ mod integration_tests {
             LocalQuorumWorkerTaskType::BackfillLog { data } => {
                 assert!(data.len() > 0); // Should have data to backfill
             }
-            _ => panic!("Expected BackfillLog task, got {:?}", backfill_task.task_type),
+            _ => panic!("Expected BackfillLog task"),
         }
     }
 
@@ -508,6 +544,7 @@ mod integration_tests {
     async fn test_truncate_flow_with_new_leader_entries() {
         // Test scenario where new leader has written additional entries in a higher term
         let mut leader_delegate = RaftLeaderStateDelegate::new();
+        leader_delegate.initialized = true;
         let mut leader_state = create_shared_state();
 
         // Leader is in term 4, has entries for terms 2, 3, and 4
@@ -516,12 +553,16 @@ mod integration_tests {
         leader_state.volatile_server_state.replication_log_term_starts.insert(3, 3);
         leader_state.volatile_server_state.replication_log_term_starts.insert(4, 7);
 
-        // Leader has: term 2 (0,1,2), term 3 (3,4,5,6), term 4 (7,8,9)
+        // Leader has: term 2 (0,1,2), term 3 (0,1,2), term 4 (0,1,2,3)
         for i in 0..10 {
             leader_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
-                term: if i < 3 { 2 } else if i < 7 { 3 } else { 4 },
-                index: i,
+                term: if i < 3 { 2 } else if i < 6 { 3 } else { 4 },
+                timestamp: 0,
+                prev_index: 0,
+                prev_term: 0,
+                index: i % 3,
+                message_id: i,
             }));
         }
 
@@ -530,7 +571,7 @@ mod integration_tests {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
                 prev_term: 3,
-                prev_index: 5,
+                prev_index: 1,
             }
         });
 
@@ -544,9 +585,9 @@ mod integration_tests {
         let task = queue.pop().expect("Should have task");
         match task.task_type {
             LocalQuorumWorkerTaskType::BackfillLog { data } => {
-                assert!(data.len() > 0);
+                assert_eq!(data.len(), 5)
             }
-            _ => panic!("Expected BackfillLog task"),
+            default => panic!("Expected BackfillLog task"),
         }
     }
 
@@ -554,6 +595,7 @@ mod integration_tests {
     async fn test_truncate_flow_boundary_conditions() {
         // Test edge cases like requesting the last entry of a term
         let mut leader_delegate = RaftLeaderStateDelegate::new();
+        leader_delegate.initialized = true;
         let mut leader_state = create_shared_state();
 
         leader_state.server_state.current_term = 3;
@@ -565,7 +607,11 @@ mod integration_tests {
             leader_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
                 term: if i < 5 { 2 } else { 3 },
+                timestamp: 0,
+                prev_index: 0,
+                prev_term: 0,
                 index: i,
+                message_id: i,
             }));
         }
 

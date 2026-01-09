@@ -211,3 +211,34 @@ It should undo its own log last log entries until it reaches the prev index and 
 
 Candidate state should delegate to follower state if receiving append entries request from a valid leader. 
 Probably happens automatically given that the first request from the leader is always the heartbeat which would trigger a state change from Candidate.
+
+
+persistence worker, quorum worker, read worker all need concurrent read access to transaction log
+leader worker needs concurrent write access to transaction log.
+
+On write:
+1. State machine worker constructs an Arc LogEntry
+2. It adds it to its transaction log i.e Vec Arc LogEntry
+3. It sends the Arc LogEntry to the message bus.
+4. The Quorum worker gets the entry from the bus and sends it to quorum members
+5. The Persistence worker gets the entry from the bus and stores it on disk.
+6. The Read worker gets the entry from the bus and applies it to the read datastructure if the commit index has been updated.
+
+The read worker needs to be notified when the commit index changes. Maybe the SM worker and the read worker share an atomic value for the current term+commit index + a notifying primitive.
+
+TODO
+On boot all entries in the transaction log need to be sent over the bus to the query worker.
+When node has become leader or follower with correct log for the first time it can emit all entries from the transaction log to the bus.
+Before successfully joining the cluster and syncing its log with others certain entries may have to be undone.
+Also possible that a log entry gets replicated to a less than a quorum and leader crashing when running in that case log entries may need to be reverted as well.
+
+Maybe send initial query structure backfill whenever the initial leader election is done.
+Maybe truncate query structure on truncate signal for simplicity and replay all non-truncated transactions.
+
+For simplicity rebuild full query structure after a leader election when log truncation is done.
+Would need a way to send a signal to the query worker that it should reset the structure from scratch, maybe send a log entry with term or index 0 and no data.
+
+Need to hook into a good place in the state machine where the first OK append entries was completed.
+
+On follower truncate, reset commit state, send log entry over bus with 0 term, index and data and backfill from start.
+On boot backfill from start optimistically and only invalidate on truncate.

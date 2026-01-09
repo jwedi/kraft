@@ -4,11 +4,11 @@ use ping::ping_pong_client::{PingPongClient};
 use ping::{PingRequest};
 use raftproto::raft_client::{RaftClient};
 use raftproto::{RemoteAppendEntriesRequest, RemoteVoteRequest};
-use futures::future;
+use futures::{future, try_join};
 use tonic::transport::Channel;
 use std::time::{Duration, Instant};
 use datastoreproto::datastore_client::{DatastoreClient};
-use crate::datastoreproto::PutDataStoreRecordRequest;
+use crate::datastoreproto::{GetDataStoreRecordRequest, PutDataStoreRecordRequest};
 use chrono::Utc;
 use uuid::Uuid;
 use crate::raftproto::RemoteLogEntry;
@@ -61,6 +61,73 @@ async fn do_append_entries() -> Result<(), Box<dyn std::error::Error>> {
     });
     let response = client.append_entries(request).await?;
     println!("RESPONSE={:?}", response.into_inner());
+
+    Ok(())
+}
+
+async fn do_get_record_async() -> Result<(), Box<dyn std::error::Error>> {
+    // Define the number of requests to make
+    let n_requests = 5000;
+    // Create a shared channel
+    let channel = Channel::from_static("http://[::1]:50051")
+        .connect()
+        .await?;
+    let channel2 = Channel::from_static("http://[::1]:50052")
+        .connect()
+        .await?;
+    let channel3 = Channel::from_static("http://[::1]:50053")
+        .connect()
+        .await?;
+    let chans = vec![channel, channel2, channel3];
+    let now = Utc::now();
+
+    let times: Vec<i64> = vec![];
+    let safe_times = Arc::new(Mutex::new(times));
+    let tasks = (0..n_requests).map(|i| {
+        let t = Arc::clone(&safe_times);
+        let mut client = DatastoreClient::new(chans[i%chans.len()].clone());
+        async move {
+            let mut request = tonic::Request::new(GetDataStoreRecordRequest {
+                id: i.to_string(),
+            });
+            request.set_timeout(Duration::from_secs(1));
+
+            let start = Utc::now();
+            match client.get_record(request).await {
+                Ok(response) => {
+                    if response.into_inner().record.is_none() {
+                        println!("Got empty response for key {}", i)
+                    }
+                    let done_time = Utc::now();
+                    let taken = done_time.sub(start);
+                    let taken_millis = taken.num_milliseconds();
+                    if taken_millis > 1000 {
+                        println!("Slow response {}, start: {}, end: {}", taken_millis, start.to_rfc3339(), done_time.to_rfc3339());
+                    }
+                    let mut v = t.lock().unwrap();
+                    v.push(taken_millis);
+                }
+                Err(e) => {
+                    eprintln!("Task {} ERROR={:?}", i, e);
+                }
+            }
+        }
+    });
+
+    future::join_all(tasks).await;
+    let mut t = safe_times.lock().unwrap();
+    let sum: i64 = t.iter().sum();
+    t.sort();
+    let fastest = t.get(0).unwrap();
+    let p50 = t.get((t.len() as f32 / 2f32) as usize).unwrap();
+    let p75 = t.get((t.len() as f32 * 0.75f32) as usize).unwrap();
+    let p95 = t.get((t.len() as f32 * 0.95f32) as usize).unwrap();
+    let slowest = t.get(t.len()-1).unwrap();
+
+    let avg = sum / t.len() as i64;
+
+    let elapsed = Utc::now().sub(now);
+    log::info!("Get record elapsed: {}, Avg latency: {}, fastest: {}, slowest: {}, p50: {}, p75: {}, p95: {}", elapsed, avg, fastest, slowest, p50, p75, p95);
 
     Ok(())
 }
@@ -125,7 +192,7 @@ async fn do_write_batch_async() -> Result<(), Box<dyn std::error::Error>> {
     let avg = sum / t.len() as i64;
 
     let elapsed = Utc::now().sub(now);
-    log::info!("Elapsed: {}, Avg latency: {}, fastest: {}, slowest: {}, p50: {}, p75: {}, p95: {}", elapsed, avg, fastest, slowest, p50, p75, p95);
+    log::info!("Write batch elapsed: {}, Avg latency: {}, fastest: {}, slowest: {}, p50: {}, p75: {}, p95: {}", elapsed, avg, fastest, slowest, p50, p75, p95);
 
     Ok(())
 }
@@ -194,12 +261,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::builder().filter_level(log::LevelFilter::Info).init();
     let mut iterations = 0;
     let mut last_time = Instant::now();
-    //do_write_batch_async().await?;
+    do_write_batch_async().await?;
 
 
     loop {
         //do_append_entries_async().await?;
-        do_write_batch_async().await?;
+        let w = do_write_batch_async();
+        let g = do_get_record_async();
+
+        try_join!(g, w);
 
         iterations += 1;
         if iterations % 10 == 0 {

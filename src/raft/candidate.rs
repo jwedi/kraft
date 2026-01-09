@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use crossbeam_queue::SegQueue;
 use rand::Rng;
@@ -44,17 +45,16 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         tracing::debug!("handling append entries for term: {}, current term: {}", append_entries_request.term, shared_state.server_state.current_term);
         if append_entries_request.term >= shared_state.server_state.current_term {
             log::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
-            // TODO check if prev term or prev index is same as our own, else inform new leader that we need backfill.
-
-            // TODO this isn't correct, fix when log backfill and storage works
-            //shared_state.volatile_server_state.last_log_term = append_entries_request.term;
-            //shared_state.volatile_server_state.last_log_index = 1;
 
             // New leader
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
             shared_state.volatile_server_state.next_term = append_entries_request.term +1;
             shared_state.volatile_server_state.replication_log_term_starts.insert(shared_state.server_state.current_term, shared_state.volatile_server_state.replication_log.len() as u64);
+
+            shared_state.volatile_server_state.commit_state.commit_index.store(0, Ordering::Release);
+            shared_state.volatile_server_state.commit_state.term.store(shared_state.server_state.current_term, Ordering::Release);
+            shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
             if let Some(entry) = append_entries_request.entry {
                 shared_state.volatile_server_state.last_log_index = entry.index;

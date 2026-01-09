@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use crossbeam_queue::SegQueue;
 use csv::WriterBuilder;
@@ -88,6 +89,10 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
 
+            shared_state.volatile_server_state.commit_state.commit_index.store(0, Ordering::Release);
+            shared_state.volatile_server_state.commit_state.term.store(shared_state.server_state.current_term, Ordering::Release);
+            shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+
             // Update Raft state metrics for new leader
             crate::metrics::update_raft_state_metrics(
                 shared_state.volatile_server_state.commit_index,
@@ -98,9 +103,6 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             shared_state.volatile_server_state.next_term = append_entries_request.term + 1;
             shared_state.volatile_server_state.replication_log_term_starts.insert(shared_state.server_state.current_term, shared_state.volatile_server_state.replication_log.len() as u64);
 
-            // TODO this isn't correct, fix when log backfill and storage works
-            //shared_state.volatile_server_state.last_log_term = append_entries_request.term;
-            //shared_state.volatile_server_state.last_log_index = 0;
             if let Some(entry) = append_entries_request.entry {
                 error!("Received append_entries request with entry when recognizing new leader, but follower should not have entries. Leader: {}, term: {}, index: {}", append_entries_request.leader_id, append_entries_request.term, entry.index);
             }
@@ -111,7 +113,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                     payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok)
                 }
             ).expect("sending append_entries response callback failed");
-        } else if append_entries_request.leader_id == shared_state.server_state.leader_id { // TODO maybe check leader id.
+        } else if append_entries_request.leader_id == shared_state.server_state.leader_id {
             tracing::debug!("received append_entries request from current leader: {}, term: {}", append_entries_request.leader_id, append_entries_request.term);
 
             // Check if heartbeat
@@ -129,6 +131,9 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 } else {
                     if append_entries_request.commit_index > shared_state.volatile_server_state.commit_index {
                         shared_state.volatile_server_state.commit_index = append_entries_request.commit_index;
+                        shared_state.volatile_server_state.commit_state.commit_index.store(append_entries_request.commit_index, Ordering::Release);
+                        shared_state.volatile_server_state.commit_state.term.store(append_entries_request.term, Ordering::Release);
+                        shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
                         log::info!("Updated commit index to {}", append_entries_request.commit_index);
 
                         // Update metrics for commit index change
@@ -149,8 +154,6 @@ impl RaftProtocol for RaftFollowerStateDelegate {
 
                 return RaftMessageStateChange::None
             }
-
-            // Check request if valid in current state:
 
             if !self.validate_append_entries(&append_entries_request, shared_state.volatile_server_state.last_log_index, shared_state.volatile_server_state.last_log_term) {
                 log::info!("non-consecutive append log req: req prev term {}, req prev index: {}, state: last log term {}, state: last log index {}, requestId: {}, dataLen: {}", append_entries_request.prev_term, append_entries_request.prev_index, shared_state.volatile_server_state.last_log_term, shared_state.volatile_server_state.last_log_index, append_entries_request.request_id, append_entries_request.entry.map(|e| e.data.len()).unwrap_or(0));
@@ -175,21 +178,23 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 shared_state.volatile_server_state.last_log_index = entry.index;
                 shared_state.volatile_server_state.last_log_term = entry.term;
                 log::debug!("updating last log term {} and index {}", entry.term, entry.index);
-                entry.data
+                Arc::new(entry.data)
             } else {
-                vec![]
+                Arc::new(vec![])
             };
 
             if data.is_empty() {
                 log::error!("Received empty append_entries data request from leader: {}, term: {}, index: {}", append_entries_request.leader_id, append_entries_request.term, append_entries_request.prev_index);
             }
-
-            let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: data.to_vec(), parent_span: Span::current(), request_id: append_entries_request.request_id};
+            
+            let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: Arc::clone(&data), parent_span: Span::current(), request_id: append_entries_request.request_id};
             shared_state.persistence_work.push(persistence_task);
 
             match deserialize_data(&data, 0) {
                 Ok((_, deserialized)) => {
-                    shared_state.volatile_server_state.replication_log.push(Arc::new(deserialized));
+                    let serialization_data = Arc::new(deserialized);
+                    shared_state.volatile_server_state.replication_log.push(Arc::clone(&serialization_data));
+                    shared_state.log_entry_bus.broadcast(serialization_data);
                 }
                 Err(e) => {
                     log::error!("Failed to deserialize append_entries data from leader: {}, term: {}, index: {}, error: {}", append_entries_request.leader_id, append_entries_request.term, append_entries_request.prev_index, e);
@@ -197,6 +202,9 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             }
             if append_entries_request.commit_index > shared_state.volatile_server_state.commit_index {
                 shared_state.volatile_server_state.commit_index = append_entries_request.commit_index;
+                shared_state.volatile_server_state.commit_state.commit_index.store(append_entries_request.commit_index, Ordering::Release);
+                shared_state.volatile_server_state.commit_state.term.store(append_entries_request.term, Ordering::Release);
+                shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
             }
 
             // Update metrics after processing new entry and commit index
@@ -342,6 +350,8 @@ mod tests {
     use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumTaskResponseType};
     use tokio::sync::oneshot;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use bus::Bus;
     use crate::server::raftproto::{RemoteLogEntry, RemotePutRequest};
     use crate::service_utils::storage_utils::{SerializationData, serialize_data};
 
@@ -360,6 +370,11 @@ mod tests {
                 replication_log_term_starts: std::collections::HashMap::new(),
                 last_applied: 0,
                 next_log_index: 1,
+                commit_state: Arc::new(CommitState{
+                    commit_index: AtomicU64::new(0),
+                    term: AtomicU64::new(0),
+                    version: AtomicU64::new(0),
+                })
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),
@@ -372,6 +387,7 @@ mod tests {
             identity: 0,
             term_votes: HashMap::new(),
             state_machine_config: StateMachineConfig { max_message_size_bytes: 2048},
+            log_entry_bus: Bus::new(5000)
         }
     }
 
@@ -553,7 +569,11 @@ mod tests {
             shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
                 term: if i < 3 { 1 } else if i < 8 { 2 } else { 3 },
+                timestamp: 0,
+                prev_index: 0,
+                prev_term: 0,
                 index: i,
+                message_id: i,
             }));
         }
 
@@ -589,7 +609,11 @@ mod tests {
             shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
                 term: if i < 5 { 1 } else { 2 },
-                index: i,
+                timestamp: 0,
+                prev_index: 0,
+                prev_term: 0,
+                index: i % 5,
+                message_id: i,
             }));
         }
 
@@ -600,7 +624,7 @@ mod tests {
         delegate.truncate_log(&mut shared_state, 1, 4);
 
         // Should truncate to exactly the end of term 1
-        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 6); // 0-4 + 1 for next
+        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 5);
         assert_eq!(shared_state.volatile_server_state.last_log_term, 1);
         assert_eq!(shared_state.volatile_server_state.last_log_index, 4);
 
@@ -620,7 +644,11 @@ mod tests {
             shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
                 term: 3,
+                timestamp: 0,
+                prev_index: 0,
+                prev_term: 0,
                 index: i,
+                message_id: i,
             }));
         }
 
@@ -649,7 +677,11 @@ mod tests {
             shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
                 term: 2,
+                timestamp: 0,
+                prev_index: 0,
+                prev_term: 0,
                 index: i,
+                message_id: i,
             }));
         }
 
@@ -678,7 +710,11 @@ mod tests {
             shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
                 term: if i < 5 { 2 } else { 3 },
+                timestamp: 0,
+                prev_index: 0,
+                prev_term: 0,
                 index: i,
+                message_id: i,
             }));
         }
 
@@ -700,7 +736,7 @@ mod tests {
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Log should be truncated
-        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 4); // 0,1,2 + 1 for next
+        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 3);
         assert_eq!(shared_state.volatile_server_state.last_log_term, 2);
         assert_eq!(shared_state.volatile_server_state.last_log_index, 2);
         assert_eq!(shared_state.volatile_server_state.next_log_index, 3);
