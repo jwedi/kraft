@@ -16,7 +16,7 @@ use crate::quorum::worker::{LocalQuorumWorkerTask, LocalQuorumTaskResponseType, 
 use crate::raft::candidate::RaftCandidateStateDelegate;
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRaftWriteBatchRequest, LocalRaftWriteBatchResponse, LocalRequestVoteRequest, SharedState, TermVote};
-use crate::server::raftproto::{RemoteAppendEntriesRequest, RemoteLogEntry, RemotePutRequest};
+use crate::transport::raft::raftproto::{RemoteAppendEntriesRequest, RemoteLogEntry, RemotePutRequest};
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils::{SerializationData, serialize_data};
 
@@ -240,7 +240,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
             // Update metrics for leader initialization
-            crate::metrics::update_raft_state_metrics(
+            crate::transport::metrics::update_raft_state_metrics(
                 shared_state.volatile_server_state.commit_index,
                 shared_state.server_state.leader_id,
                 shared_state.server_state.current_term,
@@ -281,7 +281,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
                                     // Update Raft state metrics
-                                    crate::metrics::update_raft_state_metrics(
+                                    crate::transport::metrics::update_raft_state_metrics(
                                         shared_state.volatile_server_state.commit_index,
                                         shared_state.server_state.leader_id,
                                         shared_state.server_state.current_term,
@@ -290,9 +290,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
 
                                     // Record metrics for completed write batch (in microseconds)
                                     let duration = start_time.elapsed();
-                                    crate::metrics::record_write_batch_completion(duration.as_micros());
-                                    crate::metrics::WRITE_BATCH_SIZE.observe(batch_size as f64);
-                                    crate::metrics::WRITE_BATCH_TOTAL.inc();
+                                    crate::transport::metrics::record_write_batch_completion(duration.as_micros());
+                                    crate::transport::metrics::WRITE_BATCH_SIZE.observe(batch_size as f64);
+                                    crate::transport::metrics::WRITE_BATCH_TOTAL.inc();
 
                                     let r = LocalRaftWriteBatchResponse{
                                         responses: vec![], // TODO
@@ -372,7 +372,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     }
 
                                     // Update Raft state metrics
-                                    crate::metrics::update_raft_state_metrics(
+                                    crate::transport::metrics::update_raft_state_metrics(
                                         shared_state.volatile_server_state.commit_index,
                                         shared_state.server_state.leader_id,
                                         shared_state.server_state.current_term,
@@ -381,9 +381,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
 
                                     // Record metrics for completed write batch (in microseconds)
                                     let duration = start_time.elapsed();
-                                    crate::metrics::record_write_batch_completion(duration.as_micros());
-                                    crate::metrics::WRITE_BATCH_SIZE.observe(batch_size as f64);
-                                    crate::metrics::WRITE_BATCH_TOTAL.inc();
+                                    crate::transport::metrics::record_write_batch_completion(duration.as_micros());
+                                    crate::transport::metrics::WRITE_BATCH_SIZE.observe(batch_size as f64);
+                                    crate::transport::metrics::WRITE_BATCH_TOTAL.inc();
 
                                     let r = LocalRaftWriteBatchResponse{
                                         responses: vec![], // TODO
@@ -537,7 +537,7 @@ mod tests {
     use bus::Bus;
     use log::info;
     use crate::quorum::worker::LocalQuorumResponse;
-    use crate::server::raftproto::{RemoteLogEntry, RemotePutRequest};
+    use crate::transport::raft::raftproto::{RemoteLogEntry, RemotePutRequest};
     use crate::service_utils::storage_utils::{SerializationData, serialize_data};
 
     fn create_shared_state() -> SharedState {
@@ -552,7 +552,7 @@ mod tests {
                 last_log_index: 0,
                 commit_index: 0,
                 replication_log: vec![],
-                replication_log_term_starts: std::collections::HashMap::new(),
+                replication_log_term_starts: HashMap::new(),
                 last_applied: 0,
                 next_log_index: 1,
                 commit_state: Arc::new(CommitState{

@@ -28,9 +28,9 @@ use tracing::instrument::Instrumented;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::client::cluster_node_client::SharedGrpcChannel;
 use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftMessage, LocalRaftMessagePayload, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalRaftWriteBatchRequest, LocalRequestVoteRequest};
-use crate::server::raftproto::raft_client::RaftClient;
-use crate::server::raftproto::{RemoteAppendEntriesAcknowledge, RemoteAppendEntriesRequest, RemoteAppendEntriesResponse, RemoteLogEntry, RemotePutBatchRequest, RemotePutBatchResponse, RemoteQuorumMessage, RemoteTruncateLogRequest, RemoteTruncateLogResponse, RemoteVoteRequest, RemoteVoteResponse};
-use crate::server::raftproto::remote_quorum_message::MessagePayload;
+use crate::transport::raft::raftproto::raft_client::RaftClient;
+use crate::transport::raft::raftproto::{RemoteAppendEntriesAcknowledge, RemoteAppendEntriesRequest, RemoteAppendEntriesResponse, RemoteLogEntry, RemotePutBatchRequest, RemotePutBatchResponse, RemoteQuorumMessage, RemoteTruncateLogRequest, RemoteTruncateLogResponse, RemoteVoteRequest, RemoteVoteResponse};
+use crate::transport::raft::raftproto::remote_quorum_message::MessagePayload;
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
 use crate::service_utils::storage_utils::{SerializationData, serialize_data, SerializedData};
 use crate::service_utils::tracing_utils::{span_to_tracing_context, tracing_context_to_span};
@@ -362,7 +362,7 @@ impl QuorumWorker {
 
                                     if let Some(start_time) = self.pending_append_entries.remove(&append_entries.request_id) {
                                         let latency_micros = start_time.elapsed().as_micros() as f64;
-                                        crate::metrics::QUORUM_APPEND_ENTRIES_LATENCY
+                                        crate::transport::metrics::QUORUM_APPEND_ENTRIES_LATENCY
                                             .with_label_values(&[&self.member_id.to_string()])
                                             .observe(latency_micros);
                                     }
@@ -439,7 +439,7 @@ impl QuorumWorker {
                                 match pending_batch {
                                     Some(batch) => {
                                         let latency_micros = batch.start_time.elapsed().as_micros() as f64;
-                                        crate::metrics::QUORUM_PUT_BATCH_LATENCY
+                                        crate::transport::metrics::QUORUM_PUT_BATCH_LATENCY
                                             .with_label_values(&[&self.member_id.to_string()])
                                             .observe(latency_micros);
 

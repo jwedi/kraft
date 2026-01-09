@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use crate::server::raftproto::RemotePutRequest;
+use crate::transport::raft::raftproto::RemotePutRequest;
 use sbe_kraft_replication_schema::log_entry_codec::encoder::{Put_data_commandsEncoder};
 use sbe_kraft_replication_schema::log_entry_codec::{LogEntryDecoder, LogEntryEncoder};
 use sbe_kraft_replication_schema::message_header_codec::MessageHeaderDecoder;

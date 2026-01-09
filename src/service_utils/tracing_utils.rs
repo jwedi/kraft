@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use opentelemetry::Context;
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry_zipkin::Propagator;
-use crate::server::raftproto::{TracingContext, TracingContextEntry};
+use crate::transport::raft::raftproto::{TracingContext, TracingContextEntry};
 
 // Function for converting a span to a TracingContext
 pub fn span_to_tracing_context(span: &Context, propagator: &Propagator) -> TracingContext {

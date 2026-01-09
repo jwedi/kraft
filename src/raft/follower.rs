@@ -94,7 +94,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
             // Update Raft state metrics for new leader
-            crate::metrics::update_raft_state_metrics(
+            crate::transport::metrics::update_raft_state_metrics(
                 shared_state.volatile_server_state.commit_index,
                 shared_state.server_state.leader_id,
                 shared_state.server_state.current_term,
@@ -137,7 +137,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                         log::info!("Updated commit index to {}", append_entries_request.commit_index);
 
                         // Update metrics for commit index change
-                        crate::metrics::update_raft_state_metrics(
+                        crate::transport::metrics::update_raft_state_metrics(
                             shared_state.volatile_server_state.commit_index,
                             shared_state.server_state.leader_id,
                             shared_state.server_state.current_term,
@@ -208,7 +208,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             }
 
             // Update metrics after processing new entry and commit index
-            crate::metrics::update_raft_state_metrics(
+            crate::transport::metrics::update_raft_state_metrics(
                 shared_state.volatile_server_state.commit_index,
                 shared_state.server_state.leader_id,
                 shared_state.server_state.current_term,
@@ -372,7 +372,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
     use bus::Bus;
-    use crate::server::raftproto::{RemoteLogEntry, RemotePutRequest};
+    use crate::transport::raft::raftproto::{RemoteLogEntry, RemotePutRequest};
     use crate::service_utils::storage_utils::{SerializationData, serialize_data};
 
     fn create_shared_state() -> SharedState {

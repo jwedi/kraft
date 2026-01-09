@@ -7,8 +7,8 @@ use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tonic::{Request, Status, Streaming};
 use crate::client::cluster_node_client::SharedGrpcChannel;
 use crate::config::config::ClusterNode;
-use crate::server::raftproto::{RemoteConnectRequest, RemoteQuorumMessage};
-use crate::server::raftproto::remote_quorum_message::MessagePayload;
+use crate::transport::raft::raftproto::{RemoteConnectRequest, RemoteQuorumMessage};
+use crate::transport::raft::raftproto::remote_quorum_message::MessagePayload;
 
 pub mod raftproto {
     tonic::include_proto!("raftproto"); // The string specified here must match the proto package name
