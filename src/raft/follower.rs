@@ -15,7 +15,7 @@ use crate::quorum::worker::{LocalQuorumWorkerTask, LocalQuorumTaskResponseType, 
 use crate::raft::candidate::RaftCandidateStateDelegate;
 use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRaftWriteBatchResponse, LocalRequestVoteRequest, SharedState, TermVote};
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
-use crate::service_utils::storage_utils::deserialize_data;
+use crate::service_utils::storage_utils::{deserialize_data, SerializationData};
 
 pub struct RaftFollowerStateDelegate {
     election_timeout: u128,
@@ -294,6 +294,26 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 LocalQuorumTaskResponseType::TruncateLog { quorum_node_id, prev_term, prev_index } => {
                     log::info!("Received truncate log request from leader, truncating to term {} index {}", prev_term, prev_index);
                     self.truncate_log(shared_state, prev_term, prev_index);
+
+                    // Send truncate signal for commit state to rebuild query structure.
+                    shared_state.log_entry_bus.broadcast(Arc::new(SerializationData{
+                        index: u64::MAX,
+                        term: u64::MAX,
+                        timestamp: 0,
+                        prev_index: u64::MAX,
+                        prev_term: u64::MAX,
+                        message_id: u64::MAX,
+                        requests: vec![],
+                    }));
+
+                    for log_entry in &shared_state.volatile_server_state.replication_log {
+                        shared_state.log_entry_bus.broadcast(Arc::clone(log_entry))
+                    }
+
+                    shared_state.volatile_server_state.commit_state.commit_index.store(prev_index, Ordering::Release);
+                    shared_state.volatile_server_state.commit_state.term.store(prev_term, Ordering::Release);
+                    shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+
                     // After truncation, request backfill again
                     log::info!("After truncation, will request backfill from term {} index {}", prev_term, prev_index);
                 }

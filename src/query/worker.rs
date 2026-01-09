@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use bus::BusReader;
 use crossbeam_queue::SegQueue;
@@ -63,16 +63,21 @@ impl QueryWorker {
                 applied_index = index;
                 applied_term = term;
 
+                let mut num_entries_applied = 0;
                 match parked.take() {
                     None => {}
                     Some(parked_value) => {
-                        for req in parked_value.requests.iter() {
-                            self.query_structure.insert(req.id.clone(), Arc::new(req.payload.clone()));
+                        if (parked_value.term == term && parked_value.index <= index) || (parked_value.term < term) {
+                            for req in parked_value.requests.iter() {
+                                self.query_structure.insert(req.id.clone(), Arc::new(req.payload.clone()));
+                            }
+                            num_entries_applied += 1;
+                        } else {
+                            parked = Some(parked_value)
                         }
                     }
                 }
                 // Apply all new data up until new commit index.
-                let mut num_entries_applied = 0;
                 loop {
                     match self.bus.try_recv() {
                         Ok(val) => {
@@ -80,6 +85,13 @@ impl QueryWorker {
                                 for req in val.requests.iter() {
                                     self.query_structure.insert(req.id.clone(), Arc::new(req.payload.clone()));
                                 }
+                            } else if val.term == u64::MAX && val.term == u64::MAX {
+                                // Truncate signal
+                                self.query_structure.clear();
+                                last_version = current_version;
+                                applied_index = 0;
+                                applied_term = 0;
+                                continue;
                             } else {
                                 parked = Some(val);
                                 break;
