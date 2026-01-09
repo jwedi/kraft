@@ -4,6 +4,8 @@ pub mod metrics_server;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar};
+use std::sync::atomic::AtomicU64;
+use bus::Bus;
 use server::PingServer;
 use server::RaftServerImpl;
 use tonic::{transport::Server, Request, Response, Status};
@@ -31,8 +33,9 @@ use tracing_opentelemetry::{OpenTelemetryLayer, OpenTelemetrySpanExt};
 use tracing_subscriber::{registry, layer::SubscriberExt, Registry, Layer};
 use crate::config::config::{ClusterNode, read_config};
 use crate::persistence::worker::{PersistenceConfig, PersistenceResponseType, PersistenceTaskType, PersistenceWorker, VoteRow};
+use crate::query::worker::QueryRequest;
 use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask, QuorumWorker};
-use crate::raft::raft_sm::{OutstandingMessage, LocalRaftMessage, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig};
+use crate::raft::raft_sm::{OutstandingMessage, LocalRaftMessage, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig, CommitState};
 use crate::server::raftproto::RemoteQuorumMessage;
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils;
@@ -41,11 +44,6 @@ use crate::transport::datastore::datastoreproto::datastore_server::DatastoreServ
 use crate::transport::datastore::DatastoreServerImpl;
 use crate::transport::stream_manager::StreamManagerImpl;
 use crate::transport::write_proxy::{WriteBatch, WriteProxy};
-
-
-mod raft_runtime {
-    pub mod runtime;
-}
 
 pub mod service_utils {
     pub mod errors;
@@ -71,6 +69,10 @@ mod persistence {
 }
 
 mod quorum {
+    pub mod worker;
+}
+
+mod query {
     pub mod worker;
 }
 
@@ -132,7 +134,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_raft_queue = Arc::clone(&task_queue);
     let api_write_work_queue = Arc::new(SegQueue::<WriteBatch>::new());
     let proxy_write_work_queue = Arc::clone(&api_write_work_queue);
-    let datastore_server = DatastoreServerImpl{task_queue: api_write_work_queue};
+    let query_queue = Arc::new(SegQueue::<QueryRequest>::new());
+
+    let commit_state = Arc::new(CommitState{
+        commit_index: AtomicU64::new(0),
+        term: AtomicU64::new(0),
+        version: AtomicU64::new(0)
+    });
+
+    let datastore_server = DatastoreServerImpl{
+        task_queue: api_write_work_queue,
+        query_queue: Arc::clone(&query_queue),
+        commit_state: Arc::clone(&commit_state)
+    };
 
     let persistence_work_queue = Arc::new(SegQueue::<PersistenceTaskType>::new());
     let sm_persistence_work = Arc::clone(&persistence_work_queue);
@@ -190,7 +204,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_term: next_term,
         next_log_index: last_log_index + 1, // TODO this is probably stupid.
         replication_log,
-        replication_log_term_starts: term_start_index
+        replication_log_term_starts: term_start_index,
+        commit_state: Arc::clone(&commit_state)
     };
 
 
@@ -239,6 +254,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     }).collect();
 
+    let mut log_entry_bus: Bus<Arc<SerializationData>> = Bus::new(5000);
+    let mut query_bus_reader = log_entry_bus.add_rx();
+
     let shared_state = SharedState{
         server_state,
         volatile_server_state,
@@ -253,6 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quorum_size,
         quorum_worker_tasks: quorum_send_channels.clone(),
         state_machine_config: StateMachineConfig{ max_message_size_bytes: cfg.max_message_size_bytes},
+        log_entry_bus: log_entry_bus
     };
 
     let write_proxy_handle = spawn(
@@ -272,6 +291,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             true
         }
     );
+
+    let query_commit_state = Arc::clone(&commit_state);
+    let query_pending_queue = Arc::clone(&query_queue);
+    let query_worker_handle = spawn_blocking(move ||{
+        let mut worker = query::worker::QueryWorker::new(query_bus_reader, query_commit_state, query_pending_queue);
+        worker.run();
+        true
+    });
 
     let worker_handle = spawn_blocking(move ||{
         let mut worker = server::QueueWorker::new(worker_queue, shared_state);
@@ -336,7 +363,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
 
-    let _ = join!(worker_handle, persistence_handle, write_proxy_handle, metrics_handle);
+    let _ = join!(worker_handle, persistence_handle, write_proxy_handle, metrics_handle, query_worker_handle);
     join_all(cw_join_handles);
     opentelemetry::global::shutdown_tracer_provider();
     Ok(())

@@ -3,7 +3,7 @@ port = 50053
 node_id = 3
 persistence_dir = "out3/"
 max_message_size_bytes = 4096
-metrics_port = 51051
+metrics_port = 51053
 [[cluster_nodes]]
 endpoint = "http://[::1]:50051"
 node_id = 1

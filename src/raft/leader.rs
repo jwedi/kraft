@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use crossbeam_queue::SegQueue;
 use prost::bytes::{BufMut, Bytes};
 use rand::Rng;
@@ -22,7 +23,7 @@ use crate::service_utils::storage_utils::{SerializationData, serialize_data};
 pub struct RaftLeaderStateDelegate {
     election_timeout: u128,
     rng: ThreadRng,
-    initialized: bool,
+    pub(crate) initialized: bool,
 }
 
 fn clone_subset<T>(data: &[Arc<T>], start: usize, end: usize) -> Vec<Arc<T>> {
@@ -122,10 +123,13 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         if idx == 0 {
             shared_state.volatile_server_state.replication_log_term_starts.insert(shared_state.server_state.current_term, shared_state.volatile_server_state.replication_log.len() as u64);
         }
-        shared_state.volatile_server_state.replication_log.push(Arc::new(serialization_data));
+        let arc_serialization_data = Arc::new(serialization_data);
+        shared_state.volatile_server_state.replication_log.push(Arc::clone(&arc_serialization_data));
+        shared_state.log_entry_bus.broadcast(arc_serialization_data);
 
         // TODO no clone.
-        let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: data.clone(), parent_span: Span::current(), request_id: message_id};
+        let d = Arc::new(data.clone());
+        let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: d, parent_span: Span::current(), request_id: message_id};
         shared_state.persistence_work.push(persistence_task);
 
         // TODO log entry command should be just bytes
@@ -170,7 +174,6 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             span: Span::current()
         };
         shared_state.outstanding_messages.insert(message_id, outstanding_message);
-        // TODO write log entry to volatile state replication log for backfills.
 
         shared_state.volatile_server_state.last_log_term = shared_state.server_state.current_term;
         shared_state.volatile_server_state.next_log_index = idx +1;
@@ -232,6 +235,10 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             shared_state.volatile_server_state.next_log_index = 0;
             shared_state.volatile_server_state.commit_index = 0;
 
+            shared_state.volatile_server_state.commit_state.commit_index.store(0, Ordering::Release);
+            shared_state.volatile_server_state.commit_state.term.store(shared_state.server_state.current_term, Ordering::Release);
+            shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+
             // Update metrics for leader initialization
             crate::metrics::update_raft_state_metrics(
                 shared_state.volatile_server_state.commit_index,
@@ -269,6 +276,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     // Persistence done and replicated to quorum of nodes
                                     log::info!("Write batch with message id {} has been persisted on quorum of nodes", id);
                                     shared_state.volatile_server_state.commit_index = index;
+                                    shared_state.volatile_server_state.commit_state.commit_index.store(index, Ordering::Release);
+                                    shared_state.volatile_server_state.commit_state.term.store(shared_state.server_state.current_term, Ordering::Release);
+                                    shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
                                     // Update Raft state metrics
                                     crate::metrics::update_raft_state_metrics(
@@ -356,6 +366,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     log::info!("Write batch with message id {} has been persisted on quorum of nodes", id);
                                     if index > shared_state.volatile_server_state.commit_index {
                                         shared_state.volatile_server_state.commit_index = index;
+                                        shared_state.volatile_server_state.commit_state.commit_index.store(index, Ordering::Release);
+                                        shared_state.volatile_server_state.commit_state.term.store(shared_state.server_state.current_term, Ordering::Release);
+                                        shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
                                     }
 
                                     // Update Raft state metrics
@@ -519,6 +532,10 @@ mod tests {
     use crate::raft::raft_sm::*;
     use tokio::sync::oneshot;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Instant;
+    use bus::Bus;
+    use log::info;
     use crate::quorum::worker::LocalQuorumResponse;
     use crate::server::raftproto::{RemoteLogEntry, RemotePutRequest};
     use crate::service_utils::storage_utils::{SerializationData, serialize_data};
@@ -538,6 +555,11 @@ mod tests {
                 replication_log_term_starts: std::collections::HashMap::new(),
                 last_applied: 0,
                 next_log_index: 1,
+                commit_state: Arc::new(CommitState{
+                    commit_index: AtomicU64::new(0),
+                    version: AtomicU64::new(0),
+                    term: AtomicU64::new(0),
+                })
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),
@@ -550,6 +572,7 @@ mod tests {
             identity: 0,
             term_votes: HashMap::new(),
             state_machine_config: StateMachineConfig { max_message_size_bytes: 2048},
+            log_entry_bus: Bus::new(5000)
         }
     }
 
@@ -606,6 +629,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_request_sends_truncate_signal_when_leader_missing_entries() {
         let mut delegate = RaftLeaderStateDelegate::new();
+        delegate.initialized = true;
         let mut shared_state = create_shared_state();
 
         // Initialize as leader for term 3
@@ -622,7 +646,11 @@ mod tests {
             shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
                 term: 2,
+                timestamp: 0,
+                prev_index: 0,
+                prev_term: 0,
                 index: 0,
+                message_id: 0,
             }));
         }
 
@@ -654,7 +682,7 @@ mod tests {
                     assert_eq!(prev_index, 2); // Last index leader has for term 2
                     assert!(id > 0); // Should have a valid message ID
                 }
-                _ => panic!("Expected TruncateLog task, got {:?}", task.task_type),
+                _ => panic!("Expected TruncateLog task"),
             }
         } else {
             panic!("Expected task in queue");
@@ -664,6 +692,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_request_sends_truncate_for_unknown_term() {
         let mut delegate = RaftLeaderStateDelegate::new();
+        delegate.initialized = true;
         let mut shared_state = create_shared_state();
 
         // Initialize as leader for term 3
@@ -708,6 +737,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_request_succeeds_when_leader_has_entries() {
         let mut delegate = RaftLeaderStateDelegate::new();
+        delegate.initialized = true;
         let mut shared_state = create_shared_state();
 
         // Initialize as leader
@@ -723,7 +753,11 @@ mod tests {
             shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
                 term: if i < 6 { 2 } else { 3 },
+                timestamp: 0,
+                prev_index: 0,
+                prev_term: 0,
                 index: i,
+                message_id: i,
             }));
         }
 
@@ -753,7 +787,7 @@ mod tests {
                 LocalQuorumWorkerTaskType::BackfillLog { data } => {
                     assert!(data.len() > 0); // Should have some data to backfill
                 }
-                _ => panic!("Expected BackfillLog task, got {:?}", task.task_type),
+                _ => panic!("Expected BackfillLog task"),
             }
         }
     }
@@ -859,6 +893,11 @@ mod tests {
                 replication_log_term_starts: std::collections::HashMap::new(),
                 last_applied: 0,
                 next_log_index: 1,
+                commit_state: Arc::new(CommitState{
+                    commit_index: AtomicU64::new(0),
+                    term: AtomicU64::new(0),
+                    version: AtomicU64::new(0),
+                })
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),
@@ -871,6 +910,7 @@ mod tests {
             identity: 0,
             term_votes: std::collections::HashMap::new(),
             state_machine_config: StateMachineConfig { max_message_size_bytes: 2048},
+            log_entry_bus: Bus::new(5000)
         };
         state
     }
@@ -925,6 +965,8 @@ mod tests {
                 quorum_acks: 1,
                 callback: callback_tx,
                 index: 42,
+                start_time: Instant::now(),
+                batch_size: 0,
             },
             span: tracing::span!(Level::INFO, "test"),
         };

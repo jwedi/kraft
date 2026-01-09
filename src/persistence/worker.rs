@@ -17,7 +17,7 @@ pub enum PersistenceTaskType {
     ReadState{id: u64, span: Span},
     AppendVote{id: u64, term: u64, candidate_id: u32, parent_span: Span},
     ReadVotes{id: u64, span: Span},
-    AppendLog{id: u64, data: Vec<u8>, parent_span: Span, request_id: u64},
+    AppendLog{id: u64, data: Arc<Vec<u8>>, parent_span: Span, request_id: u64},
     // Can either be RC / Arc and immutable, or copied, or immutable and the persistence worker serializes while waiting for IO sync.
     // Preparing next batch while waiting for IO sync seems reasonable.
     // Now sure how to avoid IO if that's the case.
@@ -122,7 +122,7 @@ impl PersistenceWorker {
                             span.set_parent(parent_span.context());
                             let _enter = span.enter();
                             tracing::info!("Appending log entry with id {} and data length {}", request_id, data.len());
-                            self.append_log(&data, & mut log_write_buffer).unwrap();
+                            self.append_log(data, & mut log_write_buffer).unwrap();
                             self.response_queue.push(PersistenceResponseType::LogPersisted{id});
                             tracing::info!("Append log entry done");
                         }
@@ -145,8 +145,8 @@ impl PersistenceWorker {
         Ok(())
     }
 
-    fn append_log(&mut self, buffer: &[u8], file_handle: & mut BufWriter<File>) -> io::Result<()> {
-        file_handle.write_all(buffer)?;
+    fn append_log(&mut self, buffer: Arc<Vec<u8>>, file_handle: & mut BufWriter<File>) -> io::Result<()> {
+        file_handle.write_all(&buffer)?;
         file_handle.flush()?;
         Ok(())
     }

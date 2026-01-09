@@ -705,8 +705,8 @@ impl QuorumWorker {
                 self.stream_manager.reset_send_stream(self.member_id as u32).await;
             }
             let elapsed = now_millis() - current_time;
-            if elapsed < 2 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+            if elapsed < 1 {
+                tokio::time::sleep(Duration::from_micros(500)).await;
             }
         }
     }
