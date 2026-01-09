@@ -63,7 +63,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             }
 
             // Update metrics when candidate recognizes new leader
-            crate::metrics::update_raft_state_metrics(
+            crate::transport::metrics::update_raft_state_metrics(
                 shared_state.volatile_server_state.commit_index,
                 shared_state.server_state.leader_id,
                 shared_state.server_state.current_term,
@@ -113,7 +113,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                     shared_state.server_state.current_term = term;
 
                                     // Update Raft state metrics for new leadership
-                                    crate::metrics::update_raft_state_metrics(
+                                    crate::transport::metrics::update_raft_state_metrics(
                                         shared_state.volatile_server_state.commit_index,
                                         shared_state.server_state.leader_id,
                                         shared_state.server_state.current_term,
@@ -191,7 +191,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                     shared_state.server_state.current_term = term;
 
                                     // Update Raft state metrics for new leadership
-                                    crate::metrics::update_raft_state_metrics(
+                                    crate::transport::metrics::update_raft_state_metrics(
                                         shared_state.volatile_server_state.commit_index,
                                         shared_state.server_state.leader_id,
                                         shared_state.server_state.current_term,

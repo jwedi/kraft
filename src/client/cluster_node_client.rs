@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::transport::{Channel, Error};
-use crate::server::raftproto::raft_client::RaftClient;
+use crate::transport::raft::raftproto::raft_client::RaftClient;
 
 #[derive(Clone, Debug)]
 pub struct SharedGrpcChannel {

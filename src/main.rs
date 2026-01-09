@@ -1,16 +1,12 @@
-pub mod server;
-pub mod metrics;
-pub mod metrics_server;
-
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar};
 use std::sync::atomic::AtomicU64;
 use bus::Bus;
-use server::PingServer;
-use server::RaftServerImpl;
-use tonic::{transport::Server, Request, Response, Status};
-use crate::server::ping::ping_pong_server::PingPongServer;
-use crate::server::raftproto::raft_server::RaftServer;
+use transport::ping::PingServer;
+use transport::raft::RaftServerImpl;
+use tonic::{Request, Response, Status, transport::Server};
+use transport::ping::ping::ping_pong_server::PingPongServer;
+use crate::transport::raft::raftproto::raft_server::RaftServer;
 use tokio::sync::{mpsc, Mutex};
 use log::{info, log, warn};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -30,13 +26,13 @@ use tracing::{callsite, field, Level, Metadata, Span};
 use tracing::field::ValueSet;
 use tracing::metadata::Kind;
 use tracing_opentelemetry::{OpenTelemetryLayer, OpenTelemetrySpanExt};
-use tracing_subscriber::{registry, layer::SubscriberExt, Registry, Layer};
+use tracing_subscriber::{Layer, layer::SubscriberExt, registry, Registry};
 use crate::config::config::{ClusterNode, read_config};
 use crate::persistence::worker::{PersistenceConfig, PersistenceResponseType, PersistenceTaskType, PersistenceWorker, VoteRow};
 use crate::query::worker::QueryRequest;
 use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask, QuorumWorker};
-use crate::raft::raft_sm::{OutstandingMessage, LocalRaftMessage, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig, CommitState};
-use crate::server::raftproto::RemoteQuorumMessage;
+use crate::raft::raft_sm::{CommitState, LocalRaftMessage, OutstandingMessage, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig};
+use crate::transport::raft::raftproto::RemoteQuorumMessage;
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils;
 use crate::service_utils::storage_utils::SerializationData;
@@ -62,6 +58,7 @@ mod raft {
     pub mod follower;
     pub mod candidate;
     pub mod leader;
+    pub mod state_machine_worker;
 }
 
 mod persistence {
@@ -84,6 +81,10 @@ mod transport {
     pub mod datastore;
     pub mod write_proxy;
     pub mod stream_manager;
+    pub mod raft;
+    pub mod ping;
+    pub mod metrics_server;
+    pub mod metrics;
 }
 
 mod client {
@@ -120,8 +121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opentelemetry::global::set_text_map_propagator(opentelemetry_zipkin::Propagator::new());
 
     // Initialize metrics
-    crate::metrics::register_metrics();
-    crate::metrics::initialize_metrics();
+    transport::metrics::register_metrics();
+    transport::metrics::initialize_metrics();
 
     let cfg = read_config()?;
     let node_id = cfg.node_id;
@@ -301,7 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let worker_handle = spawn_blocking(move ||{
-        let mut worker = server::QueueWorker::new(worker_queue, shared_state);
+        let mut worker = raft::state_machine_worker::StateMachineWorker::new(worker_queue, shared_state);
         worker.run();
         true
     });
@@ -328,7 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start metrics server
     let metrics_handle = tokio::spawn(async move {
-        if let Err(e) = crate::metrics_server::start_metrics_server(cfg.metrics_port as u16).await {
+        if let Err(e) = transport::metrics_server::start_metrics_server(cfg.metrics_port as u16).await {
             log::error!("Failed to start metrics server: {}", e);
         }
     });

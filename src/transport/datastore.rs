@@ -12,7 +12,7 @@ use log::{error, info, warn};
 use tokio::sync::oneshot::{Receiver, Sender};
 use crate::runtime_core::task_buffer::TaskBufferImpl;
 use crate::runtime_core::types::{Command, RuntimeTask, RuntimeTaskResponse, CommandType};
-use crate::server::raftproto::{RemotePutRequest, RemotePutResponse};
+use crate::transport::raft::raftproto::{RemotePutRequest, RemotePutResponse};
 use crate::service_utils::errors::ServiceError;
 use crate::raft::raft_sm::{RaftStateMachineExecutor, StateMachineExecutorImpl, RaftServerState, TermVote, RaftVolatileState, SharedState, LocalRaftMessage, LocalRaftMessagePayload, LocalRequestVoteRequest, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalAppendEntries, LocalRaftWriteBatchRequest, CommitState};
 use crossbeam_queue::SegQueue;
@@ -37,7 +37,7 @@ pub struct DatastoreServerImpl {
 impl Datastore for DatastoreServerImpl {
 
     async fn get_record(&self, request: Request<GetDataStoreRecordRequest>) -> Result<Response<GetDataStoreRecordResponse>, Status> {
-        let _timing_guard = crate::metrics::record_rpc_request("get_record");
+        let _timing_guard = crate::transport::metrics::record_rpc_request("get_record");
         let callback: (Sender<QueryResponse>, Receiver<QueryResponse>) = oneshot::channel();
         let commit_index = self.commit_state.commit_index.load(Ordering::Acquire);
         let term = self.commit_state.term.load(Ordering::Acquire);
@@ -81,7 +81,7 @@ impl Datastore for DatastoreServerImpl {
 
     #[instrument(skip_all)]
     async fn put_record(&self, request: Request<PutDataStoreRecordRequest>) -> Result<Response<PutDataStoreRecordResponse>, Status> {
-        let _timing_guard = crate::metrics::record_rpc_request("put_record");
+        let _timing_guard = crate::transport::metrics::record_rpc_request("put_record");
         tracing::debug!("received put_records request");
 
         let req = request.into_inner();

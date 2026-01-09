@@ -11,8 +11,8 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
 use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask};
 use crate::raft::follower::RaftFollowerStateDelegate;
-use crate::server::raftproto::{RemoteLogEntry, RemotePutRequest, RemotePutResponse};
-use crate::server::raftproto::raft_server::Raft;
+use crate::transport::raft::raftproto::{RemoteLogEntry, RemotePutRequest, RemotePutResponse};
+use crate::transport::raft::raftproto::raft_server::Raft;
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils::SerializationData;
 use crate::transport::write_proxy::{WriteBatch, WriteResponse};
@@ -95,7 +95,7 @@ pub struct StateMachineExecutorImpl {
 impl StateMachineExecutorImpl {
     pub fn new(shared_state: SharedState) -> Self {
         // Initialize metrics with current state
-        crate::metrics::update_raft_state_metrics(
+        crate::transport::metrics::update_raft_state_metrics(
             shared_state.volatile_server_state.commit_index,
             shared_state.server_state.leader_id,
             shared_state.server_state.current_term,

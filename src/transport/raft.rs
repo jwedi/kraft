@@ -3,15 +3,13 @@ use std::thread;
 use tonic::{transport::Server, Request, Response, Status};
 use tokio::sync::{mpsc, oneshot};
 
-use ping::ping_pong_server::{PingPong, PingPongServer};
-use ping::{PingRequest, PingResponse};
 use raftproto::raft_server::{Raft, RaftServer};
 use log::{info, warn};
 use tokio::sync::oneshot::{Receiver, Sender};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use crate::runtime_core::task_buffer::TaskBufferImpl;
 use crate::runtime_core::types::{Command, RuntimeTask, RuntimeTaskResponse, CommandType};
-use crate::server::raftproto::{RemoteAppendEntriesRequest, RemoteAppendEntriesResponse, RemoteVoteRequest, RemoteVoteResponse, RemotePutBatchRequest, RemotePutBatchResponse, RemotePutResponse, RemoteQuorumMessage, StreamResponse};
+use crate::transport::raft::raftproto::{RemoteAppendEntriesRequest, RemoteAppendEntriesResponse, RemoteVoteRequest, RemoteVoteResponse, RemotePutBatchRequest, RemotePutBatchResponse, RemotePutResponse, RemoteQuorumMessage, StreamResponse};
 use crate::service_utils::errors::ServiceError;
 use crate::raft::raft_sm::{RaftStateMachineExecutor, StateMachineExecutorImpl, RaftServerState, TermVote, RaftVolatileState, SharedState, LocalRaftMessage, LocalRaftMessagePayload, LocalRequestVoteRequest, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalAppendEntries, LocalRaftWriteBatchRequest, LocalAppendEntriesCallbackResponse};
 use crossbeam_queue::SegQueue;
@@ -19,66 +17,12 @@ use futures::FutureExt;
 use tokio::sync::oneshot::error::RecvError;
 use tracing::{instrument, Instrument, Level, Span};
 use crate::persistence::worker::PersistenceTaskType;
-use crate::server::raftproto::remote_quorum_message::MessagePayload;
+use crate::transport::raft::raftproto::remote_quorum_message::MessagePayload;
 use crate::transport::stream_manager::StreamManagerImpl;
 
-pub mod ping {
-    tonic::include_proto!("ping"); // The string specified here must match the proto package name
-}
 
 pub mod raftproto {
     tonic::include_proto!("raftproto"); // The string specified here must match the proto package name
-}
-
-#[derive(Debug, Default)]
-pub struct PingServer {}
-
-#[tonic::async_trait]
-impl PingPong for PingServer {
-    async fn ping(
-        &self,
-        request: Request<PingRequest>, // Accept request of type HelloRequest
-    ) -> Result<Response<PingResponse>, Status> { // Return an instance of type HelloReply
-        tracing::info!("received request");
-
-        let reply = PingResponse {
-        };
-
-        Ok(Response::new(reply)) // Send back our formatted greeting
-    }
-}
-
-pub struct QueueWorker {
-    work_queue: Arc<SegQueue<LocalRaftMessage>>,
-    state_machine: Box<StateMachineExecutorImpl>,
-}
-
-impl QueueWorker {
-    pub fn new(work_queue: Arc<SegQueue<LocalRaftMessage>>, shared_state: SharedState) -> Self {
-        Self {
-            work_queue,
-            state_machine: Box::new(StateMachineExecutorImpl::new(shared_state))
-        }
-    }
-
-    pub fn run(&mut self) {
-        log::info!("Running worker");
-        self.state_machine.initialize();
-        loop {
-            self.state_machine.time_step();
-            let task = self.work_queue.pop();
-
-            match task {
-                Some(task) => {
-                    self.state_machine.accept(task)
-                }
-                None => {
-                    let sleep_duration = core::time::Duration::from_micros(50);
-                    thread::sleep(sleep_duration)
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -107,7 +51,7 @@ impl Raft for RaftServerImpl {
 
     #[instrument]
     async fn put_batch(&self, request: Request<RemotePutBatchRequest>) -> Result<Response<RemotePutBatchResponse>, Status> {
-        let _timing_guard = crate::metrics::record_rpc_request("put_batch");
+        let _timing_guard = crate::transport::metrics::record_rpc_request("put_batch");
         tracing::info!("received put_batch request");
 
         let req = request.into_inner();
@@ -173,8 +117,8 @@ impl Raft for RaftServerImpl {
 
     #[instrument]
     async fn append_entries(&self, request: Request<RemoteAppendEntriesRequest>) -> Result<Response<RemoteAppendEntriesResponse>, Status> {
-        let _timing_guard = crate::metrics::record_rpc_request("append_entries");
-        crate::metrics::record_append_entries();
+        let _timing_guard = crate::transport::metrics::record_rpc_request("append_entries");
+        crate::transport::metrics::record_append_entries();
         tracing::debug!("received append_entries request");
         let req = request.into_inner();
         let callback: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
@@ -251,8 +195,8 @@ impl Raft for RaftServerImpl {
 
     #[instrument]
     async fn request_vote(&self, request: Request<RemoteVoteRequest>) -> Result<Response<RemoteVoteResponse>, Status> {
-        let _timing_guard = crate::metrics::record_rpc_request("request_vote");
-        crate::metrics::record_vote_request();
+        let _timing_guard = crate::transport::metrics::record_rpc_request("request_vote");
+        crate::transport::metrics::record_vote_request();
         tracing::info!("received request_vote request");
 
         let callback: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();

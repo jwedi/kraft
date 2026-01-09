@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
-use crate::metrics::METRICS_REGISTRY;
+use crate::transport::metrics::METRICS_REGISTRY;
 
 pub async fn start_metrics_server(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
