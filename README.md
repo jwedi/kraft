@@ -1,25 +1,5 @@
-
-Basic Rust implementation of the Raft consensus algorithm.
-
-
-TODOs
-- Ping gRPC server running, Done
-- Server running in Docker
-- Leader election, Done
-  - No-op AppendEntries heartbeats, Done
-- Persist state to disk. i.e Leader for current term, Done
-- Log replication, Done
-
-
-
-- Circle buffer with job commands, Done using Crossbeam
-- Sync writer, single reader, Done
-- Writers get index of buffer they can write to. (Sync increment index, cannot overrun the read index), N/A due to crossbeam segqueue
-- Reader smart batching, Done
-- Timer every N ms check if buffer is empty, if true, add hearbeat command, Done
-- Queueing commands return some sort of future value that is written to when the reader has processed the command and the writer can read from / await. Done using oneshot queues for callbacks.
-
-
+Distributed durable key-value database management system.
+The core is implemented using the Raft consensus algorithm and utilises leader election and log replication.
 
 Overall flow:
 Leader election:
@@ -37,33 +17,6 @@ Writes:
 - If server is not the master it forwards the request to the master. Done
   - The follower waits for a positive response from the leader and then returns with the result. Done
 - On response on channel it returns the response to the client. Done
-Reads: TODO
-- The server sends a read command to its local job queue.
-- The worker reads the commands and completes the request by reading from the state machine.
-- The worker then responds with the result to the response channel.
-- The server then returns the response to the client.
-- Something with commit index to not serve reads that haven't been replicated to a majority yet.
-
-
-AppendEntries:
-- Potentially unique payload per follower due to backfilling entries.
-- Leader prepares batch of entries from follower.matchIndex -> leader.currentIndex. TODO, no backfilling in place and always sends next
-- It sends AppendEntries to given follower
-  - with prevIndex and prevTerm taken from first entry in batch. Done?
-  - with lastCommitted taken from leader.commitIndex
-  - with leaderId taken from leader config. Done
-  - with term taken from leader.currentTerm. Done
-
-
-RequestVote: Done
-- Same payload for all followers. Done
-- It sends RequestVote to each follower: Done
-  - term being the new term, i.e old term +1. Done
-  - index of last entry applied. Done?
-  - term of last entry applied. Done?
-  - candidate id taken from server config. Done
-
-
 
 
 Performance thoughts.
@@ -105,45 +58,6 @@ Backfill and copy prevention:
 8. Backfill means that the restarted node tells the leader quorum worker it's last term + index, the quorum node looks up the term start index and fetches index = term_start + prev_index + 1.
 9. On leader write batch. Validate, create new sequence number, append to shared log, write message to actors. Actors read payload from log.
 
-Leader maintains a vec of all previous append entries requests or log entries.
-When a follower needs to backfill it sends a message to the leader with the last term and index it has.
-The leader finds the term start and calculates the index offset. It returns a slice of the log, a Vec<Arc<LogEntry>> that the follower can use to backfill.
-The followers instead of immediately issuing a append entries request when receiving a message from the leader, they add it to a local work backlog and each worker iteration it proceeds with the next entry.
-This way means that the worker only needs one flow for sending append entries request and doesn't get weird when backfilling is in progress.
-The quorum workers should get append entries requests as Arcs from the leader
-
-
-
-More TODOs
-- API needs to send message to worker to get the current leader id for writes. Done, not sure if caching is actually needed due to handling of the request on the state machine is just a hashmap lookup.
-  - Should locally cache response for a short period of time.
-  - Writes should only go to leader.
-  - 
-- API needs to put write requests onto internal queue and they need to be smart batched. Done
-- Whenever writes have been written to a quorum majority
-  - Internal datastructure like btree should be updated. TODO
-  - callback should fire to respond to API client. Done
-  - Some type of message should be sent to learner. TODO
-- Maybe during smart batch build one message containing all writes in the batch. Done
-- Insert pending message with payload that's all callbacks, on response respond to all callbacks. Done
-
-Having separate works queues for append entries and control messages would be convenient. Done
-Even if i did, i would still need to peek messages and potentially not take them.
-Maybe add a simple array buffer in the queue worker that's processed before the queue and where messages can be stored for later.
-
-Event loop {
-  pop message from array buffer.
-  if control message execute immediately
-  if append message, keep polling from array buffer until batch is full.
-  Maybe make a wrapper struct that wraps the SegQueue adds, peek, and nextAppendRequest.
-}
-
-
-Read flow
-1. Read request is sent to the internal read proxy (?)
-2. Read proxy reads data from internal datastructure (?)
-   3. If that's the case then how is the datastructure updated?
-   4. We don't want lock contention for each request, maybe the same single worker approach(?)
 
 Write flow. Done
 1. Write request is sent to write proxy
@@ -157,61 +71,7 @@ Write flow. Done
 9. It writes the serialized data to the persistence handler and all quorum workers.
 10. When data is persisted locally and on quorum of nodes it triggers the batch callback and notifies learners.
 
-
-TODOs update:
-1. Verify append entries prev index being sent correctly. Done
-2. Respect append entries prev index in follower, i.e don't commit if append entries prev index doesn't match follower last index. Done
-3. Some sort of backfilling in follower, notify leader of the services last index and term so that leader can send log entries for backfilling.
-4. Read log entries from disk on bootup and bootstrap config based on persisted log stuff. Done
-5. Fix log replication on restarted node. Currently starts up with previous log index being 0. Done
-6. Actually serialize real data and persist to disk. Done
-7. Metrics
-8. Metrics exporter
-9. Bidirectional stream for quorum workers. Ensures append log is delivered in-order. Maybe quorum worker try establish connections at random intervals. Done 
-- Phone exchange, node with highest id wins if duplicated streams.
-- Global stream manager with some locking for each bidirectional stream. IO is much more expensive than locking, especially for single writer, overhead should be negible.
-10. Rename to Kraft, Done
-11. Validate business logic on leader before commit
-12. Redo and initiate tracing for write proxy batch.
-13. Performance profiling. 
-14. Emit writes to learners?
-15. Send commit index in append entries after persisted on quorum of nodes.
-16. Implement query data structure for reads such as btree.
-17. Don't copy/allocate serialized data for persistence worker and quorum workers.
-- Might not even be possible with prost, doesn't sound like it by researching on the web.
-- Consider pure io_uring or glommio / monoio.
-
-TODOs update 2;
-1. Implement query data structure for reads such as btree.
-  - When commit index is updated, the associated log entry gets applied to the read data structure.
-2. Propagate commit index in append entries after persisted on quorum of nodes.
-3. Metrics / Tracing to help identify performance bottlenecks.
-4. Don't copy/allocate serialized data for persistence worker and quorum workers.
-   - Might not even be possible with prost, doesn't sound like it by researching on the web.
-   - Consider pure io_uring or glommio / monoio.
-5. Implement CRUD operations
-6. Refactor
-7. Rename since Kraft is taken already.
-
 Maybe when serving read requests the response is prepared but is only served when follower gets a hearbeat from the leader indicating that it's up to date.
-
-
-
-Commit index work:
-All nodes should append to the replication log after they've saved the data to disk.
-When the leader receives successful append entries responses from a quorum of nodes it should update the commit index.
-The current commit index should be sent in each append entries request.
-If a follower receives an append entries request with a higher commit index that its own, it should update it.
-
-When a node start up it should learn the commit index from the current leader.
-
-
-If a node that just started receives append entries request from the current leader with a prev index and term that's lower than its own.
-It should undo its own log last log entries until it reaches the prev index and term of the requestor.
-
-Candidate state should delegate to follower state if receiving append entries request from a valid leader. 
-Probably happens automatically given that the first request from the leader is always the heartbeat which would trigger a state change from Candidate.
-
 
 persistence worker, quorum worker, read worker all need concurrent read access to transaction log
 leader worker needs concurrent write access to transaction log.
