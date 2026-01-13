@@ -19,6 +19,12 @@ harness = false
 name = "kraft_lib"
 path = "src/main.rs"
 
+[profile.release]
+debug = true  # Includes debug symbols without affecting optimizations
+
+[profile.release.package."*"]
+debug = true
+
 [dependencies]
 tonic = "0.12.3"
 prost = "0.13"

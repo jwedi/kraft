@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::{io, thread};
 use std::io::{BufWriter, Bytes, Read, Write};
 use std::path::Path;
 use std::rc::Rc;
@@ -92,18 +92,17 @@ impl PersistenceWorker {
         loop {
             let queue_len = self.work_queue.len();
             if queue_len > 5 {
-                tracing::info!("Long persistence queue len: {}", queue_len);
+                log::info!("Long persistence queue len: {}", queue_len);
             }
             let task = self.work_queue.pop();
             match task {
                 Some(task) => {
-                    tracing::debug!("Received persistence task");
                     match task {
                         PersistenceTaskType::AppendVote{id, term, candidate_id, parent_span} => {
                             let span = tracing::span!(Level::INFO, "persistence_append_vote", id=id, term=term, candidate=candidate_id);
                             span.set_parent(parent_span.context());
                             let _enter = span.enter();
-                            tracing::info!("Saving vote message {}, term {}, candidate {}", id, term, candidate_id);
+                            log::info!("Saving vote message {}, term {}, candidate {}", id, term, candidate_id);
                             self.persist_vote(term, candidate_id, & mut vote_write_buffer).unwrap();
                             self.response_queue.push(PersistenceResponseType::VotePersisted{id, term, candidate_id})
                         }
@@ -121,16 +120,15 @@ impl PersistenceWorker {
                             let span = tracing::span!(Level::INFO, "persistence_append_log", id=id, bytes=data.len());
                             span.set_parent(parent_span.context());
                             let _enter = span.enter();
-                            tracing::info!("Appending log entry with id {} and data length {}", request_id, data.len());
+                            tracing::debug!("Appending log entry with id {} and data length {}", request_id, data.len());
                             self.append_log(data, & mut log_write_buffer).unwrap();
                             self.response_queue.push(PersistenceResponseType::LogPersisted{id});
-                            tracing::info!("Append log entry done");
+                            tracing::debug!("Append log entry done");
                         }
                     }
                 }
                 None => {
-                    // Condvar wait or sleep
-                    sleep(Duration::from_micros(1000))
+                    thread::yield_now()
                 }
             }
         }

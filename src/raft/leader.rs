@@ -146,7 +146,6 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             let req = RemoteAppendEntriesRequest {
                 term: shared_state.server_state.current_term,
                 leader_id: shared_state.server_state.leader_id,
-                entries: vec![],
                 prev_log_index: shared_state.volatile_server_state.last_log_index,
                 prev_log_term: shared_state.volatile_server_state.last_log_term,
                 request_id: message_id,

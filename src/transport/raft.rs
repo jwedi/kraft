@@ -127,7 +127,6 @@ impl Raft for RaftServerImpl {
             leader_id: req.leader_id,
             prev_index: req.prev_log_index,
             prev_term: req.prev_log_term,
-            entries: req.entries,
             request_id: req.request_id,
             entry: req.entry,
             commit_index: req.commit_index,

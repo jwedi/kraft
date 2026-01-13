@@ -29,8 +29,7 @@ impl StateMachineWorker {
                     self.state_machine.accept(task)
                 }
                 None => {
-                    let sleep_duration = core::time::Duration::from_micros(50);
-                    thread::sleep(sleep_duration)
+                    thread::yield_now()
                 }
             }
         }

@@ -6,10 +6,9 @@ message RemoteAppendEntriesRequest {
     uint32 leader_id = 2;
     uint64 prev_log_index = 3;
     uint64 prev_log_term = 4;
-    repeated RemoteLogEntry entries = 5; // TODO delete this
-    uint64 request_id = 6;
-    RemoteLogEntry entry = 7;
-    uint64 commit_index = 8;
+    uint64 request_id = 5;
+    RemoteLogEntry entry = 6;
+    uint64 commit_index = 7;
 }
 
 message RemoteAppendEntriesAcknowledge {
