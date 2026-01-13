@@ -5,8 +5,6 @@ use std::thread;
 use tonic::{transport::Server, Request, Response, Status};
 use tokio::sync::oneshot;
 use uuid::Uuid;
-
-
 use datastoreproto::datastore_server::{Datastore, DatastoreServer};
 use log::{error, info, warn};
 use tokio::sync::oneshot::{Receiver, Sender};
@@ -36,6 +34,7 @@ pub struct DatastoreServerImpl {
 #[tonic::async_trait]
 impl Datastore for DatastoreServerImpl {
 
+    #[instrument(skip_all)]
     async fn get_record(&self, request: Request<GetDataStoreRecordRequest>) -> Result<Response<GetDataStoreRecordResponse>, Status> {
         let _timing_guard = crate::transport::metrics::record_rpc_request("get_record");
         let callback: (Sender<QueryResponse>, Receiver<QueryResponse>) = oneshot::channel();

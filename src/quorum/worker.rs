@@ -6,6 +6,7 @@ use std::future::Future;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::{Arc, Condvar};
+use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 use arc_swap::ArcSwap;
@@ -14,6 +15,7 @@ use futures::{FutureExt, StreamExt, TryFuture};
 use log::{error, info};
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry_zipkin::Propagator;
+use time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, oneshot};
 use tokio::sync::mpsc::error::SendError;
@@ -163,6 +165,7 @@ impl QuorumWorker {
 
         loop {
             let current_time = now_millis();
+            let start_time = std::time::Instant::now();
             let mut maybe_receive_stream = self.stream_manager.get_receive_stream(self.member_id as u32).await;
             let mut maybe_send_stream = self.stream_manager.get_send_stream(self.member_id as u32).await;
 
@@ -382,7 +385,7 @@ impl QuorumWorker {
                                 self.commit_index = append_entries.commit_index;
 
                                 self.task_queue.push(LocalRaftMessage {
-                                    payload: LocalRaftMessagePayload::AppendEntries(LocalAppendEntries { leader_id: append_entries.leader_id, term: append_entries.term, prev_term: append_entries.prev_log_term, prev_index: append_entries.prev_log_index, entries: append_entries.entries, request_id: append_entries.request_id, entry: append_entries.entry, commit_index: append_entries.commit_index}),
+                                    payload: LocalRaftMessagePayload::AppendEntries(LocalAppendEntries { leader_id: append_entries.leader_id, term: append_entries.term, prev_term: append_entries.prev_log_term, prev_index: append_entries.prev_log_index, request_id: append_entries.request_id, entry: append_entries.entry, commit_index: append_entries.commit_index}),
                                     callback: callback.0,
                                     parent_span: span.clone()
 
@@ -518,7 +521,6 @@ impl QuorumWorker {
                     leader_id: self.self_id,
                     prev_log_index: self.prev_log_index,
                     prev_log_term: self.prev_log_term,
-                    entries: vec![],
                     request_id: 0,
                     entry: None,
                     commit_index: self.commit_index,
@@ -621,7 +623,6 @@ impl QuorumWorker {
                                         leader_id: self.self_id,
                                         prev_log_index: entry.prev_index,
                                         prev_log_term: entry.prev_term,
-                                        entries: vec![],
                                         request_id: entry.message_id,
                                         entry: Some(remote_entry),
                                         commit_index: self.commit_index,
@@ -704,9 +705,10 @@ impl QuorumWorker {
                 drop(send_stream);
                 self.stream_manager.reset_send_stream(self.member_id as u32).await;
             }
-            let elapsed = now_millis() - current_time;
-            if elapsed < 1 {
-                tokio::time::sleep(Duration::from_micros(500)).await;
+
+            let elapsed = start_time.elapsed().as_micros();
+            if elapsed < 200 {
+                thread::yield_now()
             }
         }
     }

@@ -72,9 +72,11 @@ pub fn deserialize_data(data: &[u8], offset: usize) -> Result<(usize, Serializat
         command_decoder.advance().expect("Expected command to be present when decoding");
         let key_coords = command_decoder.key_decoder();
         let key = command_decoder.key_slice(key_coords);
+        // TODO Optimise this, to string and from lossy is slow.
         let id = String::from_utf8_lossy(key).to_string();
         let value_coords = command_decoder.value_decoder();
         let value = command_decoder.value_slice(value_coords);
+        // TODO Optimise this
         let payload = String::from_utf8_lossy(value).to_string();
         requests.push(RemotePutRequest {
             id,

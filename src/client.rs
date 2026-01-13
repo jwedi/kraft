@@ -270,6 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let g = do_get_record_async();
 
         try_join!(g, w);
+        //try_join!(w);
 
         iterations += 1;
         if iterations % 10 == 0 {
