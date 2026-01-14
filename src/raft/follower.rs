@@ -432,7 +432,6 @@ mod tests {
             commit_index: 0,
             request_id: 1,
             entry: None,
-            entries: vec![]
         };
 
         let result = delegate.append_entries(req, tx, &mut shared_state);
@@ -460,7 +459,6 @@ mod tests {
             commit_index: 5,
             request_id: 0,
             entry: None,
-            entries: vec![]
         };
 
         let result = delegate.append_entries(req, tx, &mut shared_state);
@@ -512,7 +510,6 @@ mod tests {
                 prev_log_index: 0,
                 prev_log_term: 1,
             }),
-            entries: vec![]
         };
 
         let message_index = shared_state.next_message_id;

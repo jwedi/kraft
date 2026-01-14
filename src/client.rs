@@ -47,7 +47,6 @@ async fn do_append_entries() -> Result<(), Box<dyn std::error::Error>> {
         leader_id: 1,
         prev_log_index: 0,
         prev_log_term: 0,
-        entries: vec![],
         entry: Some(RemoteLogEntry {
             term: 1,
             index: 0,
@@ -222,7 +221,6 @@ async fn do_append_entries_async() -> Result<(), Box<dyn std::error::Error>> {
                 leader_id: 1,
                 prev_log_index: 0,
                 prev_log_term: 0,
-                entries: vec![],
                 entry: Some(RemoteLogEntry {
                     term: 1,
                     index: 0,

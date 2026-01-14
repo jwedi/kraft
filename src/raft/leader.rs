@@ -589,7 +589,6 @@ mod tests {
             commit_index: 0,
             request_id: 1,
             entry: None,
-            entries: vec![]
         };
 
         let result = delegate.append_entries(req, tx, &mut shared_state);
