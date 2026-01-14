@@ -13,10 +13,7 @@ use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub enum PersistenceTaskType {
-    WriteState{id: u64, span: Span},
-    ReadState{id: u64, span: Span},
     AppendVote{id: u64, term: u64, candidate_id: u32, parent_span: Span},
-    ReadVotes{id: u64, span: Span},
     AppendLog{id: u64, data: Arc<Vec<u8>>, parent_span: Span, request_id: u64},
 }
 
@@ -106,21 +103,6 @@ impl PersistenceWorker {
                             log::info!("Saving vote message {}, term {}, candidate {}", id, term, candidate_id);
                             self.persist_vote(term, candidate_id, &mut vote_write_buffer).unwrap();
                             self.response_queue.push(PersistenceResponseType::VotePersisted{id, term, candidate_id})
-                        }
-                        PersistenceTaskType::ReadVotes{id, span} => {
-                            // Flush any pending log writes before handling other tasks
-                            self.flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses).unwrap();
-                            let _enter = span.enter();
-                        }
-                        PersistenceTaskType::ReadState{id, span} => {
-                            // Flush any pending log writes before handling other tasks
-                            self.flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses).unwrap();
-                            let _enter = span.enter();
-                        }
-                        PersistenceTaskType::WriteState{id, span} => {
-                            // Flush any pending log writes before handling other tasks
-                            self.flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses).unwrap();
-                            let _enter = span.enter();
                         }
                         PersistenceTaskType::AppendLog {id, data, parent_span, request_id} => {
                             log::debug!("Appending log entry with id {} and data length {}", request_id, data.len());
