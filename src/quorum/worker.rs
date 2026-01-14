@@ -533,8 +533,8 @@ impl QuorumWorker {
         let pending_task = PendingQuorumTask {
             task: PendingQuorumTaskEnum::AppendEntries {
                 request_id: append_entries.request_id,
-                log_index: term,
-                term: index,
+                log_index: index,
+                term: term,
                 parent_span: span.clone(),
             },
             callback: callback.1,
