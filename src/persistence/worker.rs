@@ -13,19 +13,8 @@ use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub enum PersistenceTaskType {
-    WriteState{id: u64, span: Span},
-    ReadState{id: u64, span: Span},
     AppendVote{id: u64, term: u64, candidate_id: u32, parent_span: Span},
-    ReadVotes{id: u64, span: Span},
     AppendLog{id: u64, data: Arc<Vec<u8>>, parent_span: Span, request_id: u64},
-    // Can either be RC / Arc and immutable, or copied, or immutable and the persistence worker serializes while waiting for IO sync.
-    // Preparing next batch while waiting for IO sync seems reasonable.
-    // Now sure how to avoid IO if that's the case.
-    // If the input is immutable structs and the worker does the serialization then the persistence worker could reuse the same byte buffer.
-    // The caller wouldn't know the size of each entry though which makes batching harder. If the caller sends the serialized data then it knows the size and can properly batch it. I think that has to be the way to go.
-    // I can do some unsafe stuff, send an RC and then free the buffer when the persistence worker returns because i know that the persistence worker wouldn't be using the buffer anymore.
-    // Alternative is that the caller attaches the whole memory arena and the persistence worker is the one that clears it. So it's one allocation per batch.
-    // Writing data to the byte buffer still requires the writer to know the size of the entry before serializing it into the given buffer.
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -73,6 +62,9 @@ impl PersistenceWorker {
     pub fn run(&mut self) {
         tracing::info!("Running persistence worker");
 
+        // Batch size for accumulating AppendLog tasks before flushing
+        const BATCH_SIZE: usize = 32;
+
         let log_write_file_handle = OpenOptions::new()
             .write(true)
             .create(true)
@@ -89,6 +81,9 @@ impl PersistenceWorker {
             .unwrap();
         let mut vote_write_buffer = WriterBuilder::new().has_headers(false).from_writer(vote_write_file_handle);
 
+        // Track pending log responses for batched flushing
+        let mut pending_log_responses: Vec<PersistenceResponseType> = Vec::with_capacity(BATCH_SIZE);
+
         loop {
             let queue_len = self.work_queue.len();
             if queue_len > 5 {
@@ -99,21 +94,15 @@ impl PersistenceWorker {
                 Some(task) => {
                     match task {
                         PersistenceTaskType::AppendVote{id, term, candidate_id, parent_span} => {
+                            // Flush any pending log writes before handling vote
+                            self.flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses).unwrap();
+
                             let span = tracing::span!(Level::INFO, "persistence_append_vote", id=id, term=term, candidate=candidate_id);
                             span.set_parent(parent_span.context());
                             let _enter = span.enter();
                             log::info!("Saving vote message {}, term {}, candidate {}", id, term, candidate_id);
-                            self.persist_vote(term, candidate_id, & mut vote_write_buffer).unwrap();
+                            self.persist_vote(term, candidate_id, &mut vote_write_buffer).unwrap();
                             self.response_queue.push(PersistenceResponseType::VotePersisted{id, term, candidate_id})
-                        }
-                        PersistenceTaskType::ReadVotes{id, span} => {
-                            let _enter = span.enter();
-                        }
-                        PersistenceTaskType::ReadState{id, span} => {
-                            let _enter = span.enter();
-                        }
-                        PersistenceTaskType::WriteState{id, span} => {
-                            let _enter = span.enter();
                         }
                         PersistenceTaskType::AppendLog {id, data, parent_span, request_id} => {
                             log::debug!("Appending log entry with id {} and data length {}", request_id, data.len());
@@ -121,13 +110,27 @@ impl PersistenceWorker {
                             span.set_parent(parent_span.context());
                             let _enter = span.enter();
                             tracing::debug!("Appending log entry with id {} and data length {}", request_id, data.len());
-                            self.append_log(data, & mut log_write_buffer).unwrap();
-                            self.response_queue.push(PersistenceResponseType::LogPersisted{id});
+
+                            // Write to buffer without flushing
+                            self.write_log_entry(data, &mut log_write_buffer).unwrap();
+
+                            // Queue response for later (after flush)
+                            pending_log_responses.push(PersistenceResponseType::LogPersisted{id});
+
+                            // Flush if batch is full OR queue is empty (for low-latency when idle)
+                            if pending_log_responses.len() >= BATCH_SIZE || self.work_queue.is_empty() {
+                                let flushed = self.flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses).unwrap();
+                                if flushed > 1 {
+                                    tracing::debug!("Batched flush of {} log entries", flushed);
+                                }
+                            }
                             tracing::debug!("Append log entry done");
                         }
                     }
                 }
                 None => {
+                    // Queue empty - flush any pending writes to ensure durability
+                    self.flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses).unwrap();
                     thread::yield_now()
                 }
             }
@@ -143,10 +146,32 @@ impl PersistenceWorker {
         Ok(())
     }
 
-    fn append_log(&mut self, buffer: Arc<Vec<u8>>, file_handle: & mut BufWriter<File>) -> io::Result<()> {
+    /// Writes a log entry to the buffer without flushing.
+    /// Used for batching multiple writes before a single flush.
+    fn write_log_entry(&self, buffer: Arc<Vec<u8>>, file_handle: &mut BufWriter<File>) -> io::Result<()> {
         file_handle.write_all(&buffer)?;
-        file_handle.flush()?;
         Ok(())
+    }
+
+    /// Flushes pending log writes and sends all queued responses.
+    /// Returns the number of responses sent.
+    fn flush_pending_logs(
+        &self,
+        file_handle: &mut BufWriter<File>,
+        pending_responses: &mut Vec<PersistenceResponseType>,
+    ) -> io::Result<usize> {
+        if pending_responses.is_empty() {
+            return Ok(0);
+        }
+
+        file_handle.flush()?;
+
+        let count = pending_responses.len();
+        for resp in pending_responses.drain(..) {
+            self.response_queue.push(resp);
+        }
+
+        Ok(count)
     }
 
     pub fn read_votes(&mut self) -> Result<Vec<VoteRow>, Box<dyn Error>> {
