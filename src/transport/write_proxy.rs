@@ -320,8 +320,7 @@ impl WriteProxy {
             // Realistically, this is just stupid.
             // Something like a atomic integer that's shared between the write proxy and the state machine could also work.
 
-            //if current_leader_id <= 0 || leader_resync.elapsed().as_millis() > 10 {
-            if true {
+            if current_leader_id <= 0 || leader_resync.elapsed().as_millis() > 1 {
                 let span = Span::current();
                 let chan: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
                 let payload = LocalRaftMessagePayload::GetRaftState;
@@ -462,19 +461,5 @@ impl WriteProxy {
                 tokio::time::sleep(Duration::from_millis(self.min_batch_interval as u64)).await;
             }
         }
-
-        // Solution would only be scalable in terms of writes if leadership can be sharded?
-        // Alternatively 3 nodes are made into a mini-quorum for a key range. So N*3 nodes means N*100.000 RPS, that's decent.
-        // Cassandra does around 10.000 replicated RPS for a 3 node cluster.
-
-        // 100.000 RPS
-        // means 1000 requests per ms
-        // means 33.000 RPS per node in 3 node cluster
-        // means 333 requests per millisecond per node.
-
-        // means 1 request per millisecond for batches of 1000.
-        // means 4 requests per millisecond for batches of 250.
-        // 2 serial RPCs and 2 potentially concurrent disk IO per batch. Throughput of 100 batches per second.
-        // This is within the realm of reasonable
     }
 }
