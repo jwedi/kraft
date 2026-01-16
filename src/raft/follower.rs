@@ -89,10 +89,6 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
 
-            shared_state.volatile_server_state.commit_state.commit_index.store(0, Ordering::Release);
-            shared_state.volatile_server_state.commit_state.term.store(shared_state.server_state.current_term, Ordering::Release);
-            shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
-
             // Update Raft state metrics for new leader
             crate::transport::metrics::update_raft_state_metrics(
                 shared_state.volatile_server_state.commit_index,
@@ -101,7 +97,6 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 shared_state.volatile_server_state.replication_log.len()
             );
             shared_state.volatile_server_state.next_term = append_entries_request.term + 1;
-            shared_state.volatile_server_state.replication_log_term_starts.insert(shared_state.server_state.current_term, shared_state.volatile_server_state.replication_log.len() as u64);
 
             if let Some(entry) = append_entries_request.entry {
                 error!("Received append_entries request with entry when recognizing new leader, but follower should not have entries. Leader: {}, term: {}, index: {}", append_entries_request.leader_id, append_entries_request.term, entry.index);
@@ -129,12 +124,17 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                         }
                     ).expect("sending append_entries response callback failed");
                 } else {
-                    if append_entries_request.commit_index > shared_state.volatile_server_state.commit_index {
+                    // TODO commit index start at 0, for each term, we need to know if this is a new term or not.
+                    // If it's a new term we should enter here.
+                    if append_entries_request.commit_index > shared_state.volatile_server_state.commit_index || shared_state.volatile_server_state.commit_state.term.load(Ordering::Acquire) != append_entries_request.term {
                         shared_state.volatile_server_state.commit_index = append_entries_request.commit_index;
                         shared_state.volatile_server_state.commit_state.commit_index.store(append_entries_request.commit_index, Ordering::Release);
                         shared_state.volatile_server_state.commit_state.term.store(append_entries_request.term, Ordering::Release);
                         shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
                         log::info!("Updated commit index to {}", append_entries_request.commit_index);
+
+                        // Broadcast newly committed entries to query workers
+                        shared_state.broadcast_committed_entries(append_entries_request.commit_index, append_entries_request.term);
 
                         // Update metrics for commit index change
                         crate::transport::metrics::update_raft_state_metrics(
@@ -177,6 +177,10 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             let data = if let Some(entry) = append_entries_request.entry {
                 shared_state.volatile_server_state.last_log_index = entry.index;
                 shared_state.volatile_server_state.last_log_term = entry.term;
+                if entry.prev_log_term != entry.term {
+                    // First entry for new term
+                    shared_state.volatile_server_state.replication_log_term_starts.insert(entry.term, shared_state.volatile_server_state.replication_log.len() as u64);
+                }
                 log::debug!("updating last log term {} and index {}", entry.term, entry.index);
                 Arc::new(entry.data)
             } else {
@@ -194,7 +198,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 Ok((_, deserialized)) => {
                     let serialization_data = Arc::new(deserialized);
                     shared_state.volatile_server_state.replication_log.push(Arc::clone(&serialization_data));
-                    shared_state.log_entry_bus.broadcast(serialization_data);
+                    // Note: Bus broadcast is deferred until commit_index advances (committed entries only)
                 }
                 Err(e) => {
                     log::error!("Failed to deserialize append_entries data from leader: {}, term: {}, index: {}, error: {}", append_entries_request.leader_id, append_entries_request.term, append_entries_request.prev_index, e);
@@ -205,6 +209,9 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 shared_state.volatile_server_state.commit_state.commit_index.store(append_entries_request.commit_index, Ordering::Release);
                 shared_state.volatile_server_state.commit_state.term.store(append_entries_request.term, Ordering::Release);
                 shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+
+                // Broadcast newly committed entries to query workers
+                shared_state.broadcast_committed_entries(append_entries_request.commit_index, append_entries_request.term);
             }
 
             // Update metrics after processing new entry and commit index
@@ -295,30 +302,32 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                     log::info!("Received truncate log request from leader, truncating to term {} index {}", prev_term, prev_index);
                     self.truncate_log(shared_state, prev_term, prev_index);
 
-                    // Send truncate signal for commit state to rebuild query structure.
-                    shared_state.log_entry_bus.broadcast(Arc::new(SerializationData{
-                        index: u64::MAX,
-                        term: u64::MAX,
-                        timestamp: 0,
-                        prev_index: u64::MAX,
-                        prev_term: u64::MAX,
-                        message_id: u64::MAX,
-                        requests: vec![],
-                    }));
+                    // Note: No sentinel/rebuild needed for query workers because:
+                    // - We only broadcast committed entries to the bus
+                    // - Truncation only affects uncommitted entries
+                    // - Query workers never saw the truncated entries
 
-                    for log_entry in &shared_state.volatile_server_state.replication_log {
-                        shared_state.log_entry_bus.broadcast(Arc::clone(log_entry))
-                    }
-
-                    shared_state.volatile_server_state.commit_state.commit_index.store(prev_index, Ordering::Release);
-                    shared_state.volatile_server_state.commit_state.term.store(prev_term, Ordering::Release);
+                    // Update commit state (truncation only removes uncommitted entries, so commit_index should remain valid)
+                    // Note: In correct Raft semantics, committed entries are never truncated
                     shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
                     // After truncation, request backfill again
                     log::info!("After truncation, will request backfill from term {} index {}", prev_term, prev_index);
+                },
+                LocalQuorumTaskResponseType::RequestVoteResponse { .. } => {
+                    log::warn!("Received invalid quorum response message in current state: RequestVoteResponse");
+                }
+                LocalQuorumTaskResponseType::BackfillLog { .. } => {
+                    log::warn!("Received invalid quorum response message in current state: BackfillLog");
+                }
+                LocalQuorumTaskResponseType::AppendEntries { .. } => {
+                    log::warn!("Received invalid quorum response message in current state: AppendEntries");
+                }
+                LocalQuorumTaskResponseType::TruncateLogResponse { .. } => {
+                    log::warn!("Received invalid quorum response message in current state: TruncateLogResponse");
                 }
                 _ => {
-                    tracing::error!(message = "Received invalid quorum response message in current state");
+                    log::error!("Received invalid quorum response message in current state");
                 }
             }
         }
@@ -394,7 +403,8 @@ mod tests {
                     commit_index: AtomicU64::new(0),
                     term: AtomicU64::new(0),
                     version: AtomicU64::new(0),
-                })
+                }),
+                last_broadcast_index: None,
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),

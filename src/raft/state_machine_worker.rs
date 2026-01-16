@@ -19,7 +19,6 @@ impl StateMachineWorker {
 
     pub fn run(&mut self) {
         log::info!("Running worker");
-        self.state_machine.initialize();
         loop {
             self.state_machine.time_step();
             let task = self.work_queue.pop();

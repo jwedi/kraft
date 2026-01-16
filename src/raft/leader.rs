@@ -120,12 +120,13 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         let (limit, mut data) = serialize_data(&serialization_data, buffer, offset);
         tracing::info!("serialized data size: {}", limit);
         data.truncate(limit);
-        if idx == 0 {
+        if serialization_data.prev_term != serialization_data.term {
+            // First entry of new term.
             shared_state.volatile_server_state.replication_log_term_starts.insert(shared_state.server_state.current_term, shared_state.volatile_server_state.replication_log.len() as u64);
         }
         let arc_serialization_data = Arc::new(serialization_data);
         shared_state.volatile_server_state.replication_log.push(Arc::clone(&arc_serialization_data));
-        shared_state.log_entry_bus.broadcast(arc_serialization_data);
+        // Note: Bus broadcast is deferred until commit_index advances (committed entries only)
 
         // TODO no clone.
         let d = Arc::new(data.clone());
@@ -197,8 +198,6 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             let message_id = shared_state.next_message_id;
             shared_state.next_message_id += 1;
 
-            shared_state.volatile_server_state.replication_log_term_starts.insert(shared_state.server_state.current_term, shared_state.volatile_server_state.replication_log.len() as u64);
-
             shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
                 let task = LocalQuorumWorkerTaskType::StopHeartbeats{ id: message_id };
                 task_queue.push(LocalQuorumWorkerTask {task_type: task});
@@ -234,8 +233,8 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             shared_state.volatile_server_state.next_log_index = 0;
             shared_state.volatile_server_state.commit_index = 0;
 
-            shared_state.volatile_server_state.commit_state.commit_index.store(0, Ordering::Release);
-            shared_state.volatile_server_state.commit_state.term.store(shared_state.server_state.current_term, Ordering::Release);
+            shared_state.volatile_server_state.commit_state.commit_index.store(shared_state.volatile_server_state.last_log_index, Ordering::Release);
+            shared_state.volatile_server_state.commit_state.term.store(shared_state.volatile_server_state.last_log_term, Ordering::Release);
             shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
             // Update metrics for leader initialization
@@ -256,6 +255,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                 };
                 task_queue.push(LocalQuorumWorkerTask {task_type: task});
             });
+            // Broadcast committed entries to query workers. The leaders log is authoritative so we can commit all of them
+            shared_state.broadcast_committed_entries(shared_state.volatile_server_state.last_log_index, shared_state.volatile_server_state.last_log_term);
+
             self.initialized = true
         }
 
@@ -278,6 +280,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     shared_state.volatile_server_state.commit_state.commit_index.store(index, Ordering::Release);
                                     shared_state.volatile_server_state.commit_state.term.store(shared_state.server_state.current_term, Ordering::Release);
                                     shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+
+                                    // Broadcast newly committed entries to query workers
+                                    shared_state.broadcast_committed_entries(index, shared_state.server_state.current_term);
 
                                     // Update Raft state metrics
                                     crate::transport::metrics::update_raft_state_metrics(
@@ -368,6 +373,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                         shared_state.volatile_server_state.commit_state.commit_index.store(index, Ordering::Release);
                                         shared_state.volatile_server_state.commit_state.term.store(shared_state.server_state.current_term, Ordering::Release);
                                         shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+
+                                        // Broadcast newly committed entries to query workers
+                                        shared_state.broadcast_committed_entries(index, shared_state.server_state.current_term);
                                     }
 
                                     // Update Raft state metrics
@@ -410,7 +418,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                     }
                 }
                 LocalQuorumTaskResponseType::BackfillLog { quorum_node_id, prev_term, prev_index} => {
-                    log::info!("Received backfill log request for member {}, prev_term: {}, prev_index: {}", quorum_node_id, prev_term, prev_index);
+                    log::info!("Received backfill log request for member {}, prev_term: {}, prev_index: {}, head of log: term: {}, index: {}", quorum_node_id, prev_term, prev_index, shared_state.server_state.current_term, shared_state.volatile_server_state.last_log_index);
 
                     let start_index = if prev_term == 0 && prev_index == 0 {
                         0
@@ -445,8 +453,17 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                             }
                             None => {
                                 // We don't have any entries for the requested term
-                                log::info!("Leader doesn't have any entries for term {}, sending truncate signal", prev_term);
-                                self.send_truncate_signal(shared_state, quorum_node_id, prev_term, 0);
+                                // Find first term with data less than requested term and truncate to there.
+                                let mut highest_term_before_requested = 0;
+                                // Get highest index as well.
+                                for (&term, &start) in &shared_state.volatile_server_state.replication_log_term_starts {
+                                    if term > highest_term_before_requested && term < prev_term {
+                                        highest_term_before_requested = term
+                                    }
+                                }
+
+                                log::info!("Leader doesn't have any entries for term {}, sending truncate signal to term: {}", prev_term, highest_term_before_requested);
+                                self.send_truncate_signal(shared_state, quorum_node_id, highest_term_before_requested, 0);
                                 continue;
                             }
                         }
@@ -558,7 +575,8 @@ mod tests {
                     commit_index: AtomicU64::new(0),
                     version: AtomicU64::new(0),
                     term: AtomicU64::new(0),
-                })
+                }),
+                last_broadcast_index: None,
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),
@@ -697,8 +715,32 @@ mod tests {
         shared_state.server_state.current_term = 3;
         shared_state.server_state.leader_id = 0;
 
-        // Leader only has entries for term 3, no entries for term 2
-        shared_state.volatile_server_state.replication_log_term_starts.insert(3, 0);
+        shared_state.volatile_server_state.replication_log.push(
+            Arc::new(SerializationData{
+                index: 0,
+                term: 1,
+                timestamp: 0,
+                prev_index: 0,
+                prev_term: 0,
+                message_id: 0,
+                requests: vec![],
+            })
+        );
+        shared_state.volatile_server_state.replication_log.push(
+            Arc::new(SerializationData{
+                index: 0,
+                term: 3,
+                timestamp: 0,
+                prev_index: 0,
+                prev_term: 1,
+                message_id: 0,
+                requests: vec![],
+            })
+        );
+
+        // Leader only has entries for term 3 and 1, no entries for term 2
+        shared_state.volatile_server_state.replication_log_term_starts.insert(3, 1);
+        shared_state.volatile_server_state.replication_log_term_starts.insert(1, 0);
 
         // Set up quorum worker task queues
         shared_state.quorum_worker_tasks = vec![Arc::new(SegQueue::new()); 3];
@@ -724,8 +766,8 @@ mod tests {
         if let Some(task) = queue.pop() {
             match task.task_type {
                 LocalQuorumWorkerTaskType::TruncateLog { prev_term, prev_index, .. } => {
-                    assert_eq!(prev_term, 2);
-                    assert_eq!(prev_index, 0); // Should send 0 for unknown term
+                    assert_eq!(prev_term, 1); // Should truncate to the highest entry lower than the unknown term 2.
+                    assert_eq!(prev_index, 0);
                 }
                 _ => panic!("Expected TruncateLog task"),
             }
@@ -895,7 +937,8 @@ mod tests {
                     commit_index: AtomicU64::new(0),
                     term: AtomicU64::new(0),
                     version: AtomicU64::new(0),
-                })
+                }),
+                last_broadcast_index: None,
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),
@@ -951,6 +994,24 @@ mod tests {
         // Test that time_step handles LogPersisted and quorum ack correctly
         let mut delegate = RaftLeaderStateDelegate::new();
         let mut shared_state = create_shared_state_with_quorum();
+        shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData{
+            index: 0,
+            term: 1,
+            timestamp: 0,
+            prev_index: 0,
+            prev_term: 0,
+            message_id: 0,
+            requests: vec![],
+        }));
+        shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData{
+            index: 1,
+            term: 1,
+            timestamp: 0,
+            prev_index: 0,
+            prev_term: 0,
+            message_id: 0,
+            requests: vec![],
+        }));
 
         // Simulate an outstanding write batch message
         let (callback_tx, mut callback_rx) = oneshot::channel();
@@ -962,7 +1023,7 @@ mod tests {
                 persistence_done: false,
                 quorum_acks: 1,
                 callback: callback_tx,
-                index: 42,
+                index: 1,
                 start_time: Instant::now(),
                 batch_size: 0,
             },
@@ -978,7 +1039,7 @@ mod tests {
         let result = delegate.time_step(&mut shared_state);
 
         // Should have updated commit_index
-        assert_eq!(shared_state.volatile_server_state.commit_index, 42);
+        assert_eq!(shared_state.volatile_server_state.commit_index, 1);
 
         // Should have sent callback response
         let response = callback_rx.try_recv().unwrap();

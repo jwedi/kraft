@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use bus::BusReader;
 use crossbeam_queue::SegQueue;
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::sync::oneshot;
 use crate::client::cluster_node_client::SharedGrpcChannel;
 use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask};
@@ -60,8 +60,6 @@ impl QueryWorker {
                 let index = self.commit_state.commit_index.load(Ordering::Acquire);
                 let term = self.commit_state.term.load(Ordering::Acquire);
                 last_version = current_version;
-                applied_index = index;
-                applied_term = term;
 
                 let mut num_entries_applied = 0;
                 match parked.take() {
@@ -71,6 +69,8 @@ impl QueryWorker {
                             for req in parked_value.requests.iter() {
                                 self.query_structure.insert(req.id.clone(), Arc::new(req.payload.clone()));
                             }
+                            applied_term = parked_value.term;
+                            applied_index = parked_value.index;
                             num_entries_applied += 1;
                         } else {
                             parked = Some(parked_value)
@@ -84,6 +84,8 @@ impl QueryWorker {
                             if (val.term == term && val.index <= index) || (val.term < term) {
                                 for req in val.requests.iter() {
                                     self.query_structure.insert(req.id.clone(), Arc::new(req.payload.clone()));
+                                    applied_term = val.term;
+                                    applied_index = val.index;
                                 }
                             } else if val.term == u64::MAX && val.term == u64::MAX {
                                 // Truncate signal
@@ -103,7 +105,7 @@ impl QueryWorker {
                     }
                     num_entries_applied += 1
                 }
-                info!("Applied transaction log data to commit version: {}, number of updates applied {}", current_version, num_entries_applied)
+                debug!("Applied transaction log data to commit version: {}, number of updates applied {}", current_version, num_entries_applied)
             }
 
             // Process read requests

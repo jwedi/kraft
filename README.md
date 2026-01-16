@@ -102,3 +102,6 @@ Need to hook into a good place in the state machine where the first OK append en
 
 On follower truncate, reset commit state, send log entry over bus with 0 term, index and data and backfill from start.
 On boot backfill from start optimistically and only invalidate on truncate.
+
+
+TODO set term start after append entries if previous term != append entries term.
