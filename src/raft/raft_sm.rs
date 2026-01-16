@@ -5,7 +5,8 @@ use std::fmt::{Debug, Display, Formatter};
 use tokio::sync::oneshot;
 use crossbeam_queue::SegQueue;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
@@ -16,8 +17,10 @@ use crate::transport::raft::raftproto::raft_server::Raft;
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils::SerializationData;
 use crate::transport::write_proxy::{WriteBatch, WriteResponse};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use bus::Bus;
+use log::kv::Source;
+use log::warn;
 
 #[derive(Copy, Clone)]
 
@@ -43,7 +46,11 @@ pub struct RaftVolatileState {
     pub next_log_index: u64,
     pub replication_log: Vec<Arc<SerializationData>>,
     pub replication_log_term_starts: HashMap<u64, u64>,
-    pub commit_state: Arc<CommitState>
+    pub commit_state: Arc<CommitState>,
+    /// Tracks the highest log index that has been broadcast to the bus.
+    /// None means no entries have been broadcast yet.
+    /// Only committed entries are broadcast to ensure query workers never see truncated data.
+    pub last_broadcast_index: Option<u64>,
 }
 
 pub struct CommitState {
@@ -87,6 +94,80 @@ pub struct SharedState {
     pub log_entry_bus: Bus<Arc<SerializationData>>
 }
 
+impl SharedState {
+    /// Broadcasts committed log entries to the bus.
+    /// Only broadcasts entries that haven't been broadcast yet (between last_broadcast_index and new_commit_index).
+    /// This ensures query workers only see committed entries that will never be truncated.
+    pub fn broadcast_committed_entries(&mut self, new_commit_index: u64, term: u64) {
+        let broadcast_start = Instant::now();
+        // log indexes and thereby commit indexes reset per term, need to transform into absolute index first.
+        let absolute_commit_index = if let Some(term_start_index) = self.volatile_server_state.replication_log_term_starts.get(&term) {
+            *term_start_index + new_commit_index
+        } else {
+            log::error!("Couldn't get replication log term start for term: {}", term);
+            return
+        };
+        let start_index = match self.volatile_server_state.last_broadcast_index {
+            Some(last) => last + 1,
+            None => 0,
+        };
+
+        if start_index > absolute_commit_index {
+            return;
+        }
+
+        let mut last_broadcast_index = 0u64;
+        for i in start_index..=absolute_commit_index {
+            let idx = i as usize;
+            if let Some(entry) = self.volatile_server_state.replication_log.get(idx) {
+                let e = Arc::clone(entry);
+                match self.log_entry_bus.try_broadcast(e) {
+                    Ok(_) => {
+                        last_broadcast_index = i;
+                    }
+                    Err(_) => {
+                        last_broadcast_index = self.broadcast_commited_entries_when_bus_full(absolute_commit_index as usize, idx) as u64;
+                        break;
+                    }
+                }
+            } else {
+                warn!("Didnt find index {} in replication log of length {}", idx, self.volatile_server_state.replication_log.len())
+            }
+        }
+
+        self.volatile_server_state.last_broadcast_index = Some(last_broadcast_index);
+        self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+        let entries_broadcasted = last_broadcast_index - start_index;
+        let elapsed_millis = broadcast_start.elapsed().as_millis();
+        if elapsed_millis > 5 {
+            log::info!("Broadcasted {} entries in {} ms", entries_broadcasted, elapsed_millis)
+        }
+    }
+
+    fn broadcast_commited_entries_when_bus_full(&mut self, new_absolute_commit_index: usize, start_index: usize) -> usize {
+        self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+        let mut idx = start_index;
+        while idx <= new_absolute_commit_index {
+            if let Some(entry) = self.volatile_server_state.replication_log.get(idx) {
+                let e = Arc::clone(entry);
+                match self.log_entry_bus.try_broadcast(e) {
+                    Ok(_) => {
+                        idx += 1;
+                    }
+                    Err(_) => {
+                        self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+                        thread::yield_now();
+                    }
+                }
+            } else {
+                log::warn!("No replication log entry at index: {}, returning", idx);
+                return idx;
+            }
+        }
+        return new_absolute_commit_index;
+    }
+}
+
 pub struct StateMachineExecutorImpl {
     state_delegate: Box<dyn RaftProtocol>,
     shared_state: SharedState,
@@ -110,14 +191,6 @@ impl StateMachineExecutorImpl {
 }
 
 impl RaftStateMachineExecutor for StateMachineExecutorImpl {
-
-    fn initialize(&mut self) {
-        log::info!("Starting state machine initialize");
-        for entry in &self.shared_state.volatile_server_state.replication_log {
-            self.shared_state.log_entry_bus.broadcast(Arc::clone(entry));
-        }
-        log::info!("State machine initialize completed");
-    }
 
     fn time_step(&mut self) {
         let state_change = self.state_delegate.time_step(&mut self.shared_state);
@@ -218,8 +291,6 @@ pub trait RaftStateMachineExecutor {
     fn accept(&mut self, raft_message: LocalRaftMessage);
 
     fn time_step(&mut self);
-
-    fn initialize(&mut self);
 }
 
 // Per-state implementation of the Raft protocol. Handles requests, returns responses through callbacks and notifies about state changes.
@@ -398,7 +469,8 @@ mod integration_tests {
                     commit_index: AtomicU64::new(0),
                     term: AtomicU64::new(0),
                     version: AtomicU64::new(0),
-                })
+                }),
+                last_broadcast_index: None,
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),

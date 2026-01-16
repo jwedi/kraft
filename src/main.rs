@@ -206,7 +206,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_log_index: last_log_index + 1, // TODO this is probably stupid.
         replication_log,
         replication_log_term_starts: term_start_index,
-        commit_state: Arc::clone(&commit_state)
+        commit_state: Arc::clone(&commit_state),
+        last_broadcast_index: None,
     };
 
 

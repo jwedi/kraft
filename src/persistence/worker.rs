@@ -85,10 +85,6 @@ impl PersistenceWorker {
         let mut pending_log_responses: Vec<PersistenceResponseType> = Vec::with_capacity(BATCH_SIZE);
 
         loop {
-            let queue_len = self.work_queue.len();
-            if queue_len > 5 {
-                log::info!("Long persistence queue len: {}", queue_len);
-            }
             let task = self.work_queue.pop();
             match task {
                 Some(task) => {

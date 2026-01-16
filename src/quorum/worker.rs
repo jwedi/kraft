@@ -471,7 +471,7 @@ impl QuorumWorker {
                 };
                 self.response_queue.push(LocalQuorumResponse { response_type: resp });
             } else {
-                log::warn!("Ongoing backfill already in progress, ignoring new backfill request");
+                log::warn!("Ongoing backfill already in progress, ignoring new backfill request for term {} and index {}", append_entries.last_log_term, append_entries.last_log_index);
             }
         }
 
@@ -656,7 +656,7 @@ impl QuorumWorker {
             .expect("sending truncate response on stream shouldn't fail");
     }
 
-    fn on_remote_truncate_log_response(&self, truncate_response: RemoteTruncateLogResponse) {
+    fn on_remote_truncate_log_response(&mut self, truncate_response: RemoteTruncateLogResponse) {
         log::info!(
             "Received truncate log response for request {}, ok: {}",
             truncate_response.request_id,
@@ -667,6 +667,7 @@ impl QuorumWorker {
             ok: truncate_response.ok,
         };
         self.response_queue.push(LocalQuorumResponse { response_type: resp });
+        self.ongoing_backfill = None
     }
 
     // ============================================================================
@@ -990,7 +991,7 @@ impl QuorumWorker {
     fn process_work_queue(&mut self, send_stream: &SendStream) -> bool {
         let queue_len = self.work_queue.len();
         if queue_len > 5 {
-            log::info!(
+            log::debug!(
                 "Long quorum queue len: {}, member {} self id {}",
                 queue_len,
                 self.member_id,
@@ -1359,7 +1360,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_remote_truncate_log_response_pushes_to_queue() {
-        let (worker, _, response_queue, _) = create_test_worker();
+        let (mut worker, _, response_queue, _) = create_test_worker();
 
         let response = RemoteTruncateLogResponse {
             request_id: 42,
