@@ -422,13 +422,12 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                         log::warn!("Received quorum event with no outstanding message registered {}, maybe backfill", id);
                     }
                 }
-                LocalQuorumTaskResponseType::BackfillLog { quorum_node_id, prev_term, prev_index} => {
-                    log::info!("Received backfill log request for member {}, prev_term: {}, prev_index: {} (absolute), head of log: term: {}, index: {}", quorum_node_id, prev_term, prev_index, shared_state.server_state.current_term, shared_state.volatile_server_state.last_log_index);
-
+                LocalQuorumTaskResponseType::BackfillLog { quorum_node_id, last_log_term, last_log_index} => {
+                    log::info!("Received backfill log request for member {}, last_log_term: {}, last_log_index: {} (absolute), head of log: term: {}, index: {}", quorum_node_id, last_log_term, last_log_index, shared_state.server_state.current_term, shared_state.volatile_server_state.last_log_index);
                     let log_len = shared_state.volatile_server_state.replication_log.len() as u64;
 
                     // Check if the follower's prev_index is beyond our log
-                    if prev_index >= log_len {
+                    if last_log_index >= log_len {
                         // Follower has entries we don't have - send truncate signal to our last entry
                         let our_last_index = if log_len > 0 { log_len - 1 } else { 0 };
                         let our_last_term = if let Some(entry) = shared_state.volatile_server_state.replication_log.last() {
@@ -436,24 +435,24 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                         } else {
                             0
                         };
-                        log::info!("Leader doesn't have entry at index {}, sending truncate to index {}", prev_index, our_last_index);
+                        log::info!("Leader doesn't have entry at index {}, sending truncate to index {}", last_log_index, our_last_index);
                         self.send_truncate_signal(shared_state, quorum_node_id, our_last_term, our_last_index);
                         continue;
                     }
 
                     // Verify the term matches at the requested index
-                    if let Some(entry_at_index) = shared_state.volatile_server_state.replication_log.get(prev_index as usize) {
-                        if entry_at_index.term != prev_term {
-                            // Term mismatch - find the last entry where the term matches prev_term
+                    if let Some(entry_at_index) = shared_state.volatile_server_state.replication_log.get(last_log_index as usize) {
+                        if (entry_at_index.term != last_log_term) && (last_log_term != 0) { // Terms start from 1, log term of 0 means empty
+                            // Term mismatch - find the last entry where the term matches last_log_term
                             // (i.e., where the follower's log could agree with ours)
-                            let mut truncate_to = prev_index;
+                            let mut truncate_to = last_log_index;
                             let mut found_match = false;
                             while truncate_to > 0 {
                                 truncate_to -= 1;
                                 if let Some(entry) = shared_state.volatile_server_state.replication_log.get(truncate_to as usize) {
-                                    if entry.term == prev_term {
+                                    if entry.term == last_log_term {
                                         // Found entry with matching term
-                                        log::info!("Term mismatch at index {}, truncating follower to index {} term {}", prev_index, truncate_to, entry.term);
+                                        log::info!("Term mismatch at index {}, truncating follower to index {} term {}", last_log_index, truncate_to, entry.term);
                                         self.send_truncate_signal(shared_state, quorum_node_id, entry.term, truncate_to);
                                         found_match = true;
                                         break;
@@ -462,14 +461,15 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                             }
                             if !found_match {
                                 // No matching term found, truncate everything
+                                info!("No matching term found between leader and follower, sending truncate everything signal");
                                 self.send_truncate_signal(shared_state, quorum_node_id, 0, 0);
                             }
                             continue;
                         }
                     }
 
-                    // prev_index is valid and term matches, backfill from prev_index + 1
-                    let start_index = prev_index + 1;
+                    // log term 0 means empty replication log, so start from 0.
+                    let start_index = if last_log_term == 0 { 0 } else { last_log_index + 1}; // The no log entry has term 0, means start from 0.
 
                     let slice = shared_state.volatile_server_state.replication_log.as_slice();
                     log::info!("Backfilling from index: {} to {}", start_index, slice.len());
@@ -681,8 +681,8 @@ mod tests {
         shared_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 2,  // Follower thinks index 3 is term 2
-                prev_index: 3, // Absolute index
+                last_log_term: 2,  // Follower thinks index 3 is term 2
+                last_log_index: 3, // Absolute index
             }
         });
 
@@ -702,7 +702,7 @@ mod tests {
                     assert_eq!(prev_term, 2);
                     assert_eq!(prev_index, 2);
                 }
-                _ => panic!("Expected TruncateLog task"),
+                task => panic!("Expected TruncateLog task"),
             }
         } else {
             panic!("Expected task in queue");
@@ -755,8 +755,8 @@ mod tests {
         shared_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 2,
-                prev_index: 3,  // Absolute index beyond leader's log
+                last_log_term: 2,
+                last_log_index: 3,  // Absolute index beyond leader's log
             }
         });
 
@@ -814,8 +814,8 @@ mod tests {
         shared_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 2,
-                prev_index: 3,
+                last_log_term: 2,
+                last_log_index: 3,
             }
         });
 
@@ -981,7 +981,7 @@ mod tests {
         for queue in &shared_state.quorum_worker_tasks {
             let task = queue.pop().unwrap();
             match task.task_type {
-                LocalQuorumWorkerTaskType::StartHeartbeats { id, term, prev_term, prev_log_index } => {
+                LocalQuorumWorkerTaskType::StartHeartbeats { id, term, prev_term, prev_log_index, commit_index } => {
                     assert_eq!(id, 1);
                     assert_eq!(term, 1);
                     assert_eq!(prev_term, 1);
@@ -1093,8 +1093,8 @@ mod tests {
         shared_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 1,
-                prev_index: 0,  // Absolute index of follower's last entry
+                last_log_term: 1,
+                last_log_index: 0,  // Absolute index of follower's last entry
             }
         });
 

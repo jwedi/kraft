@@ -523,8 +523,8 @@ mod integration_tests {
         leader_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 2,
-                prev_index: 5, // Follower claims term 2 at index 5, but leader has term 3 there
+                last_log_term: 2,
+                last_log_index: 5, // Follower claims term 2 at index 5, but leader has term 3 there
             }
         });
 
@@ -589,8 +589,8 @@ mod integration_tests {
         leader_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 2,
-                prev_index: 3, // Now matches leader's log
+                last_log_term: 2,
+                last_log_index: 3, // Now matches leader's log
             }
         });
 
@@ -616,7 +616,7 @@ mod integration_tests {
         // With absolute indexing:
         // - Leader has 10 entries (indexes 0-9)
         // - Entries 0-2: term 2, entries 3-5: term 3, entries 6-9: term 4
-        // - Follower requests backfill at prev_term=3, prev_index=4 (entry at index 4 has term 3)
+        // - Follower requests backfill at last_log_term=3, prev_index=4 (entry at index 4 has term 3)
         // - Leader verifies term matches, sends backfill from index 5 onwards
         let mut leader_delegate = RaftLeaderStateDelegate::new();
         leader_delegate.initialized = true;
@@ -647,13 +647,13 @@ mod integration_tests {
         leader_state.volatile_server_state.last_log_term = 4;
         leader_state.volatile_server_state.next_log_index = 10;
 
-        // Follower requests backfill at prev_term=3, prev_index=4
+        // Follower requests backfill at last_log_term=3, prev_index=4
         // Entry at index 4 in leader's log has term 3, so this should match
         leader_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 3,
-                prev_index: 4, // Absolute index 4 has term 3 in leader's log
+                last_log_term: 3,
+                last_log_index: 4, // Absolute index 4 has term 3 in leader's log
             }
         });
 
@@ -712,8 +712,8 @@ mod integration_tests {
         leader_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 2,
-                prev_index: 4, // Entry at index 4 has term 2
+                last_log_term: 2,
+                last_log_index: 4, // Entry at index 4 has term 2
             }
         });
 
@@ -737,8 +737,8 @@ mod integration_tests {
         leader_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 2,
-                prev_index: 5, // Entry at index 5 has term 3, not term 2
+                last_log_term: 2,
+                last_log_index: 5, // Entry at index 5 has term 3, not term 2
             }
         });
 

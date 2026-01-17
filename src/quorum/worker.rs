@@ -61,7 +61,7 @@ pub enum LocalQuorumWorkerTaskType {
 pub enum LocalQuorumTaskResponseType {
     RequestVoteResponse{ id: u64, term: u64, received_vote: bool},
     AppendEntries{ id: u64, ok: bool}, // TODO get next index
-    BackfillLog{ quorum_node_id: u64, prev_term: u64, prev_index: u64},
+    BackfillLog{ quorum_node_id: u64, last_log_term: u64, last_log_index: u64},
     TruncateLog{ quorum_node_id: u64, prev_term: u64, prev_index: u64},
     TruncateLogResponse{ id: u64, ok: bool}
 }
@@ -467,8 +467,8 @@ impl QuorumWorker {
                 });
                 let resp = LocalQuorumTaskResponseType::BackfillLog {
                     quorum_node_id: self.member_id,
-                    prev_term: append_entries.last_log_term,
-                    prev_index: append_entries.last_log_index,
+                    last_log_term: append_entries.last_log_term,
+                    last_log_index: append_entries.last_log_index,
                 };
                 self.response_queue.push(LocalQuorumResponse { response_type: resp });
             } else {
@@ -1107,6 +1107,7 @@ mod tests {
                 term: 5,
                 prev_term: 4,
                 prev_log_index: 10,
+                commit_index: 10
             },
         });
 
@@ -1285,10 +1286,10 @@ mod tests {
         // Verify response was pushed
         let response = response_queue.pop().expect("Should have response in queue");
         match response.response_type {
-            LocalQuorumTaskResponseType::BackfillLog { quorum_node_id, prev_term, prev_index } => {
+            LocalQuorumTaskResponseType::BackfillLog { quorum_node_id, last_log_term, last_log_index } => {
                 assert_eq!(quorum_node_id, 2); // member_id
-                assert_eq!(prev_term, 2);
-                assert_eq!(prev_index, 5);
+                assert_eq!(last_log_term, 2);
+                assert_eq!(last_log_index, 5);
             }
             _ => panic!("Expected BackfillLog response"),
         }
