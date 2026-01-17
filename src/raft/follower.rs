@@ -39,34 +39,29 @@ impl RaftFollowerStateDelegate {
     }
 
     fn truncate_log(&self, shared_state: &mut SharedState, prev_term: u64, prev_index: u64) {
-        log::info!("Truncating log to term {} index {}", prev_term, prev_index);
+        log::info!("Truncating log to term {} index {} (absolute)", prev_term, prev_index);
 
-        // Find the term start for the given term
-        if let Some(&term_start) = shared_state.volatile_server_state.replication_log_term_starts.get(&prev_term) {
-            let target_length = (term_start + prev_index + 1) as usize;
+        let target_length = (prev_index + 1) as usize;
 
-            // Truncate the replication log to the specified point
-            if target_length < shared_state.volatile_server_state.replication_log.len() {
-                shared_state.volatile_server_state.replication_log.truncate(target_length);
-                log::info!("Truncated replication log to length {}", target_length);
+        // Truncate the replication log to the specified point
+        if target_length < shared_state.volatile_server_state.replication_log.len() {
+            shared_state.volatile_server_state.replication_log.truncate(target_length);
+            log::info!("Truncated replication log to length {}", target_length);
 
-                // Update the volatile state to reflect the new log end
-                shared_state.volatile_server_state.last_log_term = prev_term;
-                shared_state.volatile_server_state.last_log_index = prev_index;
-                shared_state.volatile_server_state.next_log_index = prev_index + 1;
+            // Update the volatile state to reflect the new log end
+            shared_state.volatile_server_state.last_log_term = prev_term;
+            shared_state.volatile_server_state.last_log_index = prev_index;
+            shared_state.volatile_server_state.next_log_index = prev_index + 1;
 
-                // Remove any term starts that are beyond the truncation point
-                shared_state.volatile_server_state.replication_log_term_starts.retain(|_term, start| {
-                    *start <= term_start + prev_index
-                });
+            // Remove any term starts that are beyond the truncation point
+            shared_state.volatile_server_state.replication_log_term_starts.retain(|_term, start| {
+                *start <= prev_index
+            });
 
-                log::info!("Updated log state: last_log_term={}, last_log_index={}, next_log_index={}",
-                          shared_state.volatile_server_state.last_log_term,
-                          shared_state.volatile_server_state.last_log_index,
-                          shared_state.volatile_server_state.next_log_index);
-            }
-        } else {
-            log::warn!("Cannot truncate to unknown term {}", prev_term);
+            log::info!("Updated log state: last_log_term={}, last_log_index={}, next_log_index={}",
+                      shared_state.volatile_server_state.last_log_term,
+                      shared_state.volatile_server_state.last_log_index,
+                      shared_state.volatile_server_state.next_log_index);
         }
     }
 }
@@ -134,7 +129,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                         log::info!("Updated commit index to {}", append_entries_request.commit_index);
 
                         // Broadcast newly committed entries to query workers
-                        shared_state.broadcast_committed_entries(append_entries_request.commit_index, append_entries_request.term);
+                        shared_state.broadcast_committed_entries(append_entries_request.commit_index);
 
                         // Update metrics for commit index change
                         crate::transport::metrics::update_raft_state_metrics(
@@ -211,7 +206,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
                 // Broadcast newly committed entries to query workers
-                shared_state.broadcast_committed_entries(append_entries_request.commit_index, append_entries_request.term);
+                shared_state.broadcast_committed_entries(append_entries_request.commit_index);
             }
 
             // Update metrics after processing new entry and commit index
@@ -586,20 +581,20 @@ mod tests {
         let delegate = RaftFollowerStateDelegate::new();
         let mut shared_state = create_shared_state();
 
-        // Set up a log with multiple terms
+        // Set up a log with multiple terms using absolute indexing
         shared_state.volatile_server_state.replication_log_term_starts.insert(1, 0);
         shared_state.volatile_server_state.replication_log_term_starts.insert(2, 3);
         shared_state.volatile_server_state.replication_log_term_starts.insert(3, 8);
 
-        // Add log entries for terms 1, 2, and 3
-        for i in 0..12 {
+        // Add log entries for terms 1, 2, and 3 with absolute indexes
+        for i in 0..12u64 {
             shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
                 term: if i < 3 { 1 } else if i < 8 { 2 } else { 3 },
                 timestamp: 0,
-                prev_index: 0,
-                prev_term: 0,
-                index: i,
+                prev_index: if i > 0 { i - 1 } else { 0 },
+                prev_term: if i < 3 { 1 } else if i < 8 { 2 } else { 3 },
+                index: i,  // Absolute index
                 message_id: i,
             }));
         }
@@ -608,14 +603,14 @@ mod tests {
         shared_state.volatile_server_state.last_log_index = 11;
         shared_state.volatile_server_state.next_log_index = 12;
 
-        // Truncate to term 2, index 1 (should keep entries 0,1,2,3,4)
-        delegate.truncate_log(&mut shared_state, 2, 1);
+        // Truncate to term 2 at absolute index 4 (should keep entries 0,1,2,3,4)
+        delegate.truncate_log(&mut shared_state, 2, 4);
 
         // Verify log was truncated correctly
         assert_eq!(shared_state.volatile_server_state.replication_log.len(), 5);
         assert_eq!(shared_state.volatile_server_state.last_log_term, 2);
-        assert_eq!(shared_state.volatile_server_state.last_log_index, 1);
-        assert_eq!(shared_state.volatile_server_state.next_log_index, 2);
+        assert_eq!(shared_state.volatile_server_state.last_log_index, 4);  // Absolute index
+        assert_eq!(shared_state.volatile_server_state.next_log_index, 5);
 
         // Verify term starts were cleaned up - should only have terms 1 and 2
         assert!(shared_state.volatile_server_state.replication_log_term_starts.contains_key(&1));
@@ -661,19 +656,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_truncate_log_unknown_term_warning() {
+    async fn test_truncate_log_with_absolute_index() {
+        // With absolute indexing, truncation works using the absolute index directly
+        // The term is just metadata, not used for index lookup
         let delegate = RaftFollowerStateDelegate::new();
         let mut shared_state = create_shared_state();
 
         // Set up a log with only term 3
         shared_state.volatile_server_state.replication_log_term_starts.insert(3, 0);
-        for i in 0..5 {
+        for i in 0..5u64 {
             shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
                 term: 3,
                 timestamp: 0,
-                prev_index: 0,
-                prev_term: 0,
+                prev_index: if i > 0 { i - 1 } else { 0 },
+                prev_term: 3,
                 index: i,
                 message_id: i,
             }));
@@ -682,15 +679,13 @@ mod tests {
         shared_state.volatile_server_state.last_log_term = 3;
         shared_state.volatile_server_state.last_log_index = 4;
 
-        let original_len = shared_state.volatile_server_state.replication_log.len();
+        // Truncate to absolute index 1 (keeps entries 0, 1)
+        delegate.truncate_log(&mut shared_state, 3, 1);
 
-        // Try to truncate to unknown term 2
-        delegate.truncate_log(&mut shared_state, 2, 1);
-
-        // Should not modify the log since term 2 is unknown
-        assert_eq!(shared_state.volatile_server_state.replication_log.len(), original_len);
+        // With absolute indexing, truncation happens at the specified absolute index
+        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 2);
         assert_eq!(shared_state.volatile_server_state.last_log_term, 3);
-        assert_eq!(shared_state.volatile_server_state.last_log_index, 4);
+        assert_eq!(shared_state.volatile_server_state.last_log_index, 1);
     }
 
     #[tokio::test]

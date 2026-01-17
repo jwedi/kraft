@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use crossbeam_queue::SegQueue;
+use log::info;
 use prost::bytes::{BufMut, Bytes};
 use rand::Rng;
 use rand::rngs::ThreadRng;
@@ -230,8 +231,11 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         if !self.initialized {
             let message_id = shared_state.next_message_id;
             shared_state.next_message_id += 1;
-            shared_state.volatile_server_state.next_log_index = 0;
-            shared_state.volatile_server_state.commit_index = 0;
+            let log_len = shared_state.volatile_server_state.replication_log.len() as u64;
+            shared_state.volatile_server_state.next_log_index = log_len;
+            // commit_index should be last_log_index since leader's log is authoritative
+            shared_state.volatile_server_state.commit_index = shared_state.volatile_server_state.last_log_index;
+            info!("Initializing leader with commit index: {}", shared_state.volatile_server_state.commit_index);
 
             shared_state.volatile_server_state.commit_state.commit_index.store(shared_state.volatile_server_state.last_log_index, Ordering::Release);
             shared_state.volatile_server_state.commit_state.term.store(shared_state.volatile_server_state.last_log_term, Ordering::Release);
@@ -251,12 +255,13 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                     id: message_id,
                     term: shared_state.server_state.current_term,
                     prev_term: shared_state.volatile_server_state.last_log_term,
-                    prev_log_index: shared_state.volatile_server_state.last_log_index
+                    prev_log_index: shared_state.volatile_server_state.last_log_index,
+                    commit_index: shared_state.volatile_server_state.commit_index
                 };
                 task_queue.push(LocalQuorumWorkerTask {task_type: task});
             });
             // Broadcast committed entries to query workers. The leaders log is authoritative so we can commit all of them
-            shared_state.broadcast_committed_entries(shared_state.volatile_server_state.last_log_index, shared_state.volatile_server_state.last_log_term);
+            shared_state.broadcast_committed_entries(shared_state.volatile_server_state.last_log_index);
 
             self.initialized = true
         }
@@ -282,7 +287,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
                                     // Broadcast newly committed entries to query workers
-                                    shared_state.broadcast_committed_entries(index, shared_state.server_state.current_term);
+                                    shared_state.broadcast_committed_entries(index);
 
                                     // Update Raft state metrics
                                     crate::transport::metrics::update_raft_state_metrics(
@@ -375,7 +380,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                         shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
                                         // Broadcast newly committed entries to query workers
-                                        shared_state.broadcast_committed_entries(index, shared_state.server_state.current_term);
+                                        shared_state.broadcast_committed_entries(index);
                                     }
 
                                     // Update Raft state metrics
@@ -417,57 +422,54 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                         log::warn!("Received quorum event with no outstanding message registered {}, maybe backfill", id);
                     }
                 }
-                LocalQuorumTaskResponseType::BackfillLog { quorum_node_id, prev_term, prev_index} => {
-                    log::info!("Received backfill log request for member {}, prev_term: {}, prev_index: {}, head of log: term: {}, index: {}", quorum_node_id, prev_term, prev_index, shared_state.server_state.current_term, shared_state.volatile_server_state.last_log_index);
+                LocalQuorumTaskResponseType::BackfillLog { quorum_node_id, last_log_term, last_log_index} => {
+                    log::info!("Received backfill log request for member {}, last_log_term: {}, last_log_index: {} (absolute), head of log: term: {}, index: {}", quorum_node_id, last_log_term, last_log_index, shared_state.server_state.current_term, shared_state.volatile_server_state.last_log_index);
+                    let log_len = shared_state.volatile_server_state.replication_log.len() as u64;
 
-                    let start_index = if prev_term == 0 && prev_index == 0 {
-                        0
-                    } else {
-                        // Check if we have entries for the requested term
-                        match shared_state.volatile_server_state.replication_log_term_starts.get(&prev_term) {
-                            Some(term_start) => {
-                                // Calculate the end index for this term by looking at the next term's start
-                                let term_end = {
-                                    let mut next_term_start = shared_state.volatile_server_state.replication_log.len() as u64;
-                                    for (&term, &start) in &shared_state.volatile_server_state.replication_log_term_starts {
-                                        if term > prev_term && start < next_term_start {
-                                            next_term_start = start;
-                                        }
-                                    }
-                                    next_term_start
-                                };
+                    // Check if the follower's prev_index is beyond our log
+                    if last_log_index >= log_len {
+                        // Follower has entries we don't have - send truncate signal to our last entry
+                        let our_last_index = if log_len > 0 { log_len - 1 } else { 0 };
+                        let our_last_term = if let Some(entry) = shared_state.volatile_server_state.replication_log.last() {
+                            entry.term
+                        } else {
+                            0
+                        };
+                        log::info!("Leader doesn't have entry at index {}, sending truncate to index {}", last_log_index, our_last_index);
+                        self.send_truncate_signal(shared_state, quorum_node_id, our_last_term, our_last_index);
+                        continue;
+                    }
 
-                                let requested_absolute_index = term_start + prev_index;
-
-                                // Check if we have the requested entry for this term
-                                if requested_absolute_index < term_end {
-                                    term_start + prev_index + 1
-                                } else {
-                                    // We don't have entries up to the requested index for this term
-                                    // Find the last entry we have for this term and send truncate signal
-                                    let last_index_for_term = if term_end > *term_start { term_end - term_start - 1 } else { 0 };
-                                    log::info!("Leader doesn't have entries up to index {} for term {}, last available index for term: {}", prev_index, prev_term, last_index_for_term);
-                                    self.send_truncate_signal(shared_state, quorum_node_id, prev_term, last_index_for_term);
-                                    continue;
-                                }
-                            }
-                            None => {
-                                // We don't have any entries for the requested term
-                                // Find first term with data less than requested term and truncate to there.
-                                let mut highest_term_before_requested = 0;
-                                // Get highest index as well.
-                                for (&term, &start) in &shared_state.volatile_server_state.replication_log_term_starts {
-                                    if term > highest_term_before_requested && term < prev_term {
-                                        highest_term_before_requested = term
+                    // Verify the term matches at the requested index
+                    if let Some(entry_at_index) = shared_state.volatile_server_state.replication_log.get(last_log_index as usize) {
+                        if (entry_at_index.term != last_log_term) && (last_log_term != 0) { // Terms start from 1, log term of 0 means empty
+                            // Term mismatch - find the last entry where the term matches last_log_term
+                            // (i.e., where the follower's log could agree with ours)
+                            let mut truncate_to = last_log_index;
+                            let mut found_match = false;
+                            while truncate_to > 0 {
+                                truncate_to -= 1;
+                                if let Some(entry) = shared_state.volatile_server_state.replication_log.get(truncate_to as usize) {
+                                    if entry.term == last_log_term {
+                                        // Found entry with matching term
+                                        log::info!("Term mismatch at index {}, truncating follower to index {} term {}", last_log_index, truncate_to, entry.term);
+                                        self.send_truncate_signal(shared_state, quorum_node_id, entry.term, truncate_to);
+                                        found_match = true;
+                                        break;
                                     }
                                 }
-
-                                log::info!("Leader doesn't have any entries for term {}, sending truncate signal to term: {}", prev_term, highest_term_before_requested);
-                                self.send_truncate_signal(shared_state, quorum_node_id, highest_term_before_requested, 0);
-                                continue;
                             }
+                            if !found_match {
+                                // No matching term found, truncate everything
+                                info!("No matching term found between leader and follower, sending truncate everything signal");
+                                self.send_truncate_signal(shared_state, quorum_node_id, 0, 0);
+                            }
+                            continue;
                         }
-                    };
+                    }
+
+                    // log term 0 means empty replication log, so start from 0.
+                    let start_index = if last_log_term == 0 { 0 } else { last_log_index + 1}; // The no log entry has term 0, means start from 0.
 
                     let slice = shared_state.volatile_server_state.replication_log.as_slice();
                     log::info!("Backfilling from index: {} to {}", start_index, slice.len());
@@ -643,7 +645,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_backfill_request_sends_truncate_signal_when_leader_missing_entries() {
+    async fn test_backfill_request_sends_truncate_signal_on_term_mismatch() {
+        // With absolute indexing, when follower's entry at prev_index has a different term
+        // than what the leader has, leader sends truncate
         let mut delegate = RaftLeaderStateDelegate::new();
         delegate.initialized = true;
         let mut shared_state = create_shared_state();
@@ -653,32 +657,32 @@ mod tests {
         shared_state.server_state.leader_id = 0;
         shared_state.volatile_server_state.next_term = 4;
 
-        // Leader only has entries for term 2 up to index 2 (term_start=10, so absolute indices 10,11,12)
-        shared_state.volatile_server_state.replication_log_term_starts.insert(2, 10);
-        shared_state.volatile_server_state.replication_log_term_starts.insert(3, 13);
+        // Leader has 5 entries: 3 in term 2, then 2 in term 3
+        shared_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
+        shared_state.volatile_server_state.replication_log_term_starts.insert(3, 3);
 
-        // Add some dummy log entries
-        for _ in 0..15 {
+        for i in 0..5u64 {
             shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
                 requests: vec![],
-                term: 2,
+                term: if i < 3 { 2 } else { 3 },
                 timestamp: 0,
-                prev_index: 0,
-                prev_term: 0,
-                index: 0,
-                message_id: 0,
+                prev_index: if i > 0 { i - 1 } else { 0 },
+                prev_term: if i < 3 { 2 } else if i == 3 { 2 } else { 3 },
+                index: i,  // Absolute index
+                message_id: i,
             }));
         }
 
         // Set up quorum worker task queues
         shared_state.quorum_worker_tasks = vec![Arc::new(SegQueue::new()); 3];
 
-        // Follower requests backfill for term 2 index 5 (but leader only has up to index 2)
+        // Follower requests backfill at absolute index 3 but claims it's term 2
+        // Leader has term 3 at index 3, so there's a term mismatch
         shared_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 2,
-                prev_index: 5, // Leader doesn't have this index for term 2
+                last_log_term: 2,  // Follower thinks index 3 is term 2
+                last_log_index: 3, // Absolute index
             }
         });
 
@@ -687,18 +691,18 @@ mod tests {
         // Should remain leader
         assert!(matches!(result, RaftMessageStateChange::None));
 
-        // Should have sent a truncate signal
-        let queue = &shared_state.quorum_worker_tasks[0]; // quorum_node_id 1 maps to index 0
+        // Should have sent a truncate signal to the last matching entry
+        let queue = &shared_state.quorum_worker_tasks[0];
         assert_eq!(queue.len(), 1);
 
         if let Some(task) = queue.pop() {
             match task.task_type {
-                LocalQuorumWorkerTaskType::TruncateLog { id, prev_term, prev_index, .. } => {
+                LocalQuorumWorkerTaskType::TruncateLog { prev_term, prev_index, .. } => {
+                    // Should truncate to index 2 (last entry of term 2)
                     assert_eq!(prev_term, 2);
-                    assert_eq!(prev_index, 2); // Last index leader has for term 2
-                    assert!(id > 0); // Should have a valid message ID
+                    assert_eq!(prev_index, 2);
                 }
-                _ => panic!("Expected TruncateLog task"),
+                task => panic!("Expected TruncateLog task"),
             }
         } else {
             panic!("Expected task in queue");
@@ -706,7 +710,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_backfill_request_sends_truncate_for_unknown_term() {
+    async fn test_backfill_request_sends_truncate_when_follower_ahead() {
+        // With absolute indexing, when follower's prev_index is beyond leader's log,
+        // leader sends truncate to its last entry
         let mut delegate = RaftLeaderStateDelegate::new();
         delegate.initialized = true;
         let mut shared_state = create_shared_state();
@@ -715,9 +721,10 @@ mod tests {
         shared_state.server_state.current_term = 3;
         shared_state.server_state.leader_id = 0;
 
+        // Leader has 2 entries at absolute indexes 0 and 1
         shared_state.volatile_server_state.replication_log.push(
             Arc::new(SerializationData{
-                index: 0,
+                index: 0,  // Absolute index
                 term: 1,
                 timestamp: 0,
                 prev_index: 0,
@@ -728,7 +735,7 @@ mod tests {
         );
         shared_state.volatile_server_state.replication_log.push(
             Arc::new(SerializationData{
-                index: 0,
+                index: 1,  // Absolute index
                 term: 3,
                 timestamp: 0,
                 prev_index: 0,
@@ -738,19 +745,18 @@ mod tests {
             })
         );
 
-        // Leader only has entries for term 3 and 1, no entries for term 2
         shared_state.volatile_server_state.replication_log_term_starts.insert(3, 1);
         shared_state.volatile_server_state.replication_log_term_starts.insert(1, 0);
 
         // Set up quorum worker task queues
         shared_state.quorum_worker_tasks = vec![Arc::new(SegQueue::new()); 3];
 
-        // Follower requests backfill for unknown term 2
+        // Follower requests backfill at absolute index 3 (beyond leader's log of 2 entries)
         shared_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 2,
-                prev_index: 3,
+                last_log_term: 2,
+                last_log_index: 3,  // Absolute index beyond leader's log
             }
         });
 
@@ -759,15 +765,15 @@ mod tests {
         // Should remain leader
         assert!(matches!(result, RaftMessageStateChange::None));
 
-        // Should have sent a truncate signal with index 0 for unknown term
+        // Should have sent a truncate signal to leader's last entry (index 1, term 3)
         let queue = &shared_state.quorum_worker_tasks[0];
         assert_eq!(queue.len(), 1);
 
         if let Some(task) = queue.pop() {
             match task.task_type {
                 LocalQuorumWorkerTaskType::TruncateLog { prev_term, prev_index, .. } => {
-                    assert_eq!(prev_term, 1); // Should truncate to the highest entry lower than the unknown term 2.
-                    assert_eq!(prev_index, 0);
+                    assert_eq!(prev_term, 3);  // Term of leader's last entry
+                    assert_eq!(prev_index, 1); // Leader's last absolute index
                 }
                 _ => panic!("Expected TruncateLog task"),
             }
@@ -808,8 +814,8 @@ mod tests {
         shared_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 2,
-                prev_index: 3,
+                last_log_term: 2,
+                last_log_index: 3,
             }
         });
 
@@ -975,7 +981,7 @@ mod tests {
         for queue in &shared_state.quorum_worker_tasks {
             let task = queue.pop().unwrap();
             match task.task_type {
-                LocalQuorumWorkerTaskType::StartHeartbeats { id, term, prev_term, prev_log_index } => {
+                LocalQuorumWorkerTaskType::StartHeartbeats { id, term, prev_term, prev_log_index, commit_index } => {
                     assert_eq!(id, 1);
                     assert_eq!(term, 1);
                     assert_eq!(prev_term, 1);
@@ -1056,27 +1062,39 @@ mod tests {
 
     #[test]
     fn test_time_step_handles_backfill_log_request() {
-        // Test that time_step handles BackfillLog request
+        // Test that time_step handles BackfillLog request with absolute indexing
         let mut delegate = RaftLeaderStateDelegate::new();
         delegate.initialized = true;
         let mut shared_state = create_shared_state_with_quorum();
 
+        // Add two entries at absolute indexes 0 and 1
         shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-            index: 1,
+            index: 0,  // Absolute index
             term: 1,
             timestamp: 0,
             prev_index: 0,
             prev_term: 0,
+            message_id: 0,
+            requests: vec![],
+        }));
+        shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
+            index: 1,  // Absolute index
+            term: 1,
+            timestamp: 0,
+            prev_index: 0,
+            prev_term: 1,
             message_id: 1,
             requests: vec![],
         }));
 
-        // Simulate BackfillLog event
+        shared_state.volatile_server_state.replication_log_term_starts.insert(1, 0);
+
+        // Simulate BackfillLog event - follower has entry at index 0, needs entries from index 1
         shared_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
                 quorum_node_id: 1,
-                prev_term: 0,
-                prev_index: 0,
+                last_log_term: 1,
+                last_log_index: 0,  // Absolute index of follower's last entry
             }
         });
 
@@ -1087,15 +1105,12 @@ mod tests {
         let task = queue.pop().unwrap();
         match task.task_type {
             LocalQuorumWorkerTaskType::BackfillLog { data } => {
+                // Should send entry at index 1 (one entry starting from prev_index + 1)
                 assert_eq!(data.len(), 1);
-                assert_eq!(data[0].index, 1);
+                assert_eq!(data[0].index, 1);  // Absolute index
                 assert_eq!(data[0].term, 1);
-                assert_eq!(data[0].requests.len(), 0);
-                assert_eq!(data[0].message_id, 1);
-                assert_eq!(data[0].prev_index, 0);
-                assert_eq!(data[0].prev_term, 0);
             }
-            v => panic!("Expected BackfillLog task"),
+            _ => panic!("Expected BackfillLog task"),
         }
 
         // Should return None state change

@@ -49,7 +49,7 @@ pub struct LocalQuorumWorkerTask {
 }
 
 pub enum LocalQuorumWorkerTaskType {
-    StartHeartbeats{ id: u64, term: u64, prev_term: u64, prev_log_index: u64 },
+    StartHeartbeats{ id: u64, term: u64, prev_term: u64, prev_log_index: u64, commit_index: u64 },
     StopHeartbeats { id: u64 },
     RequestVote{ id: u64, term: u64, last_term: u64, last_index: u64, parent_span: Span}, // Term, last term, last index,
     AppendEntries{ id: u64, req: RemoteAppendEntriesRequest, parent_span: Span},
@@ -61,7 +61,7 @@ pub enum LocalQuorumWorkerTaskType {
 pub enum LocalQuorumTaskResponseType {
     RequestVoteResponse{ id: u64, term: u64, received_vote: bool},
     AppendEntries{ id: u64, ok: bool}, // TODO get next index
-    BackfillLog{ quorum_node_id: u64, prev_term: u64, prev_index: u64},
+    BackfillLog{ quorum_node_id: u64, last_log_term: u64, last_log_index: u64},
     TruncateLog{ quorum_node_id: u64, prev_term: u64, prev_index: u64},
     TruncateLogResponse{ id: u64, ok: bool}
 }
@@ -243,12 +243,13 @@ impl QuorumWorker {
     // Work Queue State Handlers (on_work_*)
     // ============================================================================
 
-    fn on_work_start_heartbeats(&mut self, id: u64, term: u64, prev_term: u64, prev_log_index: u64) {
+    fn on_work_start_heartbeats(&mut self, id: u64, term: u64, prev_term: u64, prev_log_index: u64, commit_index: u64) {
         log::info!("received start heartbeat request id: {}, term: {}", id, term);
         self.send_heartbeats = true;
         self.term = term;
         self.prev_log_term = prev_term;
         self.prev_log_index = prev_log_index;
+        self.commit_index = commit_index;
     }
 
     fn on_work_stop_heartbeats(&mut self, id: u64) {
@@ -466,8 +467,8 @@ impl QuorumWorker {
                 });
                 let resp = LocalQuorumTaskResponseType::BackfillLog {
                     quorum_node_id: self.member_id,
-                    prev_term: append_entries.last_log_term,
-                    prev_index: append_entries.last_log_index,
+                    last_log_term: append_entries.last_log_term,
+                    last_log_index: append_entries.last_log_index,
                 };
                 self.response_queue.push(LocalQuorumResponse { response_type: resp });
             } else {
@@ -1008,8 +1009,8 @@ impl QuorumWorker {
             let task = self.work_queue.pop();
             match task {
                 Some(task) => match task.task_type {
-                    LocalQuorumWorkerTaskType::StartHeartbeats { id, term, prev_term, prev_log_index } => {
-                        self.on_work_start_heartbeats(id, term, prev_term, prev_log_index);
+                    LocalQuorumWorkerTaskType::StartHeartbeats { id, term, prev_term, prev_log_index, commit_index } => {
+                        self.on_work_start_heartbeats(id, term, prev_term, prev_log_index, commit_index);
                     }
                     LocalQuorumWorkerTaskType::StopHeartbeats { id } => {
                         self.on_work_stop_heartbeats(id);
@@ -1106,6 +1107,7 @@ mod tests {
                 term: 5,
                 prev_term: 4,
                 prev_log_index: 10,
+                commit_index: 10
             },
         });
 
@@ -1284,10 +1286,10 @@ mod tests {
         // Verify response was pushed
         let response = response_queue.pop().expect("Should have response in queue");
         match response.response_type {
-            LocalQuorumTaskResponseType::BackfillLog { quorum_node_id, prev_term, prev_index } => {
+            LocalQuorumTaskResponseType::BackfillLog { quorum_node_id, last_log_term, last_log_index } => {
                 assert_eq!(quorum_node_id, 2); // member_id
-                assert_eq!(prev_term, 2);
-                assert_eq!(prev_index, 5);
+                assert_eq!(last_log_term, 2);
+                assert_eq!(last_log_index, 5);
             }
             _ => panic!("Expected BackfillLog response"),
         }
