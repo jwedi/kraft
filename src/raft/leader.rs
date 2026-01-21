@@ -166,8 +166,6 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         tracing::info!("tasks dispatched");
 
         let message_type = OutstandingMessageType::WriteBatch{persistence_done: false, quorum_acks: 0, callback, index: idx, start_time, batch_size};
-        //let response_span = tracing::span!(Level::INFO, "write_batch_outstanding_message_processing");
-        //response_span.set_parent(span.context());
         let outstanding_message = OutstandingMessage{
             id: message_id,
             outstanding_responses: 1 + shared_state.quorum_worker_tasks.len() as i32,
