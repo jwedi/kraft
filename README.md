@@ -1,104 +1,276 @@
-Distributed durable key-value database management system.
-The core is implemented using the Raft consensus algorithm and utilises leader election and log replication.
+# Kraft
 
-Overall flow:
-Leader election:
-- 
-Writes:
-- Client connects to one of the servers. Done
-- Client sends insert request to server. Done
-- If server is the master it adds the insert command into the command queue and waits for a response. Done
-  - The command worker reads commands into a smart batch. Done
-  - It first writes a log entry to the local persistent log. Done
-  - It then sends an AppendEntries RPC to all other servers to replicate the log entry. Done
-  - If a majority of servers respond with success, the leader commits the log entry. Done
-  - The next AppendEntries request from the leader to the followers will now contain the new commit index. TODO
-  - The leader then updates its state machine and responds to the client. TODO as in needs to update soem in-memory data structure that's used for reads. TODO
-- If server is not the master it forwards the request to the master. Done
-  - The follower waits for a positive response from the leader and then returns with the result. Done
-- On response on channel it returns the response to the client. Done
+A high-performance, distributed, durable key-value store built on the Raft consensus algorithm.
+The project is created for learning purposes and it's not ready for prod usage.
 
+Kraft is designed for throughput over latency, using an actor-based architecture with lock-free queues and intelligent batching to achieve high write throughput while maintaining strong consistency guarantees.
 
-Performance thoughts.
-- Should smart batch on each follower node before forwarding writes to leader. Done
-  - Reduces networking overhead
-  - Achieves constant load
-- Should smart batch on leader worker. Done
-  - Reduces Bookeeping overhead
-  - Reduces IO overhead by batching writes together
-- Maybe some CAS thingy to avoid blocking the main working thread. Effectively done using the outstanding messages bookeeping in the state machine worker.
-  - API issues a request like PrepareVote, 
-  - the worker would validate the request and reserve an IO "Mutex" to the caller where they can write the data themselves, 
-  - then the caller would send something like CommitVote and the worker would then consider the vote accepted.
-  - (I may have re-invented Futures here)
-  - A follower can only respond positively to a RequestVote after it has persisted its vote to disk, this will block the main thread unless i do something about it.
-- Is blocking the main thread for AppendEntries requests actually an issue?
-  - Writes have to be synchronised to disk, which makes blocking writes a good thing rather than a bad thing.
-  - The next disk write could probably be prepared while waiting for the disk write to complete.
-  - Like some kind of pipelining strategy where the system can have one pipelining and one internal processing task active at a time.
-  - If there's no stable leader, then i would not expect AppendEntries and RequestVote requests to happen in parallell, maybe that's mostly a non-issue.
-- As long as the IO cost is amortized over a large enough number of requests, I should be fine. This should effectively be done.
-  - Maybe each request to the executor should contain both the request for validation but also the serialized version of the data that can immediately be dumped into the write buffer
-  - The worker would have a fixed size write buffer and smart batches more requests until the batch size is too large for the buffer.
-  - The buffer is reset after each IO dump, alternatively a new epoc buffer is created.
-  - So smart batch incoming requests while there are more on the queue, no leader election is happening and write buffer allows more data.
-- A batch write involves both a write to disk and then a RPC to all followers to accept the request. Done using persistence worker and one quorum worker per other node in the cluster.
-  - Doing all of this blocking IO on the main thread sounds terrible.
-  - Maybe one NodeHandler per node in the cluster. Is also a State machine, where it continously polls heartbeats while in Leader state.
+## Features
 
+- **Strong Consistency**: Built on Raft consensus with leader election and log replication
+- **Durability**: All writes are persisted to disk before acknowledgment
+- **Read-Your-Own-Writes**: Clients can immediately read values they've written
+- **High Throughput**: Smart batching of writes and lock-free inter-component communication
+- **Observability**: Built-in distributed tracing (Zipkin) and Prometheus metrics
 
-Backfill and copy prevention:
-1. To backfill log entries the leader needs to be able to go back to an arbitrary index in the log and re-issue append entries requests for those entries.
-2. Right now no copies of past append entries requests is kept, so this is non-trivial.
-3. If instead of each quorum worker and persistence worker getting their own copy of the append entries data there would be a shared datastructure with all of the data. Then no copying of data would need to be done by the leader to send it to the actor. The quorum workers could also backfill on their own by reading the log. The event passing between the leader and actors would also be simpler because the meat of the data would be in the shared log and not in the messages.
-4. Alternatives:
-5. im:Vector. Seem to have overall good performance characteristics both for reads and writes
-6. Normal Vec. Good performance characteristics as long as the vec doesn't need to get expanded. Doesn't handle chunking very well AFAIK.
-7. To know which index to start backfilling from given that there are terms, would need some indexing to say which term starts where so you can get index with index of term start + index.
-8. Backfill means that the restarted node tells the leader quorum worker it's last term + index, the quorum node looks up the term start index and fetches index = term_start + prev_index + 1.
-9. On leader write batch. Validate, create new sequence number, append to shared log, write message to actors. Actors read payload from log.
+## Architecture Overview
 
+Kraft uses an **actor-based architecture** where independent workers communicate via lock-free queues. This design eliminates contention and allows each component to operate at its own pace.
 
-Write flow. Done
-1. Write request is sent to write proxy
-2. Write proxy figures out who the leader is
-3. Write proxy batches requests into a smart batch and then forwards to leader.
-4. (Leader can't be having the combined RPS of all nodes)
-5. Would maybe not need to have leader level batching if that is the case.
-6. Leader picks up a write batch from queue
-7. It validates incoming write requests.
-8. It serializes the data in a format that can be written to disk.
-9. It writes the serialized data to the persistence handler and all quorum workers.
-10. When data is persisted locally and on quorum of nodes it triggers the batch callback and notifies learners.
+```
+                                    ┌─────────────────────────────────────────────────────────────┐
+                                    │                         KRAFT NODE                          │
+                                    │                                                             │
+    ┌──────────┐                    │  ┌─────────────┐      ┌─────────────────────────────────┐  │
+    │  Client  │◄──────────────────►│  │   gRPC      │      │      Raft State Machine         │  │
+    │  (gRPC)  │   Put/Get          │  │   Server    │      │  ┌───────┐ ┌─────────┐ ┌──────┐ │  │
+    └──────────┘                    │  │             │      │  │Follower│ │Candidate│ │Leader│ │  │
+                                    │  └──────┬──────┘      │  └───┬───┘ └────┬────┘ └──┬───┘ │  │
+                                    │         │             │      └──────────┴─────────┘     │  │
+                                    │         ▼             │              ▲                  │  │
+                                    │  ┌─────────────┐      │              │                  │  │
+                                    │  │   Write     │      │     Lock-Free Queue             │  │
+                                    │  │   Proxy     ├──────┼──────────────┘                  │  │
+                                    │  │  (Batching) │      │                                 │  │
+                                    │  └─────────────┘      └─────────────────────────────────┘  │
+                                    │                                 │                          │
+                                    │         ┌───────────────────────┼───────────────────────┐  │
+                                    │         │                       │                       │  │
+                                    │         ▼                       ▼                       ▼  │
+                                    │  ┌─────────────┐      ┌─────────────────┐      ┌─────────┐ │
+                                    │  │ Persistence │      │  Quorum Workers │      │  Query  │ │
+                                    │  │   Worker    │      │  (per peer)     │      │  Worker │ │
+                                    │  └──────┬──────┘      └────────┬────────┘      └────┬────┘ │
+                                    │         │                      │                    │      │
+                                    └─────────┼──────────────────────┼────────────────────┼──────┘
+                                              │                      │                    │
+                                              ▼                      ▼                    ▼
+                                    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────┐
+                                    │   Disk (WAL)    │    │   Other Kraft   │    │    Read     │
+                                    │   votes.csv     │    │     Nodes       │    │   Results   │
+                                    │   log.sbe       │    │                 │    │             │
+                                    └─────────────────┘    └─────────────────┘    └─────────────┘
+```
 
-Maybe when serving read requests the response is prepared but is only served when follower gets a hearbeat from the leader indicating that it's up to date.
+## Core Components
 
-persistence worker, quorum worker, read worker all need concurrent read access to transaction log
-leader worker needs concurrent write access to transaction log.
+### 1. Raft State Machine (`src/raft/`)
 
-On write:
-1. State machine worker constructs an Arc LogEntry
-2. It adds it to its transaction log i.e Vec Arc LogEntry
-3. It sends the Arc LogEntry to the message bus.
-4. The Quorum worker gets the entry from the bus and sends it to quorum members
-5. The Persistence worker gets the entry from the bus and stores it on disk.
-6. The Read worker gets the entry from the bus and applies it to the read datastructure if the commit index has been updated.
+The heart of the system. Implements the Raft consensus protocol as a **state machine** that responds to:
+- Incoming write requests from clients
+- Responses from the persistence worker (disk writes completed)
+- Responses from quorum workers (replication acknowledgments)
+- Timeouts for leader election
 
-The read worker needs to be notified when the commit index changes. Maybe the SM worker and the read worker share an atomic value for the current term+commit index + a notifying primitive.
+The state machine transitions between three states:
+- **Follower**: Receives log entries from the leader
+- **Candidate**: Requests votes to become leader
+- **Leader**: Accepts client writes and replicates to followers
 
-TODO
-On boot all entries in the transaction log need to be sent over the bus to the query worker.
-When node has become leader or follower with correct log for the first time it can emit all entries from the transaction log to the bus.
-Before successfully joining the cluster and syncing its log with others certain entries may have to be undone.
-Also possible that a log entry gets replicated to a less than a quorum and leader crashing when running in that case log entries may need to be reverted as well.
+```
+┌──────────┐  timeout   ┌───────────┐  majority votes  ┌────────┐
+│ Follower ├───────────►│ Candidate ├─────────────────►│ Leader │
+└────┬─────┘            └─────┬─────┘                  └───┬────┘
+     │                        │                            │
+     │◄───────────────────────┴────────────────────────────┘
+     │         discovers higher term / new leader
+```
 
-Maybe send initial query structure backfill whenever the initial leader election is done.
-Maybe truncate query structure on truncate signal for simplicity and replay all non-truncated transactions.
+### 2. Write Proxy (`src/transport/write_proxy.rs`)
 
-For simplicity rebuild full query structure after a leader election when log truncation is done.
-Would need a way to send a signal to the query worker that it should reset the structure from scratch, maybe send a log entry with term or index 0 and no data.
+**Smart batching** for high throughput. Instead of processing writes one-by-one:
 
-Need to hook into a good place in the state machine where the first OK append entries was completed.
+1. Collects incoming write requests into batches
+2. Waits for either:
+   - `max_batch_size` bytes accumulated, OR
+   - `min_batch_interval_ms` elapsed
+3. Gets the current Raft leader from the Raft State Machine.
+4. Forwards the entire batch to the current Raft leader, either locally or remotely.
 
-On follower truncate, reset commit state, send log entry over bus with 0 term, index and data and backfill from start.
-On boot backfill from start optimistically and only invalidate on truncate.
+This dramatically improves throughput by amortizing the cost of disk fsync and network round-trips across many writes.
+
+### 3. Persistence Worker (`src/persistence/worker.rs`)
+
+Handles all disk I/O on a dedicated thread:
+- Appends log entries to the write-ahead log (`log.sbe`)
+- Records vote decisions (`votes.csv`)
+- Batches multiple log writes before calling `fsync()` for efficiency
+- Recovers state on startup by replaying the log
+
+### 4. Quorum Workers (`src/quorum/worker.rs`)
+
+One worker per peer node, responsible for:
+- Sending heartbeats (leader only)
+- Replicating log entries via AppendEntries RPCs
+- Handling vote requests during elections
+- Managing backfill when a follower falls behind
+- Processing truncation when logs diverge
+
+Uses **bidirectional gRPC streaming** for efficient communication between nodes and in-order delivery.
+
+### 5. Query Worker (`src/query/worker.rs`)
+
+Handles client read requests by subscribing to committed log entries via a broadcast bus. Ensures clients can read their own writes by waiting for the relevant commit index.
+
+## Communication Model
+
+### Lock-Free Queues
+
+All inter-component communication uses **crossbeam's lock-free SegQueue**:
+
+```
+┌─────────────┐                     ┌─────────────┐
+│   Writer    │  ───push()────►     │  SegQueue   │  ───pop()────►  │   Reader    │
+│   (fast)    │  (non-blocking)     │  (lock-free)│  (non-blocking) │   (fast)    │
+└─────────────┘                     └─────────────┘                 └─────────────┘
+```
+
+Benefits:
+- No mutex contention between producers and consumers
+- Writers never block waiting for readers
+- Predictable latency without lock acquisition
+
+### Callback Channels
+
+For request-response patterns, Kraft uses **oneshot channels**:
+
+```rust
+// Client sends request with callback
+let (tx, rx) = oneshot::channel();
+queue.push(WriteBatch { callback: tx, ... });
+
+// Worker processes and responds
+callback.send(WriteResponse { ... });
+
+// Client awaits response
+let response = rx.await?;
+```
+
+## Performance Optimizations
+
+| Optimization | Description |
+|-------------|-------------|
+| **Write Batching** | Multiple client writes combined into single log entries |
+| **Persistence Batching** | Multiple log entries fsynced together |
+| **Lock-Free Queues** | Zero contention between components |
+| **gRPC Streaming** | Persistent connections between nodes, no connection overhead |
+| **SBE Encoding** | Simple Binary Encoding for compact, zero-copy log serialization |
+| **Async I/O** | Tokio runtime for efficient async networking |
+
+## Consistency Guarantees
+
+- **Linearizability**: (Coming soon) All operations appear to execute atomically at some point between invocation and response
+- **Read-Your-Own-Writes**: A client will always see its own previous writes
+- **Durability**: Acknowledged writes survive node failures (persisted to quorum before ack)
+
+## Getting Started
+
+### Prerequisites
+
+- Rust 1.70+
+- Protobuf compiler (`protoc`)
+
+### Configuration
+
+Create `application.toml`:
+
+```toml
+persistence_dir = "./data/"
+port = 50051
+metrics_port = 9090
+node_id = 1
+max_message_size_bytes = 4194304
+min_batch_interval_ms = 5
+max_batch_size = 1048576
+
+[[cluster_nodes]]
+endpoint = "http://[::1]:50051"
+node_id = 1
+
+[[cluster_nodes]]
+endpoint = "http://[::1]:50052"
+node_id = 2
+
+[[cluster_nodes]]
+endpoint = "http://[::1]:50053"
+node_id = 3
+```
+
+### Running a Cluster
+
+```bash
+# Terminal 1 - Node 1
+RESOURCE_DIR=./node1 cargo run --bin kraft
+
+# Terminal 2 - Node 2
+RESOURCE_DIR=./node2 cargo run --bin kraft
+
+# Terminal 3 - Node 3
+RESOURCE_DIR=./node3 cargo run --bin kraft
+```
+
+### Running Tests
+
+```bash
+cargo test
+```
+
+## Observability
+
+### Distributed Tracing
+
+Kraft integrates with **Zipkin** for distributed tracing. Start Zipkin:
+
+```bash
+docker run -d -p 9411:9411 openzipkin/zipkin
+```
+
+Traces show the full path of a write request across batching, persistence, and replication.
+
+### Metrics
+
+Prometheus metrics are exposed at `http://localhost:{metrics_port}/metrics`:
+
+- `raft_commit_index` - Current commit index
+- `raft_term` - Current Raft term
+- `raft_state` - Current state (follower/candidate/leader)
+
+## Project Structure
+
+```
+src/
+├── main.rs                 # Application entry point
+├── raft/
+│   ├── raft_sm.rs          # Shared state and broadcast logic
+│   ├── state_machine_worker.rs  # Main event loop
+│   ├── leader.rs           # Leader state handling
+│   ├── follower.rs         # Follower state handling
+│   └── candidate.rs        # Candidate state handling
+├── persistence/
+│   └── worker.rs           # Disk I/O worker
+├── quorum/
+│   └── worker.rs           # Per-peer replication worker
+├── query/
+│   └── worker.rs           # Read request handler
+├── transport/
+│   ├── write_proxy.rs      # Write batching
+│   ├── raft.rs             # gRPC service implementation
+│   ├── datastore.rs        # Client-facing API
+│   └── stream_manager.rs   # gRPC stream management
+└── config/
+    └── config.rs           # Configuration loading
+```
+
+## TODO / Future Improvements
+
+### High Priority
+- [ ] **Zero copy IO** - Prost gRPC streaming doesn't support Zero copy IO, should migrate to something like cap'n proto / SBE over raw TCP streams instead.
+- [ ] **Log compaction / snapshotting** - Truncate persisted log after snapshotting state
+- [ ] **Linearizable reads** - Implement read index or lease-based reads
+- [ ] **Membership changes** - Dynamic cluster reconfiguration
+- [ ] **Checksum validation** - Verify log integrity on recovery
+- [ ] **Graceful shutdown** - Drain pending writes before stopping
+
+## License
+
+MIT
