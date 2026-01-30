@@ -91,7 +91,15 @@ mod client {
     pub mod cluster_node_client;
 }
 
-fn init_tracing(node_id: u32) -> SDKTracer {
+/// Initialize OpenTelemetry tracing if enabled.
+/// When disabled, tracing macros become no-ops to reduce performance overhead.
+fn init_tracing(node_id: u32, enable_otel: bool) -> Option<SDKTracer> {
+    if !enable_otel {
+        log::info!("OpenTelemetry tracing is disabled");
+        return None;
+    }
+
+    log::info!("Initializing OpenTelemetry tracing for node {}", node_id);
     let name = format!("kraft_node_{}", node_id);
     let tracer = opentelemetry_zipkin::new_pipeline()
         .with_service_name(name)
@@ -112,13 +120,12 @@ fn init_tracing(node_id: u32) -> SDKTracer {
     tracing::subscriber::set_global_default(Registry::default().with(otel_layer))
         .expect("setting default subscriber failed");
 
-    tracer
+    Some(tracer)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::builder().filter_level(log::LevelFilter::Info).init();
-    opentelemetry::global::set_text_map_propagator(opentelemetry_zipkin::Propagator::new());
 
     // Initialize metrics
     transport::metrics::register_metrics();
@@ -126,7 +133,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = read_config()?;
     let node_id = cfg.node_id;
-    let tracer = init_tracing(cfg.node_id);
+    let enable_otel = cfg.enable_otel_tracing;
+    let _tracer = init_tracing(cfg.node_id, enable_otel);
     let addr = format!("[::1]:{}", cfg.port).parse()?;
     let pinger = PingServer::default();
 
@@ -335,38 +343,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let propagator = opentelemetry_zipkin::Propagator::new();
+    // Build server with or without tracing based on config
+    // Tracing can add significant performance overhead
+    if enable_otel {
+        let propagator = opentelemetry_zipkin::Propagator::new();
+        Server::builder()
+            .trace_fn(move |req| {
+                let n_id = node_id;
+                let method = req.uri().path().to_string();
 
-    Server::builder()
-        .trace_fn(move |req| {
-            let n_id = node_id;
-            let method = req.uri().path().to_string();
+                let carrier = req
+                    .headers()
+                    .iter()
+                    .map(|pair| {
+                        (
+                            pair.0.to_string(),
+                            pair.1.to_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect::<std::collections::HashMap<String, String>>();
 
-            let carrier = req
-                .headers()
-                .iter()
-                .map(|pair| {
-                    (
-                        pair.0.to_string(),
-                        pair.1.to_str().unwrap_or_default().to_string(),
-                    )
-                })
-                .collect::<std::collections::HashMap<String, String>>();
-
-            let ctx = propagator.extract(&carrier);
-            let span = tracing::info_span!("grpc_request",method = %method,request_id = %uuid::Uuid::new_v4(),node_id=n_id);
-            span.set_parent(ctx);
-            span
-        })
-        .add_service(PingPongServer::new(pinger))
-        .add_service(RaftServer::new(raft_server))
-        .add_service(DatastoreServer::new(datastore_server))
-        .serve(addr)
-        .await?;
+                let ctx = propagator.extract(&carrier);
+                let span = tracing::info_span!("grpc_request",method = %method,request_id = %uuid::Uuid::new_v4(),node_id=n_id);
+                span.set_parent(ctx);
+                span
+            })
+            .add_service(PingPongServer::new(pinger))
+            .add_service(RaftServer::new(raft_server))
+            .add_service(DatastoreServer::new(datastore_server))
+            .serve(addr)
+            .await?;
+    } else {
+        Server::builder()
+            .add_service(PingPongServer::new(pinger))
+            .add_service(RaftServer::new(raft_server))
+            .add_service(DatastoreServer::new(datastore_server))
+            .serve(addr)
+            .await?;
+    }
 
 
     let _ = join!(worker_handle, persistence_handle, write_proxy_handle, metrics_handle, query_worker_handle);
     join_all(cw_join_handles);
-    opentelemetry::global::shutdown_tracer_provider();
+    if enable_otel {
+        opentelemetry::global::shutdown_tracer_provider();
+    }
     Ok(())
 }
