@@ -6,6 +6,7 @@ max_message_size_bytes = 4096
 max_batch_size = 512
 min_batch_interval_ms = 2
 metrics_port = 51051
+enable_otel_tracing = false
 [[cluster_nodes]]
 endpoint = "http://[::1]:50051"
 node_id = 1

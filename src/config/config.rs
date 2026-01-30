@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub max_message_size_bytes: usize,
     pub min_batch_interval_ms: u64,
     pub max_batch_size: u64,
+    pub enable_otel_tracing: bool,
 }
 
 
