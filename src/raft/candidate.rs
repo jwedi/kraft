@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use crossbeam_queue::SegQueue;
+use log::{error, info};
 use rand::Rng;
 use rand::rngs::ThreadRng;
 use tokio::sync::oneshot;
@@ -96,7 +97,9 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                             OutstandingMessageType::RequestVote{callback} => {
                                 let payload = LocalRaftResponsePayload::RequestVote(true);
                                 let response = LocalRaftResponseMessage {payload};
-                                callback.send(response).unwrap();
+                                if let Err(_) = callback.send(response) {
+                                    error!("Receiver dropped when sending RequestVote callback from candidate")
+                                }
                             }
 
                             OutstandingMessageType::CandidateElection{persistence_done, quorum_votes} => {
@@ -201,7 +204,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                     msg.message_type = new_state;
                                     shared_state.outstanding_messages.insert(id, msg);
                                 } else {
-                                    tracing::info!(message = "Node lost election with no more pending votes", term);
+                                    info!("Node lost election with no more pending votes {}", term);
                                 }
                             }
                             OutstandingMessageType::AppendLog{callback} => {
@@ -215,7 +218,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                             }
                         }
                     } else {
-                        log::error!("Received quorum event with no outstanding message registered {}", id);
+                        log::error!("Received quorum event RequestVoteResponse with no outstanding message registered {}", id);
                     }
                 }
 
@@ -276,11 +279,12 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         let _enter = span.enter();
 
         if !self.should_accept_vote(request_vote_request.term, request_vote_request.last_log_term, request_vote_request.last_log_index, shared_state) {
-            callback.send(
-                LocalRaftResponseMessage {
-                    payload: LocalRaftResponsePayload::RequestVote(false)
-                }
-            ).expect("sending request_vote callback failed");
+            let payload = LocalRaftResponseMessage {
+                payload: LocalRaftResponsePayload::RequestVote(false)
+            };
+            if let Err(_) = callback.send(payload) {
+                error!("receiver dropped when trying to send request_vote callback")
+            };
             return RaftMessageStateChange::None
         }
 

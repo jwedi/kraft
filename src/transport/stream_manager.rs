@@ -77,19 +77,6 @@ impl StreamManagerImpl {
 
         let stream_response = raft_client.messages(req).await.map_err(|e| ConnectError::Err(e.message().to_string()))?.into_inner();
 
-        /*
-        // TODO handle result
-        let connect = tx.send(QuorumMessage{
-            message_payload: Some(MessagePayload::ConnectRequestOption(ConnectRequest{node_id: self.self_id}))
-        });
-        match connect {
-            Ok(ok) => {
-                log::info!("Sent stream connect request to {}", node_id);
-            }
-            Err(e) => {
-                log::error!("Error {} when sending connect request to {}", e, node_id);
-            }
-        }*/
         let entry = Arc::new(Mutex::new(tx));
         let resp = Arc::clone(&entry);
         write_lock.insert(node_id, entry);

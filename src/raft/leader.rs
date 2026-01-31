@@ -87,6 +87,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         let start_time = std::time::Instant::now();
 
         tracing::info!("writing batches {} as message id: {} with index: {}", batch_size, message_id, idx);
+        //info!("writing batches {} as message id: {} with index: {}", batch_size, message_id, idx);
         shared_state.next_message_id += 1;
 
         let span = tracing::span!(Level::INFO, "delegate_write_batch");
@@ -275,7 +276,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                             OutstandingMessageType::WriteBatch{persistence_done, quorum_acks, callback, index, start_time, batch_size} => {
                                 if quorum_acks >= shared_state.quorum_size {
                                     // Persistence done and replicated to quorum of nodes
-                                    log::info!("Write batch with message id {} and size {} has been persisted on quorum of nodes after {}ms", id, batch_size, start_time.elapsed().as_millis());
+                                    //log::info!("Write batch with message id {} and size {} has been persisted on quorum of nodes after {}ms", id, batch_size, start_time.elapsed().as_millis());
                                     shared_state.volatile_server_state.commit_index = index;
                                     shared_state.volatile_server_state.commit_state.commit_index.store(index, Ordering::Release);
                                     shared_state.volatile_server_state.commit_state.term.store(shared_state.server_state.current_term, Ordering::Release);
@@ -367,7 +368,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                 let new_acks = quorum_acks +1;
                                 if new_acks >= shared_state.quorum_size && persistence_done {
                                     // Log replication done
-                                    log::info!("Write batch with message id {} and size {} has been persisted on quorum of nodes after {}ms", id, batch_size, start_time.elapsed().as_millis());
+                                    //log::info!("Write batch with message id {} and size {} has been persisted on quorum of nodes after {}ms", id, batch_size, start_time.elapsed().as_millis());
                                     if index > shared_state.volatile_server_state.commit_index {
                                         shared_state.volatile_server_state.commit_index = index;
                                         shared_state.volatile_server_state.commit_state.commit_index.store(index, Ordering::Release);
@@ -414,7 +415,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                             }
                         }
                     } else {
-                        log::warn!("Received quorum event with no outstanding message registered {}, maybe backfill", id);
+                        log::warn!("Received quorum event AppendEntries with no outstanding message registered {}, maybe backfill", id);
                     }
                 }
                 LocalQuorumTaskResponseType::BackfillLog { quorum_node_id, last_log_term, last_log_index} => {

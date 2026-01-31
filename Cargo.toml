@@ -53,6 +53,8 @@ prometheus = { version = "0.13", features = ["process"] }
 lazy_static = "1.4.0"
 hyper = { version = "0.14", features = ["full"] }
 bus = "2.4.1"
+capnp = "0.23"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 criterion = "0.5"
@@ -67,3 +69,4 @@ features = [
 
 [build-dependencies]
 tonic-build = "*"
+capnpc = "0.23"

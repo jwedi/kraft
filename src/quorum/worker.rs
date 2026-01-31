@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::oneshot::{Receiver, Sender};
 use tokio::sync::oneshot::error::TryRecvError;
-use tokio::task::JoinSet;
+use tokio::task::{yield_now, JoinSet};
 use tonic::{Request, Response, Status};
 use tonic::codegen::http::StatusCode;
 use tonic::transport::{Channel};
@@ -225,7 +225,7 @@ impl QuorumWorker {
 
             // CPU throttling
             if start_time.elapsed().as_micros() < 200 {
-                thread::yield_now();
+                yield_now().await;
             }
         }
     }
