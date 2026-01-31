@@ -31,6 +31,8 @@ use crate::config::config::{ClusterNode, read_config};
 use crate::persistence::worker::{PersistenceConfig, PersistenceResponseType, PersistenceTaskType, PersistenceWorker, VoteRow};
 use crate::query::worker::QueryRequest;
 use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask, QuorumWorker};
+use crate::quorum::capnp_worker::CapnpQuorumWorker;
+use crate::transport::capnp_stream_manager::CapnpStreamManager;
 use crate::raft::raft_sm::{CommitState, LocalRaftMessage, OutstandingMessage, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig};
 use crate::transport::raft::raftproto::RemoteQuorumMessage;
 use crate::service_utils::app_time::now_millis;
@@ -67,6 +69,7 @@ mod persistence {
 
 mod quorum {
     pub mod worker;
+    pub mod capnp_worker;
 }
 
 mod query {
@@ -85,6 +88,8 @@ mod transport {
     pub mod ping;
     pub mod metrics_server;
     pub mod metrics;
+    pub mod capnp_stream_manager;
+    pub mod capnp;
 }
 
 mod client {
@@ -233,6 +238,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let outstanding_messages: HashMap<u64, OutstandingMessage> = HashMap::new();
 
+    // Store transport choice for later use
+    let use_capnp_transport = cfg.use_capnp_transport;
+
+    // Create stream managers and workers based on transport choice
+    let mut quorum_send_channels: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>> = vec![];
+
+    // gRPC stream manager (needed for RaftServer even if not using gRPC for quorum)
     let send_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<mpsc::UnboundedSender<RemoteQuorumMessage>>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let receive_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<tonic::Streaming<RemoteQuorumMessage>>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let sm: StreamManagerImpl = StreamManagerImpl::new(
@@ -244,25 +256,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sm_arc = Arc::new(sm);
     let raft_server = RaftServerImpl{task_queue: api_raft_queue, self_id: cfg.node_id, stream_manager: Arc::clone(&sm_arc)};
 
-    // For each cluster_nodes_without_self
-    let mut quorum_send_channels: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>> = vec![];
-    let cluster_workers: Vec<QuorumWorker> = cluster_nodes_without_self.iter().map(|node| {
-        let c_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::<LocalQuorumWorkerTask>::new());
-        let c_queue_clone = Arc::clone(&c_queue);
-        quorum_send_channels.push(c_queue);
-        let response_c = Arc::clone(&sm_quorum_response);
-        QuorumWorker::new(
-            c_queue_clone,
-            response_c,
-            cfg.node_id.into(),
-            0,
-            node.node_id.into(),
-            node.endpoint.clone(),
-            Arc::clone(&sm_arc),
-            Arc::clone(&task_queue),
-            cfg.max_message_size_bytes
-        )
-    }).collect();
+    // Create Cap'n Proto stream manager if enabled
+    let capnp_stream_manager: Option<Arc<CapnpStreamManager>> = if use_capnp_transport {
+        let capnp_listen_addr: std::net::SocketAddr = format!("[::1]:{}", cfg.capnp_port).parse()
+            .expect("Invalid capnp_port");
+        Some(Arc::new(CapnpStreamManager::new(
+            node_id,
+            Vec::clone(&cluster_nodes_without_self),
+            capnp_listen_addr,
+        )))
+    } else {
+        None
+    };
+
+    // Create workers based on transport choice
+    enum ClusterWorkers {
+        Grpc(Vec<QuorumWorker>),
+        Capnp(Vec<CapnpQuorumWorker>),
+    }
+
+    let cluster_workers = if use_capnp_transport {
+        log::info!("Using Cap'n Proto transport for cluster communication");
+        let capnp_sm = capnp_stream_manager.as_ref().unwrap();
+        let workers: Vec<CapnpQuorumWorker> = cluster_nodes_without_self.iter().map(|node| {
+            let c_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::<LocalQuorumWorkerTask>::new());
+            let c_queue_clone = Arc::clone(&c_queue);
+            quorum_send_channels.push(c_queue);
+            let response_c = Arc::clone(&sm_quorum_response);
+            CapnpQuorumWorker::new(
+                c_queue_clone,
+                response_c,
+                cfg.node_id,
+                0,
+                node.node_id.into(),
+                node.capnp_endpoint.clone(),
+                Arc::clone(capnp_sm),
+                Arc::clone(&task_queue),
+                cfg.max_message_size_bytes
+            )
+        }).collect();
+        ClusterWorkers::Capnp(workers)
+    } else {
+        log::info!("Using gRPC transport for cluster communication");
+        let workers: Vec<QuorumWorker> = cluster_nodes_without_self.iter().map(|node| {
+            let c_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::<LocalQuorumWorkerTask>::new());
+            let c_queue_clone = Arc::clone(&c_queue);
+            quorum_send_channels.push(c_queue);
+            let response_c = Arc::clone(&sm_quorum_response);
+            QuorumWorker::new(
+                c_queue_clone,
+                response_c,
+                cfg.node_id.into(),
+                0,
+                node.node_id.into(),
+                node.endpoint.clone(),
+                Arc::clone(&sm_arc),
+                Arc::clone(&task_queue),
+                cfg.max_message_size_bytes
+            )
+        }).collect();
+        ClusterWorkers::Grpc(workers)
+    };
 
     let mut log_entry_bus: Bus<Arc<SerializationData>> = Bus::new(5000);
     let mut query_bus_reader = log_entry_bus.add_rx();
@@ -322,19 +376,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         true
     });
 
-    let mut cw_join_handles: Vec<JoinHandle<bool>> = vec![];
-    for mut cw in cluster_workers {
-        let handle = spawn(
-            async move {
-                tracing::info!(message = "Spawning quorum worker");
-                cw.run().await;
-                true
+    // Start Cap'n Proto listener if enabled
+    let capnp_listener_handle: Option<JoinHandle<()>> = if use_capnp_transport {
+        let capnp_sm = capnp_stream_manager.clone().unwrap();
+        Some(tokio::spawn(async move {
+            log::info!("Starting Cap'n Proto listener");
+            if let Err(e) = capnp_sm.start_listener().await {
+                log::error!("Cap'n Proto listener failed: {}", e);
             }
-        );
-        cw_join_handles.push(handle);
+        }))
+    } else {
+        None
+    };
+
+    // Spawn cluster workers based on transport type
+    let mut cw_join_handles: Vec<JoinHandle<bool>> = vec![];
+    match cluster_workers {
+        ClusterWorkers::Grpc(workers) => {
+            for mut cw in workers {
+                let handle = spawn(async move {
+                    tracing::info!(message = "Spawning gRPC quorum worker");
+                    cw.run().await;
+                    true
+                });
+                cw_join_handles.push(handle);
+            }
+        }
+        ClusterWorkers::Capnp(workers) => {
+            for mut cw in workers {
+                let handle = spawn(async move {
+                    tracing::info!(message = "Spawning Cap'n Proto quorum worker");
+                    cw.run().await;
+                    true
+                });
+                cw_join_handles.push(handle);
+            }
+        }
     }
 
-    tracing::info!(message = "Starting server.", %addr);
+    info!("Starting server {}", addr);
 
     // Start metrics server
     let metrics_handle = tokio::spawn(async move {
@@ -345,41 +425,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build server with or without tracing based on config
     // Tracing can add significant performance overhead
-    if enable_otel {
-        let propagator = opentelemetry_zipkin::Propagator::new();
-        Server::builder()
-            .trace_fn(move |req| {
-                let n_id = node_id;
-                let method = req.uri().path().to_string();
-
-                let carrier = req
-                    .headers()
-                    .iter()
-                    .map(|pair| {
-                        (
-                            pair.0.to_string(),
-                            pair.1.to_str().unwrap_or_default().to_string(),
-                        )
-                    })
-                    .collect::<std::collections::HashMap<String, String>>();
-
-                let ctx = propagator.extract(&carrier);
-                let span = tracing::info_span!("grpc_request",method = %method,request_id = %uuid::Uuid::new_v4(),node_id=n_id);
-                span.set_parent(ctx);
-                span
-            })
-            .add_service(PingPongServer::new(pinger))
-            .add_service(RaftServer::new(raft_server))
-            .add_service(DatastoreServer::new(datastore_server))
-            .serve(addr)
-            .await?;
-    } else {
-        Server::builder()
-            .add_service(PingPongServer::new(pinger))
-            .add_service(RaftServer::new(raft_server))
-            .add_service(DatastoreServer::new(datastore_server))
-            .serve(addr)
-            .await?;
+    // RaftServer is only registered when using gRPC transport (not Cap'n Proto)
+    match (enable_otel, use_capnp_transport) {
+        (true, true) => {
+            // OpenTelemetry + Cap'n Proto: trace but no RaftServer
+            let propagator = opentelemetry_zipkin::Propagator::new();
+            Server::builder()
+                .trace_fn(move |req| {
+                    let n_id = node_id;
+                    let method = req.uri().path().to_string();
+                    let carrier = req.headers().iter()
+                        .map(|pair| (pair.0.to_string(), pair.1.to_str().unwrap_or_default().to_string()))
+                        .collect::<std::collections::HashMap<String, String>>();
+                    let ctx = propagator.extract(&carrier);
+                    let span = tracing::info_span!("grpc_request", method = %method, request_id = %uuid::Uuid::new_v4(), node_id = n_id);
+                    span.set_parent(ctx);
+                    span
+                })
+                .add_service(PingPongServer::new(pinger))
+                .add_service(DatastoreServer::new(datastore_server))
+                .serve(addr)
+                .await?;
+        }
+        (true, false) => {
+            // OpenTelemetry + gRPC: trace and include RaftServer
+            let propagator = opentelemetry_zipkin::Propagator::new();
+            Server::builder()
+                .trace_fn(move |req| {
+                    let n_id = node_id;
+                    let method = req.uri().path().to_string();
+                    let carrier = req.headers().iter()
+                        .map(|pair| (pair.0.to_string(), pair.1.to_str().unwrap_or_default().to_string()))
+                        .collect::<std::collections::HashMap<String, String>>();
+                    let ctx = propagator.extract(&carrier);
+                    let span = tracing::info_span!("grpc_request", method = %method, request_id = %uuid::Uuid::new_v4(), node_id = n_id);
+                    span.set_parent(ctx);
+                    span
+                })
+                .add_service(PingPongServer::new(pinger))
+                .add_service(RaftServer::new(raft_server))
+                .add_service(DatastoreServer::new(datastore_server))
+                .serve(addr)
+                .await?;
+        }
+        (false, true) => {
+            // No tracing + Cap'n Proto: no RaftServer
+            Server::builder()
+                .add_service(PingPongServer::new(pinger))
+                .add_service(DatastoreServer::new(datastore_server))
+                .serve(addr)
+                .await?;
+        }
+        (false, false) => {
+            // No tracing + gRPC: include RaftServer
+            Server::builder()
+                .add_service(PingPongServer::new(pinger))
+                .add_service(RaftServer::new(raft_server))
+                .add_service(DatastoreServer::new(datastore_server))
+                .serve(addr)
+                .await?;
+        }
     }
 
 

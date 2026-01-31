@@ -16,6 +16,10 @@ pub struct AppConfig {
     pub min_batch_interval_ms: u64,
     pub max_batch_size: u64,
     pub enable_otel_tracing: bool,
+    #[serde(default)]
+    pub use_capnp_transport: bool,
+    #[serde(default)]
+    pub capnp_port: u32,
 }
 
 
@@ -23,6 +27,9 @@ pub struct AppConfig {
 pub struct ClusterNode {
     pub endpoint: String,
     pub node_id: u32,
+    /// Cap'n Proto TCP endpoint (e.g., "[::1]:50151")
+    #[serde(default)]
+    pub capnp_endpoint: String,
 }
 
 pub fn read_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
