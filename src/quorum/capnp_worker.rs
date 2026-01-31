@@ -25,6 +25,7 @@ use crate::transport::write_proxy::{WriteBatch, WriteResponse};
 use crate::transport::metrics::{QUORUM_APPEND_ENTRIES_LATENCY, QUORUM_PUT_BATCH_LATENCY};
 use tokio::sync::oneshot;
 use tokio::task::yield_now;
+use tokio::time::Instant;
 use crate::transport::raft::raftproto::remote_quorum_message::MessagePayload;
 
 const HEARTBEAT_INTERVAL_MS: u128 = 100;
@@ -137,7 +138,9 @@ impl CapnpQuorumWorker {
         log::info!("Running Cap'n Proto quorum worker for member {}", self.member_id);
         let mut pending_tasks: Vec<PendingQuorumTask> = vec![];
 
+        let desired_cadence_micros = 50;
         loop {
+            let start_time = Instant::now();
             // Ensure we have connections
             if !self.ensure_connections().await {
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -156,8 +159,13 @@ impl CapnpQuorumWorker {
             // Process work queue items
             self.process_work_queue().await;
 
-            // Yield to other tasks
-            yield_now().await;
+            let elapsed_micros = start_time.elapsed().as_micros();
+            if elapsed_micros < desired_cadence_micros {
+                tokio::time::sleep(Duration::from_micros((desired_cadence_micros-elapsed_micros) as u64)).await;
+            } else {
+                // Yield to other tasks
+                yield_now().await;
+            }
         }
     }
 

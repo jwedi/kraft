@@ -2,10 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+use std::thread::sleep;
+use std::time::Duration;
 use bus::BusReader;
 use crossbeam_queue::SegQueue;
 use log::{debug, info, warn};
 use tokio::sync::oneshot;
+use tokio::time::Instant;
 use crate::client::cluster_node_client::SharedGrpcChannel;
 use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask};
 use crate::raft::raft_sm::{CommitState, LocalRaftMessage};
@@ -54,7 +57,9 @@ impl QueryWorker {
         let mut parked_request: Option<QueryRequest> = None;
         let mut applied_index: u64 = 0;
         let mut applied_term: u64 = 0;
+        let desired_cadence_micros = 10;
         loop {
+            let start_time = Instant::now();
             let current_version = self.commit_state.version.load(Ordering::Acquire);
             if current_version != last_version {
                 let index = self.commit_state.commit_index.load(Ordering::Acquire);
@@ -117,7 +122,6 @@ impl QueryWorker {
                         self.handle_query(query)
                     } else {
                         parked_request = Some(query);
-                        thread::yield_now();
                         continue
                     }
                 }
@@ -145,6 +149,13 @@ impl QueryWorker {
                         break;
                     }
                 }
+            }
+
+            let elapsed_micros = start_time.elapsed().as_micros();
+            if elapsed_micros < desired_cadence_micros {
+                sleep(Duration::from_micros((desired_cadence_micros-elapsed_micros) as u64));
+            } else {
+                thread::yield_now()
             }
         }
     }

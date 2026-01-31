@@ -9,6 +9,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use crossbeam_queue::SegQueue;
 use csv::{ReaderBuilder, Writer, WriterBuilder};
+use tokio::time::Instant;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -32,10 +33,6 @@ pub struct PersistenceConfig {
     pub out_dir: String
 }
 
-// Writes persistent state such as term votes to disk
-// Writes append entries to disk
-// Reads persistent state from disk
-// Reads log from disk.
 pub struct PersistenceWorker {
     work_queue: Arc<SegQueue<PersistenceTaskType>>,
     response_queue: Arc<SegQueue<PersistenceResponseType>>,
@@ -127,7 +124,7 @@ impl PersistenceWorker {
                 None => {
                     // Queue empty - flush any pending writes to ensure durability
                     self.flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses).unwrap();
-                    thread::yield_now()
+                    sleep(Duration::from_micros(25));
                 }
             }
         }
