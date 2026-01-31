@@ -159,9 +159,10 @@ impl QuorumWorker {
     pub async fn run(&mut self) {
         log::info!("Running quorum worker");
         let mut pending_tasks: Vec<PendingQuorumTask> = vec![];
+        let desired_cadence_micros = 50;
 
         loop {
-            let start_time = std::time::Instant::now();
+            let start_time = tokio::time::Instant::now();
 
             // Stream setup
             let maybe_receive_stream = self.stream_manager.get_receive_stream(self.member_id as u32).await;
@@ -223,8 +224,11 @@ impl QuorumWorker {
                 self.reset_streams().await;
             }
 
-            // CPU throttling
-            if start_time.elapsed().as_micros() < 200 {
+            let elapsed_micros = start_time.elapsed().as_micros();
+            if elapsed_micros < desired_cadence_micros {
+                tokio::time::sleep(Duration::from_micros((desired_cadence_micros-elapsed_micros) as u64)).await;
+            } else {
+                // Yield to other tasks
                 yield_now().await;
             }
         }
