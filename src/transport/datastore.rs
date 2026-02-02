@@ -11,6 +11,7 @@ use tokio::sync::oneshot::{Receiver, Sender};
 use crate::runtime_core::task_buffer::TaskBufferImpl;
 use crate::runtime_core::types::{Command, RuntimeTask, RuntimeTaskResponse, CommandType};
 use crate::transport::raft::raftproto::{RemotePutRequest, RemotePutResponse};
+use crate::transport::capnp::{OwnedWriteBatch, build_owned_write_batch};
 use crate::service_utils::errors::ServiceError;
 use crate::raft::raft_sm::{RaftStateMachineExecutor, StateMachineExecutorImpl, RaftServerState, TermVote, RaftVolatileState, SharedState, LocalRaftMessage, LocalRaftMessagePayload, LocalRequestVoteRequest, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalAppendEntries, LocalRaftWriteBatchRequest, CommitState};
 use crossbeam_queue::SegQueue;
@@ -39,13 +40,11 @@ impl Datastore for DatastoreServerImpl {
         let _timing_guard = crate::transport::metrics::record_rpc_request("get_record");
         let callback: (Sender<QueryResponse>, Receiver<QueryResponse>) = oneshot::channel();
         let commit_index = self.commit_state.commit_index.load(Ordering::Acquire);
-        let term = self.commit_state.term.load(Ordering::Acquire);
 
         let req_id = request.into_inner().id;
         self.query_queue.push(QueryRequest{
             id: req_id.clone(),
             index: commit_index,
-            term,
             callback: callback.0
         });
         let span = tracing::span!(Level::INFO, "awaiting_get_record");
@@ -73,6 +72,7 @@ impl Datastore for DatastoreServerImpl {
             }
             Err(e) => {
                 tracing::info!("get record receive error {}", e);
+                error!("get record receive error {}", e);
                 Err(Status::internal(e.to_string()))
             }
         }
@@ -84,26 +84,35 @@ impl Datastore for DatastoreServerImpl {
         tracing::debug!("received put_records request");
 
         let req = request.into_inner();
-        let put_req = RemotePutRequest {
-            id: req.key,
-            node_id: 0,
-            payload: req.value
-        };
+        let batch_id = Uuid::new_v4().to_string();
+
+        // Convert protobuf request to Cap'n Proto immediately for zero-copy internal handling
+        let write_batch_message = build_owned_write_batch(|mut builder| {
+            builder.set_batch_id(&batch_id);
+            let mut requests = builder.init_requests(1);
+            let mut put_req = requests.get(0);
+            put_req.set_id(&req.key);
+            put_req.set_payload(req.value.as_bytes());
+            put_req.set_node_id(0);
+        });
+
         let callback: (Sender<WriteResponse>, Receiver<WriteResponse>) = oneshot::channel();
         let span = tracing::span!(Level::INFO, "awaiting_put_record");
-        let msg = WriteBatch{
-            batch_id: Uuid::new_v4().to_string(),
-            requests: vec![put_req],
+        let msg = WriteBatch {
+            batch_id,
+            message: write_batch_message,
             callback: callback.0,
             span_parent: Some(span.clone())
         };
         self.task_queue.push(msg);
-        let mut receive_resp = callback.1.instrument(span).await;
+        let receive_resp = callback.1.instrument(span).await;
 
         match receive_resp {
-            Ok(mut resp) => {
+            Ok(resp) => {
                 tracing::debug!("put record returned ok");
-                match resp.responses.pop() {
+                // Convert Cap'n Proto response back to protobuf for the gRPC response
+                let mut responses = resp.to_protobuf_responses();
+                match responses.pop() {
                     None => {
                         Ok(Response::new(
                             PutDataStoreRecordResponse {
@@ -113,14 +122,14 @@ impl Datastore for DatastoreServerImpl {
                     }
                     Some(first) => {
                         Ok(Response::new(PutDataStoreRecordResponse {
-                            record: Some(DataStoreRecord{id: first.id, payload: first.message})
+                            record: Some(DataStoreRecord { id: first.id, payload: first.message })
                         }))
                     }
                 }
-
             }
             Err(e) => {
                 tracing::info!("put record receive error {}", e);
+                error!("put record receive error {}", e);
                 Err(Status::internal(e.to_string()))
             }
         }

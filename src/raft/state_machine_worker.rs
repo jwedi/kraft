@@ -23,7 +23,7 @@ impl StateMachineWorker {
 
     pub fn run(&mut self) {
         log::info!("Running worker");
-        let desired_cadence_micros = 10;
+        let desired_cadence_micros = 20;
         loop {
             let start_time = Instant::now();
             self.state_machine.time_step();

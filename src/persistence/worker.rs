@@ -9,6 +9,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use crossbeam_queue::SegQueue;
 use csv::{ReaderBuilder, Writer, WriterBuilder};
+use log::info;
 use tokio::time::Instant;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -57,7 +58,7 @@ impl PersistenceWorker {
     }
 
     pub fn run(&mut self) {
-        tracing::info!("Running persistence worker");
+        info!("Running persistence worker");
 
         // Batch size for accumulating AppendLog tasks before flushing
         const BATCH_SIZE: usize = 32;

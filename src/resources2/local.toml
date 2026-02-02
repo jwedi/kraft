@@ -4,7 +4,7 @@ node_id = 2
 persistence_dir = "out2/"
 max_message_size_bytes = 4096
 metrics_port = 51052
-use_capnp_transport = false
+use_capnp_transport = true
 capnp_port = 51152
 [[cluster_nodes]]
 endpoint = "http://[::1]:50051"

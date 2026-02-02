@@ -8,6 +8,7 @@ use std::sync::{Arc, Condvar};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use crossbeam_queue::SegQueue;
+use log::{error, info, warn};
 use opentelemetry::Context;
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::{SpanBuilder, TraceContextExt};
@@ -29,34 +30,77 @@ use crate::raft::raft_sm::{LocalRaftMessage, LocalRaftMessagePayload, LocalRaftR
 use crate::transport::raft::raftproto::{RemotePutBatchRequest, RemotePutBatchResponse, RemotePutRequest, RemotePutResponse};
 use crate::transport::raft::raftproto::raft_client::RaftClient;
 use crate::service_utils::app_time::now_millis;
-use sbe_kraft_replication_schema::{log_entry_codec, message_header_codec, WriteBuf};
-use sbe_kraft_replication_schema::command_codec::CommandEncoder;
-use sbe_kraft_replication_schema::log_entry_codec::LogEntryEncoder;
-use crate::quorum::worker::{LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
+use crate::quorum::types::{LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
+use crate::transport::capnp::{OwnedWriteBatch, OwnedWriteBatchResponse, build_owned_write_batch, build_owned_write_batch_response};
 
+/// Response from a write batch operation.
+/// Contains Cap'n Proto response for zero-copy internal handling.
 #[derive(Debug)]
 pub struct WriteResponse {
-    pub responses: Vec<RemotePutResponse>,
+    pub message: OwnedWriteBatchResponse,
     pub status_code: StatusCode
 }
 
+impl WriteResponse {
+    /// Create an empty error response
+    pub fn error(status_code: StatusCode) -> Self {
+        let message = build_owned_write_batch_response(|_| {});
+        Self { message, status_code }
+    }
+
+    /// Create a successful response from Cap'n Proto message
+    pub fn success(message: OwnedWriteBatchResponse) -> Self {
+        Self { message, status_code: StatusCode::OK }
+    }
+
+    /// Convert responses to protobuf for external API boundary
+    pub fn to_protobuf_responses(&self) -> Vec<RemotePutResponse> {
+        self.message.with_message(|r| {
+            r.get_responses().map(|resps| {
+                resps.iter().map(|resp| {
+                    RemotePutResponse {
+                        id: resp.get_id().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default(),
+                        response_type: match resp.get_response_type() {
+                            Ok(crate::transport::capnp::raft_capnp::RemoteResponseType::Ok) => 1,
+                            Ok(crate::transport::capnp::raft_capnp::RemoteResponseType::Invalid) => 2,
+                            _ => 0,
+                        },
+                        message: resp.get_message().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default(),
+                        node_id: resp.get_node_id(),
+                        batch_id: resp.get_batch_id().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default(),
+                    }
+                }).collect()
+            }).unwrap_or_default()
+        }).unwrap_or_default()
+    }
+}
+
+/// A batch of write requests using Cap'n Proto for zero-copy handling.
 #[derive(Debug)]
 pub struct WriteBatch {
     pub batch_id: String,
-    pub requests: Vec<RemotePutRequest>,
+    pub message: OwnedWriteBatch,
     pub span_parent: Option<Span>,
     pub callback: oneshot::Sender<WriteResponse>
 }
 
 impl WriteBatch {
+    /// Get the total size of all payloads in the batch
     pub fn size(&self) -> u64 {
-        self.requests.iter().map(|v| v.get_size()).sum()
+        self.message.with_message(|r| {
+            r.get_requests().map(|reqs| {
+                reqs.iter().map(|req| {
+                    req.get_payload().map(|p| p.len() as u64).unwrap_or(0)
+                }).sum()
+            }).unwrap_or(0)
+        }).unwrap_or(0)
     }
-}
 
-impl RemotePutRequest {
-    pub fn get_size(&self) -> u64 {
-        self.payload.len() as u64
+    /// Get the number of requests in this batch
+    pub fn request_count(&self) -> usize {
+        self.message.with_message(|r| {
+            r.get_requests().map(|reqs| reqs.len() as usize).unwrap_or(0)
+        }).unwrap_or(0)
     }
 }
 
@@ -157,51 +201,56 @@ impl WriteProxy {
 
     }
 
-    fn respond_to_put_responses(responses: Vec<RemotePutResponse>, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
-        let mut grouped: HashMap<String, Vec<RemotePutResponse>> = HashMap::new();
-
-        for resp in responses {
-            let entry = grouped.entry(resp.id.clone()); // TODO clone
-            entry.or_insert(vec![]).push(resp);
-        }
-
-        for b in batch_callbacks {
-            let maybe_responses = grouped.remove(&b.0).unwrap_or_else(|| vec![]);
-            let msg = WriteResponse {
-                responses: maybe_responses,
-                status_code: StatusCode::OK
-            };
-            match b.1.send(msg) {
-                Ok(_) => {}
-                Err(_) => {
-                    tracing::info!("Sending write response callback failed because the receiver dropped");
-                }
+    fn respond_to_batch_callbacks(response: OwnedWriteBatchResponse, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
+        // For now, send the same response to all callbacks
+        // TODO: Group responses by batch_id if needed
+        for (batch_id, callback) in batch_callbacks {
+            let batch_response = build_owned_write_batch_response(|mut builder| {
+                builder.set_batch_id(&batch_id);
+                // Copy relevant responses from the combined response
+                let _ = response.with_message(|r| {
+                    if let Ok(resps) = r.get_responses() {
+                        let mut out_resps = builder.init_responses(resps.len() as u32);
+                        for (i, resp) in resps.iter().enumerate() {
+                            let mut out = out_resps.reborrow().get(i as u32);
+                            if let Ok(id) = resp.get_id() {
+                                out.set_id(id);
+                            }
+                            if let Ok(rt) = resp.get_response_type() {
+                                out.set_response_type(rt);
+                            }
+                            if let Ok(msg) = resp.get_message() {
+                                out.set_message(msg);
+                            }
+                            out.set_node_id(resp.get_node_id());
+                            if let Ok(bid) = resp.get_batch_id() {
+                                out.set_batch_id(bid);
+                            }
+                        }
+                    }
+                });
+            });
+            let msg = WriteResponse::success(batch_response);
+            if callback.send(msg).is_err() {
+                warn!("Sending write response callback failed because the receiver dropped");
             }
         }
     }
 
     fn handle_insert_completed(msg: LocalRaftResponseMessage, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
-
         match msg.payload {
-            LocalRaftResponsePayload::WriteBatch (responses ) => {
-                WriteProxy::respond_to_put_responses(responses.responses, batch_callbacks)
+            LocalRaftResponsePayload::WriteBatch(response) => {
+                WriteProxy::respond_to_batch_callbacks(response.message, batch_callbacks)
             }
             _ => {
                 batch_callbacks.into_iter().for_each(|callback| {
-                    let msg = WriteResponse {
-                        responses: vec![],
-                        status_code: StatusCode::INTERNAL_SERVER_ERROR
-                    };
-                    match callback.1.send(msg) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            log::warn!("Sending write response callback failed because the receiver dropped");
-                        }
+                    let msg = WriteResponse::error(StatusCode::INTERNAL_SERVER_ERROR);
+                    if callback.1.send(msg).is_err() {
+                        log::warn!("Sending write response callback failed because the receiver dropped");
                     }
                 });
             }
         }
-
     }
 
     async fn handle_local_write_response(receiver: Receiver<LocalRaftResponseMessage>, parent_span: Span, batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>>) {
@@ -220,22 +269,74 @@ impl WriteProxy {
     }
 
 
-    fn prepare_batch_and_callbacks(batches: Vec<WriteBatch>) -> (Vec<RemotePutRequest>, HashMap<String, Sender<WriteResponse>>) {
-        let mut all_requests: Vec<RemotePutRequest> = vec![];
+    /// Combines multiple WriteBatches into a single OwnedWriteBatch for processing.
+    /// This involves extracting data from each batch and building a new combined message.
+    /// The callbacks are collected for later response routing.
+    fn prepare_batch_and_callbacks(batch_id: &str, batches: Vec<WriteBatch>) -> (OwnedWriteBatch, HashMap<String, Sender<WriteResponse>>) {
         let mut batch_callbacks: HashMap<String, oneshot::Sender<WriteResponse>> = HashMap::new();
-        for mut b in batches.into_iter() {
-            all_requests.append(&mut b.requests);
-            batch_callbacks.insert(b.batch_id, b.callback);
+
+        // First, collect all request data from all batches
+        struct RequestData {
+            id: String,
+            payload: Vec<u8>,
+            node_id: u32,
         }
-        (all_requests, batch_callbacks)
+        let mut all_requests: Vec<RequestData> = vec![];
+
+        for b in batches.into_iter() {
+            batch_callbacks.insert(b.batch_id.clone(), b.callback);
+
+            // Extract requests from this batch's OwnedWriteBatch
+            let _ = b.message.with_message(|reader| {
+                if let Ok(reqs) = reader.get_requests() {
+                    for req in reqs.iter() {
+                        all_requests.push(RequestData {
+                            id: req.get_id().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default(),
+                            payload: req.get_payload().map(|p| p.to_vec()).unwrap_or_default(),
+                            node_id: req.get_node_id(),
+                        });
+                    }
+                }
+            });
+        }
+
+        // Build combined OwnedWriteBatch
+        let combined = build_owned_write_batch(|mut builder| {
+            builder.set_batch_id(batch_id);
+            let mut reqs = builder.init_requests(all_requests.len() as u32);
+            for (i, req_data) in all_requests.iter().enumerate() {
+                let mut req = reqs.reborrow().get(i as u32);
+                req.set_id(&req_data.id);
+                req.set_payload(&req_data.payload);
+                req.set_node_id(req_data.node_id);
+            }
+        });
+
+        (combined, batch_callbacks)
     }
 
-    fn prepare_put_batch_request(batch_id: String, put_requests: Vec<RemotePutRequest>, span_parent: Span, propagator: &Propagator) -> Request<RemotePutBatchRequest> {
-        let req = RemotePutBatchRequest {
-            batch_id,
-            put_request: put_requests
-        };
+    /// Convert OwnedWriteBatch to protobuf RemotePutBatchRequest for gRPC fallback
+    fn owned_batch_to_protobuf(batch_id: &str, batch: &OwnedWriteBatch) -> RemotePutBatchRequest {
+        let put_requests = batch.with_message(|r| {
+            r.get_requests().map(|reqs| {
+                reqs.iter().map(|req| {
+                    RemotePutRequest {
+                        id: req.get_id().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default(),
+                        payload: req.get_payload().map(|p| String::from_utf8_lossy(p).to_string()).unwrap_or_default(),
+                        node_id: req.get_node_id(),
+                    }
+                }).collect()
+            }).unwrap_or_default()
+        }).unwrap_or_default();
 
+        RemotePutBatchRequest {
+            batch_id: batch_id.to_string(),
+            put_request: put_requests,
+        }
+    }
+
+    fn prepare_put_batch_request(batch_id: &str, batch: &OwnedWriteBatch, span_parent: Span, propagator: &Propagator) -> Request<RemotePutBatchRequest> {
+        let req = WriteProxy::owned_batch_to_protobuf(batch_id, batch);
         let mut request = tonic::Request::new(req);
 
         // Tracing stuff
@@ -253,12 +354,24 @@ impl WriteProxy {
         request
     }
 
-    async fn send_quorum_put_batch_and_handle_response(leader_quorum_worker: Arc<SegQueue<LocalQuorumWorkerTask>>, request: RemotePutBatchRequest, batch_callbacks: HashMap<String, Sender<WriteResponse>>, span: Span) {
-
+    async fn send_quorum_put_batch_and_handle_response(
+        leader_quorum_worker: Arc<SegQueue<LocalQuorumWorkerTask>>,
+        batch_id: String,
+        batch: OwnedWriteBatch,
+        batch_callbacks: HashMap<String, Sender<WriteResponse>>,
+        span: Span
+    ) {
         let s = span.clone();
         let callback: (Sender<WriteResponse>, Receiver<WriteResponse>) = oneshot::channel();
-        let wb = LocalQuorumWorkerTaskType::WriteBatch { write_batch: WriteBatch { batch_id: request.batch_id, requests: request.put_request, span_parent: Some(span.clone()), callback: callback.0 } };
-        leader_quorum_worker.push(LocalQuorumWorkerTask{task_type: wb});
+        let wb = LocalQuorumWorkerTaskType::WriteBatch {
+            write_batch: WriteBatch {
+                batch_id: batch_id.clone(),
+                message: batch,
+                span_parent: Some(span.clone()),
+                callback: callback.0
+            }
+        };
+        leader_quorum_worker.push(LocalQuorumWorkerTask { task_type: wb });
         let resp = callback.1.instrument(s).await;
         match resp {
             Ok(put_response) => {
@@ -266,24 +379,49 @@ impl WriteProxy {
                 write_callback_span.set_parent(span.context());
                 write_callback_span.in_scope(|| {
                     tracing::event!(Level::INFO, "sending successful callback");
-                    WriteProxy::respond_to_put_responses(put_response.responses, batch_callbacks)
+                    WriteProxy::respond_to_batch_callbacks(put_response.message, batch_callbacks)
                 })
             }
             Err(e) => {
                 tracing::error!("Remote PutBatch request failed with error: {}", e);
-                for b in batch_callbacks {
-                    let msg = WriteResponse {
-                        responses: vec![],
-                        status_code: StatusCode::INTERNAL_SERVER_ERROR
-                    };
-                    b.1.send(msg);
+                error!("Remote PutBatch request failed with error: {}", e);
+                for (_, callback) in batch_callbacks {
+                    let msg = WriteResponse::error(StatusCode::INTERNAL_SERVER_ERROR);
+                    if let Err(_) = callback.send(msg) {
+                        warn!("Failed to send write batch response on channel, receiver dropped")
+                    }
                 }
             }
         }
     }
 
-    async fn send_remote_put_batch_and_handle_response(mut client: RaftClient<Channel>, request: Request<RemotePutBatchRequest>, batch_callbacks: HashMap<String, Sender<WriteResponse>>, span: Span) {
+    /// Convert protobuf responses to OwnedWriteBatchResponse
+    fn protobuf_responses_to_owned(batch_id: &str, responses: Vec<RemotePutResponse>) -> OwnedWriteBatchResponse {
+        build_owned_write_batch_response(|mut builder| {
+            builder.set_batch_id(batch_id);
+            let mut out_resps = builder.init_responses(responses.len() as u32);
+            for (i, resp) in responses.iter().enumerate() {
+                let mut out = out_resps.reborrow().get(i as u32);
+                out.set_id(&resp.id);
+                out.set_response_type(match resp.response_type {
+                    1 => crate::transport::capnp::raft_capnp::RemoteResponseType::Ok,
+                    2 => crate::transport::capnp::raft_capnp::RemoteResponseType::Invalid,
+                    _ => crate::transport::capnp::raft_capnp::RemoteResponseType::Unspecified,
+                });
+                out.set_message(&resp.message);
+                out.set_node_id(resp.node_id);
+                out.set_batch_id(&resp.batch_id);
+            }
+        })
+    }
 
+    async fn send_remote_put_batch_and_handle_response(
+        mut client: RaftClient<Channel>,
+        batch_id: String,
+        request: Request<RemotePutBatchRequest>,
+        batch_callbacks: HashMap<String, Sender<WriteResponse>>,
+        span: Span
+    ) {
         let s = span.clone();
         let resp = client.put_batch(request).instrument(s).await;
         match resp {
@@ -292,17 +430,15 @@ impl WriteProxy {
                 write_callback_span.set_parent(span.context());
                 write_callback_span.in_scope(|| {
                     tracing::event!(Level::INFO, "sending successful callback");
-                    WriteProxy::respond_to_put_responses(put_response.into_inner().responses, batch_callbacks)
+                    let owned_response = WriteProxy::protobuf_responses_to_owned(&batch_id, put_response.into_inner().responses);
+                    WriteProxy::respond_to_batch_callbacks(owned_response, batch_callbacks)
                 })
             }
             Err(e) => {
                 tracing::error!("Remote PutBatch request failed with error: {}", e);
-                for b in batch_callbacks {
-                    let msg = WriteResponse {
-                        responses: vec![],
-                        status_code: StatusCode::INTERNAL_SERVER_ERROR
-                    };
-                    b.1.send(msg);
+                for (_, callback) in batch_callbacks {
+                    let msg = WriteResponse::error(StatusCode::INTERNAL_SERVER_ERROR);
+                    let _ = callback.send(msg);
                 }
             }
         }
@@ -362,20 +498,20 @@ impl WriteProxy {
                 }
             }
 
-            let (mut batch, full_batch) = self.write_queue.next_write_batch(self.max_batch_size);
+            let (batch, full_batch) = self.write_queue.next_write_batch(self.max_batch_size);
             let start_time = now_millis();
             if !batch.is_empty() {
-                let mut new_root = tracing::span!(Level::INFO, "write_proxy_batch_process", batch_requests=batch.iter().map(|b| b.requests.len()).sum::<usize>(), num_batches=batch.len());
+                let batch_requests: usize = batch.iter().map(|b| b.request_count()).sum();
+                let num_batches: u64 = batch.len() as u64;
+                let mut new_root = tracing::span!(Level::INFO, "write_proxy_batch_process", batch_requests=batch_requests, num_batches=num_batches);
                 new_root.set_parent(Context::new());
                 let _enter = new_root.enter();
                 let batch_id = uuid::Uuid::new_v4().to_string();
-                let batch_requests: u64 = batch.iter().map(|b| b.requests.len() as u64).sum();
-                let num_batches: u64 = batch.len() as u64;
-                let mut preparation = WriteProxy::prepare_batch_and_callbacks(batch);
-                let all_requests = preparation.0;
-                let mut batch_callbacks = preparation.1;
-                let request_size: u64 = all_requests.iter().map(|req| req.get_size()).sum();
-                let num_requests: u64 = all_requests.len() as u64;
+                let (combined_batch, batch_callbacks) = WriteProxy::prepare_batch_and_callbacks(&batch_id, batch);
+                let request_size: u64 = combined_batch.size();
+                let num_requests = combined_batch.with_message(|r| {
+                    r.get_requests().map(|reqs| reqs.len() as u64).unwrap_or(0)
+                }).unwrap_or(0);
                 if request_size == 0 {
                     log::warn!("Request size is 0, batch requests {}, num batches: {}", batch_requests, num_batches)
                 }
@@ -388,7 +524,7 @@ impl WriteProxy {
                     let chan: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
                     let payload = LocalRaftMessagePayload::WriteBatch(
                         LocalRaftWriteBatchRequest {
-                            requests: all_requests,
+                            message: combined_batch,
                         }
                     );
                     let span = tracing::span!(Level::INFO, "write_proxy_local_batch_forward_await", num_requests=num_requests, request_size=request_size);
@@ -407,35 +543,33 @@ impl WriteProxy {
                         let put_batch_span = tracing::span!(Level::INFO, "write_proxy_remote_put_batch", num_requests=num_requests, request_size=request_size);
                         put_batch_span.set_parent(new_root.context());
                         let _enter = put_batch_span.enter();
-                        let request = RemotePutBatchRequest{ put_request: all_requests, batch_id};
 
                         let p = put_batch_span.clone();
                         let leader_quorum_worker_index = if current_leader_id < self.self_id { (current_leader_id - 1) as usize } else { (current_leader_id - 2) as usize };
                         let leader_quorum_worker = Arc::clone(&self.quorum_worker_tasks[leader_quorum_worker_index]);
-                        join_set.spawn(async {
-                            WriteProxy::send_quorum_put_batch_and_handle_response(leader_quorum_worker, request, batch_callbacks, p.clone()).instrument(p).await
+                        let batch_id_clone = batch_id.clone();
+                        join_set.spawn(async move {
+                            WriteProxy::send_quorum_put_batch_and_handle_response(leader_quorum_worker, batch_id_clone, combined_batch, batch_callbacks, p.clone()).instrument(p).await
                         });
                     } else {
                         match self.get_client(current_leader_id).instrument(new_root.clone()).await {
-                            Ok(mut client) => {
+                            Ok(client) => {
                                 let put_batch_span = tracing::span!(Level::INFO, "write_proxy_remote_put_batch", num_requests=num_requests, request_size=request_size);
                                 put_batch_span.set_parent(new_root.context());
                                 let _enter = put_batch_span.enter();
-                                let request = WriteProxy::prepare_put_batch_request(batch_id, all_requests, put_batch_span.clone(), &self.propagator);
+                                let request = WriteProxy::prepare_put_batch_request(&batch_id, &combined_batch, put_batch_span.clone(), &self.propagator);
+                                let batch_id_clone = batch_id.clone();
 
                                 let p = put_batch_span.clone();
-                                join_set.spawn(async {
-                                    WriteProxy::send_remote_put_batch_and_handle_response(client, request, batch_callbacks, p.clone()).instrument(p).await
+                                join_set.spawn(async move {
+                                    WriteProxy::send_remote_put_batch_and_handle_response(client, batch_id_clone, request, batch_callbacks, p.clone()).instrument(p).await
                                 });
                             }
                             Err(e) => {
                                 tracing::error!("Setting up remote client failed with error: {}", e);
-                                for b in batch_callbacks {
-                                    let msg = WriteResponse {
-                                        responses: vec![],
-                                        status_code: StatusCode::INTERNAL_SERVER_ERROR
-                                    };
-                                    b.1.send(msg);
+                                for (_, callback) in batch_callbacks {
+                                    let msg = WriteResponse::error(StatusCode::INTERNAL_SERVER_ERROR);
+                                    let _ = callback.send(msg);
                                 }
                             }
                         }

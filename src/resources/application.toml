@@ -7,7 +7,7 @@ max_batch_size = 512
 min_batch_interval_ms = 2
 metrics_port = 51051
 enable_otel_tracing = false
-use_capnp_transport = false
+use_capnp_transport = true
 capnp_port = 51151
 [[cluster_nodes]]
 endpoint = "http://[::1]:50051"

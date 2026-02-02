@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
-use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
+use crate::quorum::types::{LocalQuorumResponse, LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::raft::leader::RaftLeaderStateDelegate;
 use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRequestVoteRequest, SharedState, TermVote};
@@ -278,6 +278,10 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         let span = tracing::span!(Level::INFO, "candidate_request_vote");
         let _enter = span.enter();
 
+        if shared_state.volatile_server_state.next_term <= request_vote_request.term {
+            shared_state.volatile_server_state.next_term = request_vote_request.term+1;
+        }
+
         if !self.should_accept_vote(request_vote_request.term, request_vote_request.last_log_term, request_vote_request.last_log_index, shared_state) {
             let payload = LocalRaftResponseMessage {
                 payload: LocalRaftResponsePayload::RequestVote(false)
@@ -286,10 +290,6 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                 error!("receiver dropped when trying to send request_vote callback")
             };
             return RaftMessageStateChange::None
-        }
-
-        if shared_state.volatile_server_state.next_term <= request_vote_request.term {
-            shared_state.volatile_server_state.next_term = request_vote_request.term+1;
         }
 
         let message_id = shared_state.next_message_id;

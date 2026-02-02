@@ -30,7 +30,7 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, registry, Registry};
 use crate::config::config::{ClusterNode, read_config};
 use crate::persistence::worker::{PersistenceConfig, PersistenceResponseType, PersistenceTaskType, PersistenceWorker, VoteRow};
 use crate::query::worker::QueryRequest;
-use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask, QuorumWorker};
+use crate::quorum::types::{LocalQuorumResponse, LocalQuorumWorkerTask};
 use crate::quorum::capnp_worker::CapnpQuorumWorker;
 use crate::transport::capnp_stream_manager::CapnpStreamManager;
 use crate::raft::raft_sm::{CommitState, LocalRaftMessage, OutstandingMessage, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig};
@@ -68,8 +68,8 @@ mod persistence {
 }
 
 mod quorum {
-    pub mod worker;
     pub mod capnp_worker;
+    pub mod types;
 }
 
 mod query {
@@ -152,7 +152,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let commit_state = Arc::new(CommitState{
         commit_index: AtomicU64::new(0),
-        term: AtomicU64::new(0),
         version: AtomicU64::new(0)
     });
 
@@ -269,54 +268,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Create workers based on transport choice
-    enum ClusterWorkers {
-        Grpc(Vec<QuorumWorker>),
-        Capnp(Vec<CapnpQuorumWorker>),
-    }
-
-    let cluster_workers = if use_capnp_transport {
-        log::info!("Using Cap'n Proto transport for cluster communication");
-        let capnp_sm = capnp_stream_manager.as_ref().unwrap();
-        let workers: Vec<CapnpQuorumWorker> = cluster_nodes_without_self.iter().map(|node| {
-            let c_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::<LocalQuorumWorkerTask>::new());
-            let c_queue_clone = Arc::clone(&c_queue);
-            quorum_send_channels.push(c_queue);
-            let response_c = Arc::clone(&sm_quorum_response);
-            CapnpQuorumWorker::new(
-                c_queue_clone,
-                response_c,
-                cfg.node_id,
-                0,
-                node.node_id.into(),
-                node.capnp_endpoint.clone(),
-                Arc::clone(capnp_sm),
-                Arc::clone(&task_queue),
-                cfg.max_message_size_bytes
-            )
-        }).collect();
-        ClusterWorkers::Capnp(workers)
-    } else {
-        log::info!("Using gRPC transport for cluster communication");
-        let workers: Vec<QuorumWorker> = cluster_nodes_without_self.iter().map(|node| {
-            let c_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::<LocalQuorumWorkerTask>::new());
-            let c_queue_clone = Arc::clone(&c_queue);
-            quorum_send_channels.push(c_queue);
-            let response_c = Arc::clone(&sm_quorum_response);
-            QuorumWorker::new(
-                c_queue_clone,
-                response_c,
-                cfg.node_id.into(),
-                0,
-                node.node_id.into(),
-                node.endpoint.clone(),
-                Arc::clone(&sm_arc),
-                Arc::clone(&task_queue),
-                cfg.max_message_size_bytes
-            )
-        }).collect();
-        ClusterWorkers::Grpc(workers)
-    };
+    // Create Cap'n Proto workers for cluster communication
+    log::info!("Using Cap'n Proto transport for cluster communication");
+    let capnp_sm = capnp_stream_manager.as_ref().expect("Cap'n Proto stream manager is required");
+    let cluster_workers: Vec<CapnpQuorumWorker> = cluster_nodes_without_self.iter().map(|node| {
+        let c_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::<LocalQuorumWorkerTask>::new());
+        let c_queue_clone = Arc::clone(&c_queue);
+        quorum_send_channels.push(c_queue);
+        let response_c = Arc::clone(&sm_quorum_response);
+        CapnpQuorumWorker::new(
+            c_queue_clone,
+            response_c,
+            cfg.node_id,
+            0,
+            node.node_id.into(),
+            node.capnp_endpoint.clone(),
+            Arc::clone(capnp_sm),
+            Arc::clone(&task_queue),
+            cfg.max_message_size_bytes
+        )
+    }).collect();
 
     let mut log_entry_bus: Bus<Arc<SerializationData>> = Bus::new(5000);
     let mut query_bus_reader = log_entry_bus.add_rx();
@@ -389,29 +360,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Spawn cluster workers based on transport type
+    // Spawn Cap'n Proto cluster workers
     let mut cw_join_handles: Vec<JoinHandle<bool>> = vec![];
-    match cluster_workers {
-        ClusterWorkers::Grpc(workers) => {
-            for mut cw in workers {
-                let handle = spawn(async move {
-                    tracing::info!(message = "Spawning gRPC quorum worker");
-                    cw.run().await;
-                    true
-                });
-                cw_join_handles.push(handle);
-            }
-        }
-        ClusterWorkers::Capnp(workers) => {
-            for mut cw in workers {
-                let handle = spawn(async move {
-                    tracing::info!(message = "Spawning Cap'n Proto quorum worker");
-                    cw.run().await;
-                    true
-                });
-                cw_join_handles.push(handle);
-            }
-        }
+    for mut cw in cluster_workers {
+        let handle = spawn(async move {
+            tracing::info!(message = "Spawning Cap'n Proto quorum worker");
+            cw.run().await;
+            true
+        });
+        cw_join_handles.push(handle);
     }
 
     info!("Starting server {}", addr);

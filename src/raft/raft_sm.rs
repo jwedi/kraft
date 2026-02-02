@@ -10,9 +10,10 @@ use std::thread;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
-use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask};
+use crate::quorum::types::{LocalQuorumResponse, LocalQuorumWorkerTask};
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::transport::raft::raftproto::{RemoteLogEntry, RemotePutRequest, RemotePutResponse};
+use crate::transport::capnp::{OwnedWriteBatch, OwnedWriteBatchResponse, build_owned_write_batch_response};
 use crate::transport::raft::raftproto::raft_server::Raft;
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils::SerializationData;
@@ -20,7 +21,7 @@ use crate::transport::write_proxy::{WriteBatch, WriteResponse};
 use std::time::{Duration, Instant};
 use bus::Bus;
 use log::kv::Source;
-use log::warn;
+use log::{info, warn};
 
 #[derive(Copy, Clone)]
 
@@ -55,7 +56,6 @@ pub struct RaftVolatileState {
 
 pub struct CommitState {
     pub commit_index: AtomicU64,
-    pub term: AtomicU64,
     pub version: AtomicU64,
 }
 
@@ -265,7 +265,7 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                 } else {
                     log::error!("Received write batch as non-leader. Leader is {}", self.shared_state.server_state.leader_id);
                     let resp = LocalRaftWriteBatchResponse {
-                        responses: vec![],
+                        message: build_owned_write_batch_response(|_| {}),
                         err: Some("Received write batch as non-leader".to_string())
                     };
                     let msg = LocalRaftResponsePayload::WriteBatch(resp);
@@ -311,16 +311,16 @@ pub trait RaftProtocol {
     fn should_accept_vote(&mut self, term: u64, last_log_term: u64, last_log_index: u64, shared_state: &mut SharedState) -> bool {
         if let Some(voted_for) = shared_state.term_votes.get(&term) {
             // Node have already voted for someone this term.
-            tracing::info!(message = "Rejecting vote, node has already voted this term.", term);
+            info!("Rejecting vote, node has already voted for candidate {} this term {}", voted_for, term);
             return false
         }
 
         if term <= shared_state.server_state.current_term {
-            tracing::info!(message = "Rejecting vote, proposed term is lower than current.", term);
+            info!("Rejecting vote, proposed term {} is lower than current {}.", term, shared_state.server_state.current_term);
             return false
         }
-        if last_log_term < shared_state.volatile_server_state.last_log_term || last_log_index < shared_state.volatile_server_state.last_log_index {
-            tracing::info!(message = "Rejecting vote, proposer has fewer log entries than node.", term);
+        if last_log_index < shared_state.volatile_server_state.last_log_index {
+            info!("Rejecting vote, proposer has fewer log entries than node {}.", term);
             return false
         }
         true
@@ -371,10 +371,16 @@ pub enum LocalAppendEntriesCallbackResponse {
     TruncateLog{ prev_term: u64, prev_index: u64} // Leader is telling follower to truncate log to this point
 }
 
-#[derive(Debug)]
+/// Response from a write batch operation, using Cap'n Proto for zero-copy.
 pub struct LocalRaftWriteBatchResponse {
-    pub responses: Vec<RemotePutResponse>,
+    pub message: OwnedWriteBatchResponse,
     pub err: Option<String>
+}
+
+impl std::fmt::Debug for LocalRaftWriteBatchResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LocalRaftWriteBatchResponse {{ message: {:?}, err: {:?} }}", self.message, self.err)
+    }
 }
 
 #[derive(Debug)]
@@ -382,8 +388,15 @@ pub struct LocalRaftResponseMessage {
     pub payload: LocalRaftResponsePayload,
 }
 
+/// Write batch request using Cap'n Proto for zero-copy internal handling.
 pub struct LocalRaftWriteBatchRequest {
-    pub requests: Vec<RemotePutRequest>,
+    pub message: OwnedWriteBatch,
+}
+
+impl std::fmt::Debug for LocalRaftWriteBatchRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LocalRaftWriteBatchRequest {{ message: {:?} }}", self.message)
+    }
 }
 
 pub enum LocalRaftMessagePayload {
@@ -434,7 +447,7 @@ mod integration_tests {
     use super::*;
     use crate::raft::leader::RaftLeaderStateDelegate;
     use crate::raft::follower::RaftFollowerStateDelegate;
-    use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumTaskResponseType, LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
+    use crate::quorum::types::{LocalQuorumResponse, LocalQuorumTaskResponseType, LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
     use crate::service_utils::storage_utils::SerializationData;
     use std::collections::HashMap;
     use std::sync::Arc;

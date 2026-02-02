@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
-use crate::quorum::worker::{LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
+use crate::quorum::types::{LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
 use crate::raft::candidate::RaftCandidateStateDelegate;
 use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRaftWriteBatchResponse, LocalRequestVoteRequest, SharedState, TermVote};
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
@@ -121,10 +121,9 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 } else {
                     // TODO commit index start at 0, for each term, we need to know if this is a new term or not.
                     // If it's a new term we should enter here.
-                    if append_entries_request.commit_index > shared_state.volatile_server_state.commit_index || shared_state.volatile_server_state.commit_state.term.load(Ordering::Acquire) != append_entries_request.term {
+                    if append_entries_request.commit_index > shared_state.volatile_server_state.commit_index || shared_state.server_state.current_term != append_entries_request.term {
                         shared_state.volatile_server_state.commit_index = append_entries_request.commit_index;
                         shared_state.volatile_server_state.commit_state.commit_index.store(append_entries_request.commit_index, Ordering::Release);
-                        shared_state.volatile_server_state.commit_state.term.store(append_entries_request.term, Ordering::Release);
                         shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
                         log::info!("Updated commit index to {}", append_entries_request.commit_index);
 
@@ -202,7 +201,6 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             if append_entries_request.commit_index > shared_state.volatile_server_state.commit_index {
                 shared_state.volatile_server_state.commit_index = append_entries_request.commit_index;
                 shared_state.volatile_server_state.commit_state.commit_index.store(append_entries_request.commit_index, Ordering::Release);
-                shared_state.volatile_server_state.commit_state.term.store(append_entries_request.term, Ordering::Release);
                 shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
                 // Broadcast newly committed entries to query workers
@@ -338,6 +336,11 @@ impl RaftProtocol for RaftFollowerStateDelegate {
     fn request_vote(&mut self, request_vote_request: LocalRequestVoteRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
         let span = tracing::span!(Level::INFO, "follower_request_vote");
         let _enter = span.enter();
+
+        if shared_state.volatile_server_state.next_term <= request_vote_request.term {
+            shared_state.volatile_server_state.next_term = request_vote_request.term+1;
+        }
+
         if !self.should_accept_vote(request_vote_request.term, request_vote_request.last_log_term, request_vote_request.last_log_index, shared_state) {
             callback.send(
                 LocalRaftResponseMessage {
@@ -345,9 +348,6 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 }
             ).expect("response callback for request_vote failed");
             return RaftMessageStateChange::None
-        }
-        if shared_state.volatile_server_state.next_term <= request_vote_request.term {
-            shared_state.volatile_server_state.next_term = request_vote_request.term+1;
         }
 
         let message_id = shared_state.next_message_id;
@@ -371,7 +371,7 @@ mod tests {
     use std::collections::HashMap;
     use super::*;
     use crate::raft::raft_sm::*;
-    use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumTaskResponseType};
+    use crate::quorum::types::{LocalQuorumResponse, LocalQuorumTaskResponseType};
     use tokio::sync::oneshot;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;

@@ -1,19 +1,22 @@
 #![feature(future_join)]
 
 use std::collections::hash_map::DefaultHasher;
+use std::error::Error;
 use std::future::{join, Future};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use futures::future::join_all;
+use log::{error, info};
 use tokio::io::join;
 use datastoreproto::datastore_client::DatastoreClient;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tonic::Response;
 use tonic::transport::Channel;
 
-use crate::datastoreproto::{GetDataStoreRecordRequest, PutDataStoreRecordRequest};
+use crate::datastoreproto::{GetDataStoreRecordRequest, GetDataStoreRecordResponse, PutDataStoreRecordRequest};
 
 pub mod ping {
     tonic::include_proto!("ping");
@@ -247,9 +250,11 @@ where
                     metrics.record_latency(latency_micros);
                 }
                 Ok(Err(_e)) => {
+                    //error!("Error {}", _e);
                     metrics.record_error();
                 }
                 Err(_) => {
+                    //error!("Timeout error");
                     // Timeout
                     metrics.record_error();
                 }
@@ -327,6 +332,26 @@ async fn do_write_batch_async(config: &LoadTestConfig) -> Result<(), Box<dyn std
     );
 
     Ok(())
+}
+
+async fn do_get_one_record_async(config: &LoadTestConfig) -> Result<Response<GetDataStoreRecordResponse>, Box<dyn Error + Send + Sync>> {
+    let mut channels = Vec::new();
+    for endpoint in &config.endpoints {
+        let channel = Channel::from_shared(endpoint.clone()).unwrap()
+        .connect()
+        .await.unwrap();
+        channels.push(channel);
+    };
+
+    let mut request = tonic::Request::new(GetDataStoreRecordRequest {
+        id: "123".to_string(),
+    });
+
+    let mut client = DatastoreClient::new(channels.first().unwrap().clone());
+    info!("Sending Get DataStoreRecordRequest");
+    client.get_record(request).await.map_err(|e| {
+        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+    })
 }
 
 async fn do_get_record_async(config: &LoadTestConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -488,15 +513,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = LoadTestConfig {
-        concurrency: 1000,
+        concurrency: 1500,
         max_requests: 1_500_000,
         checkpoint_interval_secs: 5,
         ..Default::default()
     };
 
     let mixed_handle = do_mixed_operations_async(&config, 0.2);
+    //let mixed_handle = do_get_record_async(&config);
+    //let mixed_handle = do_write_batch_async(&config);
 
     join!(mixed_handle).await;
+    //do_get_one_record_async(&config).await;
 
     Ok(())
 }

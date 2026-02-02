@@ -13,11 +13,12 @@ use tokio::sync::oneshot;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
-use crate::quorum::worker::{LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
+use crate::quorum::types::{LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
 use crate::raft::candidate::RaftCandidateStateDelegate;
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRaftWriteBatchRequest, LocalRaftWriteBatchResponse, LocalRequestVoteRequest, SharedState, TermVote};
 use crate::transport::raft::raftproto::{RemoteAppendEntriesRequest, RemoteLogEntry, RemotePutRequest};
+use crate::transport::capnp::{build_owned_write_batch_response, build_owned_log_entry};
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils::{SerializationData, serialize_data};
 
@@ -83,11 +84,12 @@ impl RaftProtocol for RaftLeaderStateDelegate {
     fn write_batch(&mut self, write_batch_request: LocalRaftWriteBatchRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) {
         let message_id = shared_state.next_message_id;
         let mut idx = shared_state.volatile_server_state.next_log_index;
-        let batch_size = write_batch_request.requests.len();
+        // Extract protobuf requests for legacy SerializationData
+        let requests = write_batch_request.message.to_protobuf_requests();
+        let batch_size = requests.len();
         let start_time = std::time::Instant::now();
 
         tracing::info!("writing batches {} as message id: {} with index: {}", batch_size, message_id, idx);
-        //info!("writing batches {} as message id: {} with index: {}", batch_size, message_id, idx);
         shared_state.next_message_id += 1;
 
         let span = tracing::span!(Level::INFO, "delegate_write_batch");
@@ -97,10 +99,10 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         let buffer = vec![0u8; shared_state.state_machine_config.max_message_size_bytes];
         let offset = 0usize;
 
-        if write_batch_request.requests.is_empty() {
+        if requests.is_empty() {
             log::warn!("Received empty write batch request, ignoring");
             let r = LocalRaftWriteBatchResponse{
-                responses: vec![],
+                message: build_owned_write_batch_response(|_| {}),
                 err: Some("Empty write batch request".to_string())
             };
             let payload = LocalRaftResponsePayload::WriteBatch(r);
@@ -116,7 +118,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             prev_index: shared_state.volatile_server_state.last_log_index,
             prev_term: shared_state.volatile_server_state.last_log_term,
             message_id,
-            requests: write_batch_request.requests
+            requests
         };
         let (limit, mut data) = serialize_data(&serialization_data, buffer, offset);
         tracing::info!("serialized data size: {}", limit);
@@ -128,37 +130,34 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         let arc_serialization_data = Arc::new(serialization_data);
         shared_state.volatile_server_state.replication_log.push(Arc::clone(&arc_serialization_data));
 
-        // TODO no clone.
-        let d = Arc::new(data.clone());
-        let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: d, parent_span: Span::current(), request_id: message_id};
+        let shared_data = Arc::new(data);
+        let persistence_task = PersistenceTaskType::AppendLog{id: message_id, data: Arc::clone(&shared_data), parent_span: Span::current(), request_id: message_id};
         shared_state.persistence_work.push(persistence_task);
 
-        // TODO log entry command should be just bytes
-        shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
-            let le = RemoteLogEntry {
-                index: idx,
-                data: data.clone(), // TODO maybe fundamental problem with the approach, doesn't support IO without copies...
-                batch_index: idx,
-                term: shared_state.server_state.current_term,
-                prev_log_index: shared_state.volatile_server_state.last_log_index,
-                prev_log_term: shared_state.volatile_server_state.last_log_term,
-                message_id: message_id,
-            };
-            let req = RemoteAppendEntriesRequest {
-                term: shared_state.server_state.current_term,
-                leader_id: shared_state.server_state.leader_id,
-                prev_log_index: shared_state.volatile_server_state.last_log_index,
-                prev_log_term: shared_state.volatile_server_state.last_log_term,
-                request_id: message_id,
-                entry: Some(le),
-                commit_index: shared_state.volatile_server_state.commit_index,
-            };
+        let owned_entry = Arc::new(build_owned_log_entry(|mut builder| {
+            builder.set_index(idx);
+            builder.set_term(shared_state.server_state.current_term);
+            builder.set_prev_log_index(shared_state.volatile_server_state.last_log_index);
+            builder.set_prev_log_term(shared_state.volatile_server_state.last_log_term);
+            builder.set_message_id(message_id);
+            builder.set_timestamp(now_millis() as u64);
+            builder.set_data(&Arc::clone(&shared_data));
+            let mut commands = builder.init_commands(arc_serialization_data.requests.len() as u32);
+            for (i, req) in arc_serialization_data.requests.iter().enumerate() {
+                let mut cmd = commands.reborrow().get(i as u32);
+                cmd.set_id(&req.id);
+                cmd.set_payload(req.payload.as_bytes());
+                cmd.set_node_id(req.node_id);
+            }
+        }));
 
+        shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
             let quorum_span = Span::current();
             let task = LocalQuorumWorkerTaskType::AppendEntries{
                 id: message_id,
                 parent_span: quorum_span,
-                req,
+                entry: owned_entry.clone(),
+                commit_index: shared_state.volatile_server_state.commit_index,
             };
             task_queue.push(LocalQuorumWorkerTask {task_type: task});
         });
@@ -185,7 +184,6 @@ impl RaftProtocol for RaftLeaderStateDelegate {
 
         if append_entries_request.term > shared_state.server_state.current_term {
             log::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
-            // TODO check if prev term or prev index is same as our own, else inform new leader that we need backfill.
 
             // New leader
             shared_state.server_state.current_term = append_entries_request.term;
@@ -234,7 +232,6 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             info!("Initializing leader with commit index: {}", shared_state.volatile_server_state.commit_index);
 
             shared_state.volatile_server_state.commit_state.commit_index.store(shared_state.volatile_server_state.last_log_index, Ordering::Release);
-            shared_state.volatile_server_state.commit_state.term.store(shared_state.volatile_server_state.last_log_term, Ordering::Release);
             shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
             // Update metrics for leader initialization
@@ -276,10 +273,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                             OutstandingMessageType::WriteBatch{persistence_done, quorum_acks, callback, index, start_time, batch_size} => {
                                 if quorum_acks >= shared_state.quorum_size {
                                     // Persistence done and replicated to quorum of nodes
-                                    //log::info!("Write batch with message id {} and size {} has been persisted on quorum of nodes after {}ms", id, batch_size, start_time.elapsed().as_millis());
+                                    log::debug!("Write batch with message id {} and size {} has been persisted on quorum of nodes after {}ms", id, batch_size, start_time.elapsed().as_millis());
                                     shared_state.volatile_server_state.commit_index = index;
                                     shared_state.volatile_server_state.commit_state.commit_index.store(index, Ordering::Release);
-                                    shared_state.volatile_server_state.commit_state.term.store(shared_state.server_state.current_term, Ordering::Release);
                                     shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
                                     // Broadcast newly committed entries to query workers
@@ -300,7 +296,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     crate::transport::metrics::WRITE_BATCH_TOTAL.inc();
 
                                     let r = LocalRaftWriteBatchResponse{
-                                        responses: vec![], // TODO
+                                        message: build_owned_write_batch_response(|_| {}), // TODO: populate with actual responses
                                         err: None
                                     };
                                     let payload = LocalRaftResponsePayload::WriteBatch(r);
@@ -368,11 +364,10 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                 let new_acks = quorum_acks +1;
                                 if new_acks >= shared_state.quorum_size && persistence_done {
                                     // Log replication done
-                                    //log::info!("Write batch with message id {} and size {} has been persisted on quorum of nodes after {}ms", id, batch_size, start_time.elapsed().as_millis());
+                                    log::debug!("Write batch with message id {} and size {} has been persisted on quorum of nodes after {}ms", id, batch_size, start_time.elapsed().as_millis());
                                     if index > shared_state.volatile_server_state.commit_index {
                                         shared_state.volatile_server_state.commit_index = index;
                                         shared_state.volatile_server_state.commit_state.commit_index.store(index, Ordering::Release);
-                                        shared_state.volatile_server_state.commit_state.term.store(shared_state.server_state.current_term, Ordering::Release);
                                         shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
                                         // Broadcast newly committed entries to query workers
@@ -394,7 +389,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                                     crate::transport::metrics::WRITE_BATCH_TOTAL.inc();
 
                                     let r = LocalRaftWriteBatchResponse{
-                                        responses: vec![], // TODO
+                                        message: build_owned_write_batch_response(|_| {}), // TODO: populate with actual responses
                                         err: None
                                     };
                                     let payload = LocalRaftResponsePayload::WriteBatch(r);
@@ -502,6 +497,11 @@ impl RaftProtocol for RaftLeaderStateDelegate {
     }
 
     fn request_vote(&mut self, request_vote_request: LocalRequestVoteRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
+
+        if shared_state.volatile_server_state.next_term <= request_vote_request.term {
+            shared_state.volatile_server_state.next_term = request_vote_request.term+1;
+        }
+
         if !self.should_accept_vote(request_vote_request.term, request_vote_request.last_log_term, request_vote_request.last_log_index, shared_state) {
             callback.send(
                 LocalRaftResponseMessage {
@@ -509,10 +509,6 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                 }
             );
             return RaftMessageStateChange::None
-        }
-
-        if shared_state.volatile_server_state.next_term <= request_vote_request.term {
-            shared_state.volatile_server_state.next_term = request_vote_request.term+1;
         }
 
         let message_id = shared_state.next_message_id;
@@ -550,9 +546,10 @@ mod tests {
     use std::time::Instant;
     use bus::Bus;
     use log::info;
-    use crate::quorum::worker::LocalQuorumResponse;
+    use crate::quorum::types::LocalQuorumResponse;
     use crate::transport::raft::raftproto::{RemoteLogEntry, RemotePutRequest};
     use crate::service_utils::storage_utils::{SerializationData, serialize_data};
+    use crate::transport::capnp::build_owned_write_batch;
 
     fn create_shared_state() -> SharedState {
         SharedState {
@@ -860,14 +857,16 @@ mod tests {
         let mut shared_state = create_shared_state();
         let (tx, rx) = oneshot::channel();
 
-        // Prepare a write batch request
-        let put_request = RemotePutRequest {
-            id: "put_1".to_string(),
-            payload: "payload".to_string(),
-            node_id: 1,
-        };
+        // Prepare a write batch request using Cap'n Proto
         let write_batch_request = LocalRaftWriteBatchRequest {
-            requests: vec![put_request.clone()],
+            message: build_owned_write_batch(|mut builder| {
+                builder.set_batch_id("test_batch");
+                let mut requests = builder.init_requests(1);
+                let mut req = requests.get(0);
+                req.set_id("put_1");
+                req.set_payload(b"payload");
+                req.set_node_id(1);
+            }),
         };
 
         // Add a dummy quorum worker task queue
@@ -906,7 +905,10 @@ mod tests {
 
         // Prepare an empty write batch request
         let write_batch_request = LocalRaftWriteBatchRequest {
-            requests: vec![],
+            message: build_owned_write_batch(|mut builder| {
+                builder.set_batch_id("empty_batch");
+                builder.init_requests(0);
+            }),
         };
 
         // Add a dummy quorum worker task queue

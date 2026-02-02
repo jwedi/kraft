@@ -3,14 +3,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use bus::BusReader;
 use crossbeam_queue::SegQueue;
 use log::{debug, info, warn};
 use tokio::sync::oneshot;
-use tokio::time::Instant;
 use crate::client::cluster_node_client::SharedGrpcChannel;
-use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask};
+use crate::quorum::types::{LocalQuorumResponse, LocalQuorumWorkerTask};
 use crate::raft::raft_sm::{CommitState, LocalRaftMessage};
 use crate::service_utils::storage_utils::SerializationData;
 use crate::transport::stream_manager::StreamManagerImpl;
@@ -18,7 +17,6 @@ use crate::transport::stream_manager::StreamManagerImpl;
 pub struct QueryWorker {
     bus: BusReader<Arc<SerializationData>>,
     commit_state: Arc<CommitState>,
-    last_applied_commit_index: u64,
     query_structure: HashMap<String, Arc<String>>,
     pending_queries: Arc<SegQueue<QueryRequest>>
 }
@@ -30,7 +28,6 @@ pub struct QueryResponse {
 pub struct QueryRequest {
     pub id: String,
     pub index: u64,
-    pub term: u64,
     pub callback: oneshot::Sender<QueryResponse>
 }
 
@@ -44,7 +41,6 @@ impl QueryWorker {
         Self {
             bus,
             commit_state,
-            last_applied_commit_index: 0,
             query_structure: HashMap::new(),
             pending_queries
         }
@@ -56,25 +52,22 @@ impl QueryWorker {
         let mut parked: Option<Arc<SerializationData>> = None;
         let mut parked_request: Option<QueryRequest> = None;
         let mut applied_index: u64 = 0;
-        let mut applied_term: u64 = 0;
-        let desired_cadence_micros = 10;
+        let desired_cadence_micros = 25;
         loop {
             let start_time = Instant::now();
             let current_version = self.commit_state.version.load(Ordering::Acquire);
             if current_version != last_version {
                 let index = self.commit_state.commit_index.load(Ordering::Acquire);
-                let term = self.commit_state.term.load(Ordering::Acquire);
                 last_version = current_version;
 
                 let mut num_entries_applied = 0;
                 match parked.take() {
                     None => {}
                     Some(parked_value) => {
-                        if (parked_value.term == term && parked_value.index <= index) || (parked_value.term < term) {
+                        if (parked_value.index <= index) {
                             for req in parked_value.requests.iter() {
                                 self.query_structure.insert(req.id.clone(), Arc::new(req.payload.clone()));
                             }
-                            applied_term = parked_value.term;
                             applied_index = parked_value.index;
                             num_entries_applied += 1;
                         } else {
@@ -86,10 +79,12 @@ impl QueryWorker {
                 loop {
                     match self.bus.try_recv() {
                         Ok(val) => {
-                            if (val.term == term && val.index <= index) || (val.term < term) {
+                            if val.index <= index {
                                 for req in val.requests.iter() {
                                     self.query_structure.insert(req.id.clone(), Arc::new(req.payload.clone()));
-                                    applied_term = val.term;
+                                    if val.index < applied_index {
+                                        warn!("Received index {} less than previously applied index {}", val.index, applied_index);
+                                    }
                                     applied_index = val.index;
                                 }
                             } else if val.term == u64::MAX && val.term == u64::MAX {
@@ -97,7 +92,6 @@ impl QueryWorker {
                                 self.query_structure.clear();
                                 last_version = current_version;
                                 applied_index = 0;
-                                applied_term = 0;
                                 continue;
                             } else {
                                 parked = Some(val);
@@ -117,11 +111,13 @@ impl QueryWorker {
             match parked_request.take() {
                 Some(query) => {
                     // Check if query index is ahead of applied index
-                    if (query.index <= applied_index && query.term == applied_term) || (query.term < applied_term) {
+                    if query.index <= applied_index {
                         // TODO verify presence of leader for linearizability.
                         self.handle_query(query)
                     } else {
+                        info!("Parked query with index {}, applied index {}", query.index, applied_index);
                         parked_request = Some(query);
+                        thread::yield_now();
                         continue
                     }
                 }
@@ -135,7 +131,7 @@ impl QueryWorker {
                 match maybe_query {
                     Some(query) => {
                         // Check if query index is ahead of applied index
-                        if (query.index <= applied_index && query.term == applied_term) || (query.term < applied_term) {
+                        if query.index <= applied_index {
                             // TODO verify presence of leader for linearizability.
                             self.handle_query(query)
                         } else {
@@ -145,8 +141,7 @@ impl QueryWorker {
                         }
                     }
                     None => {
-                        thread::yield_now();
-                        break;
+                        break; // Exit to main loop's cadence sleep
                     }
                 }
             }
