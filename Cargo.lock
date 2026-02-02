@@ -1616,6 +1616,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "crossbeam-queue",
+ "crossbeam-utils",
  "csv",
  "env_logger",
  "futures",

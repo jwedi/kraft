@@ -234,16 +234,20 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         RaftMessageStateChange::None
     }
 
-    fn time_step(&mut self, shared_state: &mut SharedState) -> RaftMessageStateChange {
+    fn time_step(&mut self, shared_state: &mut SharedState) -> (RaftMessageStateChange, u64) {
+        let mut work_done: u64 = 0;
+
         if !self.initialized {
             self.initialize_leadership(shared_state);
+            work_done += 1;
         }
 
         // Process persistence responses
-        outstanding::process_persistence_responses(shared_state);
+        work_done += outstanding::process_persistence_responses(shared_state);
 
         // Process quorum responses and collect backfill requests
-        let backfill_requests = outstanding::process_quorum_responses(shared_state);
+        let (backfill_requests, quorum_work) = outstanding::process_quorum_responses(shared_state);
+        work_done += quorum_work;
 
         // Handle backfill requests
         for (quorum_node_id, last_log_term, last_log_index) in backfill_requests {
@@ -255,7 +259,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             );
         }
 
-        RaftMessageStateChange::None
+        (RaftMessageStateChange::None, work_done)
     }
 
     fn request_vote(
@@ -452,7 +456,7 @@ mod tests {
             },
         });
 
-        let result = delegate.time_step(&mut shared_state);
+        let (result, _work_done) = delegate.time_step(&mut shared_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         let queue = &shared_state.quorum_worker_tasks[0];
@@ -509,7 +513,7 @@ mod tests {
             },
         });
 
-        let result = delegate.time_step(&mut shared_state);
+        let (result, _work_done) = delegate.time_step(&mut shared_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         let queue = &shared_state.quorum_worker_tasks[0];
@@ -560,7 +564,7 @@ mod tests {
             },
         });
 
-        let result = delegate.time_step(&mut shared_state);
+        let (result, _work_done) = delegate.time_step(&mut shared_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         let queue = &shared_state.quorum_worker_tasks[0];
@@ -585,7 +589,7 @@ mod tests {
             response_type: LocalQuorumTaskResponseType::TruncateLogResponse { id: 123, ok: true },
         });
 
-        let result = delegate.time_step(&mut shared_state);
+        let (result, _work_done) = delegate.time_step(&mut shared_state);
         assert!(matches!(result, RaftMessageStateChange::None));
     }
 
@@ -688,7 +692,7 @@ mod tests {
 
         assert!(!delegate.initialized);
 
-        let result = delegate.time_step(&mut shared_state);
+        let (result, _work_done) = delegate.time_step(&mut shared_state);
 
         assert!(delegate.initialized);
 
@@ -753,7 +757,7 @@ mod tests {
             response_type: LocalQuorumTaskResponseType::AppendEntries { id: msg_id, ok: true },
         });
 
-        let result = delegate.time_step(&mut shared_state);
+        let (result, _work_done) = delegate.time_step(&mut shared_state);
 
         assert_eq!(shared_state.volatile_server_state.commit_index, 1);
 
@@ -803,7 +807,7 @@ mod tests {
             },
         });
 
-        let result = delegate.time_step(&mut shared_state);
+        let (result, _work_done) = delegate.time_step(&mut shared_state);
 
         let queue = &shared_state.quorum_worker_tasks[0];
         let task = queue.pop().unwrap();

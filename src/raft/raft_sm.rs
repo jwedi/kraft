@@ -181,8 +181,8 @@ impl StateMachineExecutorImpl {
 
 impl RaftStateMachineExecutor for StateMachineExecutorImpl {
 
-    fn time_step(&mut self) {
-        let state_change = self.state_delegate.time_step(&mut self.shared_state);
+    fn time_step(&mut self) -> u64 {
+        let (state_change, work_done) = self.state_delegate.time_step(&mut self.shared_state);
         match state_change {
             RaftMessageStateChange::None => {}
             RaftMessageStateChange::Candidate(new_state) => {
@@ -198,6 +198,7 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                 self.state_delegate = new_state
             }
         }
+        work_done
     }
 
     fn accept(&mut self, raft_message: LocalRaftMessage) {
@@ -279,7 +280,8 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
 pub trait RaftStateMachineExecutor {
     fn accept(&mut self, raft_message: LocalRaftMessage);
 
-    fn time_step(&mut self);
+    /// Returns the number of work items processed in this time step
+    fn time_step(&mut self) -> u64;
 }
 
 // Per-state implementation of the Raft protocol. Handles requests, returns responses through callbacks and notifies about state changes.
@@ -295,7 +297,8 @@ pub trait RaftProtocol {
         tracing::error!(message = "write batch not allowed in this node state");
     }
 
-    fn time_step(&mut self, shared_state: &mut SharedState) -> RaftMessageStateChange;
+    /// Returns (state_change, work_done_count)
+    fn time_step(&mut self, shared_state: &mut SharedState) -> (RaftMessageStateChange, u64);
 
     fn validate_append_entries(&mut self, append_entries_request: &LocalAppendEntries, prev_index: u64, prev_term: u64) -> bool {
         if append_entries_request.prev_term != prev_term {
@@ -542,7 +545,7 @@ mod integration_tests {
         });
 
         // Step 2: Leader processes and detects term mismatch
-        let result = leader_delegate.time_step(&mut leader_state);
+        let (result, _work_done) = leader_delegate.time_step(&mut leader_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Step 3: Verify leader sent truncate signal to last matching point
@@ -589,7 +592,7 @@ mod integration_tests {
             }
         });
 
-        let result = follower_delegate.time_step(&mut follower_state);
+        let (result, _work_done) = follower_delegate.time_step(&mut follower_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Step 5: Verify follower truncated correctly
@@ -607,7 +610,7 @@ mod integration_tests {
             }
         });
 
-        let result = leader_delegate.time_step(&mut leader_state);
+        let (result, _work_done) = leader_delegate.time_step(&mut leader_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Step 7: Verify leader sent backfill data (not truncate)
@@ -670,7 +673,7 @@ mod integration_tests {
             }
         });
 
-        let result = leader_delegate.time_step(&mut leader_state);
+        let (result, _work_done) = leader_delegate.time_step(&mut leader_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Should send backfill (not truncate) since term matches at index 4
@@ -730,7 +733,7 @@ mod integration_tests {
             }
         });
 
-        let result = leader_delegate.time_step(&mut leader_state);
+        let (result, _work_done) = leader_delegate.time_step(&mut leader_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Should send backfill since term matches at index 4
@@ -755,7 +758,7 @@ mod integration_tests {
             }
         });
 
-        let result = leader_delegate.time_step(&mut leader_state);
+        let (result, _work_done) = leader_delegate.time_step(&mut leader_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Should send truncate since term mismatch at index 5

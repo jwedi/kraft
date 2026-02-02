@@ -146,9 +146,12 @@ impl RaftProtocol for RaftFollowerStateDelegate {
         RaftMessageStateChange::None
     }
 
-    fn time_step(&mut self, shared_state: &mut SharedState) -> RaftMessageStateChange {
+    fn time_step(&mut self, shared_state: &mut SharedState) -> (RaftMessageStateChange, u64) {
+        let mut work_done: u64 = 0;
+
         // Process persistence responses
         while let Some(task) = shared_state.persistence_response.pop() {
+            work_done += 1;
             match task {
                 PersistenceResponseType::LogPersisted { id } => {
                     self.handle_log_persisted(id, shared_state);
@@ -164,6 +167,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
 
         // Process quorum responses
         while let Some(task) = shared_state.quorum_response.pop() {
+            work_done += 1;
             match task.response_type {
                 LocalQuorumTaskResponseType::TruncateLog {
                     quorum_node_id,
@@ -210,10 +214,10 @@ impl RaftProtocol for RaftFollowerStateDelegate {
 
         // Check election timeout
         if let Some(state_change) = self.election_timer.check_timeout() {
-            return state_change;
+            return (state_change, work_done);
         }
 
-        RaftMessageStateChange::None
+        (RaftMessageStateChange::None, work_done)
     }
 
     fn request_vote(
@@ -550,8 +554,8 @@ mod tests {
         let (mut shared_state, _persistence_rx) = create_shared_state();
         delegate.election_timer.election_timeout = 0; // Simulate timeout
 
-        let result = delegate.time_step(&mut shared_state);
-        match result {
+        let (state_change, _work_done) = delegate.time_step(&mut shared_state);
+        match state_change {
             RaftMessageStateChange::Candidate(_) => {}
             _ => panic!("Should transition to candidate"),
         }
@@ -788,10 +792,10 @@ mod tests {
             },
         });
 
-        let result = delegate.time_step(&mut shared_state);
+        let (state_change, _work_done) = delegate.time_step(&mut shared_state);
 
         // Should remain follower
-        assert!(matches!(result, RaftMessageStateChange::None));
+        assert!(matches!(state_change, RaftMessageStateChange::None));
 
         // Log should be truncated
         assert_eq!(shared_state.volatile_server_state.replication_log.len(), 3);

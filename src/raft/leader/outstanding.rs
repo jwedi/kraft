@@ -11,9 +11,11 @@ use crate::raft::raft_sm::{
 use crate::transport::capnp::build_owned_write_batch_response;
 
 /// Processes persistence responses from the persistence worker.
-/// Returns true if any responses were processed.
-pub fn process_persistence_responses(shared_state: &mut SharedState) {
+/// Returns the number of responses processed.
+pub fn process_persistence_responses(shared_state: &mut SharedState) -> u64 {
+    let mut count: u64 = 0;
     while let Some(task) = shared_state.persistence_response.pop() {
+        count += 1;
         match task {
             PersistenceResponseType::LogPersisted { id } => {
                 handle_log_persisted(id, shared_state);
@@ -26,6 +28,7 @@ pub fn process_persistence_responses(shared_state: &mut SharedState) {
             }
         }
     }
+    count
 }
 
 /// Handles a LogPersisted event from the persistence worker.
@@ -105,13 +108,15 @@ fn handle_vote_persisted(id: u64, shared_state: &mut SharedState) {
 }
 
 /// Processes quorum responses from quorum workers.
-/// Returns an optional BackfillLog request that needs leader handling.
+/// Returns (backfill_requests, work_done_count).
 pub fn process_quorum_responses(
     shared_state: &mut SharedState,
-) -> Vec<(u64, u64, u64)> {
+) -> (Vec<(u64, u64, u64)>, u64) {
     let mut backfill_requests = Vec::new();
+    let mut count: u64 = 0;
 
     while let Some(task) = shared_state.quorum_response.pop() {
+        count += 1;
         match task.response_type {
             LocalQuorumTaskResponseType::AppendEntries { id, ok: _ } => {
                 handle_append_entries_response(id, shared_state);
@@ -140,7 +145,7 @@ pub fn process_quorum_responses(
         }
     }
 
-    backfill_requests
+    (backfill_requests, count)
 }
 
 /// Handles an AppendEntries ack from a quorum worker.
@@ -440,7 +445,7 @@ mod tests {
         });
 
         // Process responses - should complete (persistence_done=true, quorum_acks will be 2)
-        let backfill_requests = process_quorum_responses(&mut shared_state);
+        let (backfill_requests, _) = process_quorum_responses(&mut shared_state);
 
         // No backfill requests
         assert!(backfill_requests.is_empty());
@@ -463,7 +468,7 @@ mod tests {
         });
 
         // Process responses - should NOT complete since persistence_done = false
-        let backfill_requests = process_quorum_responses(&mut shared_state);
+        let (backfill_requests, _) = process_quorum_responses(&mut shared_state);
 
         assert!(backfill_requests.is_empty());
 
@@ -492,7 +497,7 @@ mod tests {
             },
         });
 
-        let backfill_requests = process_quorum_responses(&mut shared_state);
+        let (backfill_requests, _) = process_quorum_responses(&mut shared_state);
 
         // Should have one backfill request
         assert_eq!(backfill_requests.len(), 1);
@@ -519,7 +524,7 @@ mod tests {
             },
         });
 
-        let backfill_requests = process_quorum_responses(&mut shared_state);
+        let (backfill_requests, _) = process_quorum_responses(&mut shared_state);
 
         assert_eq!(backfill_requests.len(), 2);
     }
