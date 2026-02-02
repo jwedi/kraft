@@ -4,7 +4,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use crossbeam_queue::SegQueue;
 use tokio::task::yield_now;
-use tokio::time::Instant;
+use minstant::Instant;
 use crate::raft::raft_sm::{LocalRaftMessage, SharedState, StateMachineExecutorImpl};
 use crate::raft::raft_sm::RaftStateMachineExecutor;
 

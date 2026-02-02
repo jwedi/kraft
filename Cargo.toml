@@ -26,6 +26,7 @@ debug = true  # Includes debug symbols without affecting optimizations
 debug = true
 
 [dependencies]
+minstant = { version = "0.1", features = ["fallback-coarse"] }
 tonic = "0.12.3"
 prost = "0.13"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }

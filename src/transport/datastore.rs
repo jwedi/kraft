@@ -37,7 +37,7 @@ impl Datastore for DatastoreServerImpl {
 
     #[instrument(skip_all)]
     async fn get_record(&self, request: Request<GetDataStoreRecordRequest>) -> Result<Response<GetDataStoreRecordResponse>, Status> {
-        let _timing_guard = crate::transport::metrics::record_rpc_request("get_record");
+        let _timing_guard = crate::transport::metrics::record_get_record_fast();
         let callback: (Sender<QueryResponse>, Receiver<QueryResponse>) = oneshot::channel();
         let commit_index = self.commit_state.commit_index.load(Ordering::Acquire);
 
@@ -80,7 +80,7 @@ impl Datastore for DatastoreServerImpl {
 
     #[instrument(skip_all)]
     async fn put_record(&self, request: Request<PutDataStoreRecordRequest>) -> Result<Response<PutDataStoreRecordResponse>, Status> {
-        let _timing_guard = crate::transport::metrics::record_rpc_request("put_record");
+        let _timing_guard = crate::transport::metrics::record_put_record_fast();
         tracing::debug!("received put_records request");
 
         let req = request.into_inner();
