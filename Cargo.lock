@@ -1610,6 +1610,7 @@ dependencies = [
  "rand",
  "sbe_kraft_replication_schema",
  "serde",
+ "tempfile",
  "time",
  "tokio",
  "tokio-stream",

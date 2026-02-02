@@ -29,7 +29,12 @@ pub enum LocalQuorumWorkerTaskType {
     /// Write a batch of requests (uses OwnedWriteBatch internally via WriteBatch)
     WriteBatch { write_batch: WriteBatch },
     /// Truncate log to this term/index on quorum member
-    TruncateLog { id: u64, prev_term: u64, prev_index: u64, parent_span: Span }
+    TruncateLog { id: u64, prev_term: u64, prev_index: u64, parent_span: Span },
+    /// Update commit index and send immediate heartbeat to follower
+    /// This is sent after a write batch is committed to ensure followers
+    /// learn about the new commit_index promptly (without waiting for the
+    /// next periodic heartbeat).
+    UpdateCommitIndex { commit_index: u64 },
 }
 
 /// Response types from quorum worker

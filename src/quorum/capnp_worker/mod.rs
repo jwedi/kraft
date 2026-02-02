@@ -339,6 +339,10 @@ impl CapnpQuorumWorker {
                         parent_span,
                     );
                 }
+                LocalQuorumWorkerTaskType::UpdateCommitIndex { commit_index } => {
+                    // Update commit index so that it gets propagated on the next request/heartbeat
+                    self.commit_index = commit_index;
+                }
             }
         }
     }
