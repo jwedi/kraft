@@ -1,12 +1,14 @@
 //! Worker creation and spawning for the Kraft server.
 
-use std::sync::{Arc, Condvar};
+use std::sync::Arc;
 use bus::BusReader;
+use crossbeam_channel::Receiver;
 use crossbeam_queue::SegQueue;
 use tokio::task::{JoinHandle, spawn_blocking};
 
 use crate::config::config::ClusterNode;
-use crate::persistence::worker::{PersistenceConfig, PersistenceWorker};
+use crate::persistence::worker::{PersistenceConfig, PersistenceTaskType, PersistenceWorker};
+use crate::persistence::worker::PersistenceResponseType;
 use crate::query::worker::QueryRequest;
 use crate::quorum::capnp_worker::CapnpQuorumWorker;
 use crate::quorum::types::LocalQuorumWorkerTask;
@@ -18,14 +20,13 @@ use crate::transport::write_proxy::{WriteBatch, WriteProxy};
 
 /// Creates and initializes the persistence worker.
 pub fn create_persistence_worker(
-    queues: &AppQueues,
+    persistence_rx: Receiver<PersistenceTaskType>,
+    response_queue: Arc<SegQueue<PersistenceResponseType>>,
     persistence_dir: String,
 ) -> PersistenceWorker {
-    let condvar = Arc::new(Condvar::new());
     PersistenceWorker::new(
-        Arc::clone(&queues.persistence_work_queue),
-        Arc::clone(&queues.persistence_response_queue),
-        condvar,
+        persistence_rx,
+        response_queue,
         PersistenceConfig { out_dir: persistence_dir },
     )
 }

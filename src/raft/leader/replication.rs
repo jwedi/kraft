@@ -181,6 +181,7 @@ mod tests {
     };
     use crate::service_utils::storage_utils::SerializationData;
     use bus::Bus;
+    use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
@@ -198,6 +199,7 @@ mod tests {
             replication_log.len() as u64 - 1
         };
         let last_log_term = replication_log.last().map(|e| e.term).unwrap_or(0);
+        let (persistence_tx, _persistence_rx) = unbounded();
 
         SharedState {
             server_state: RaftServerState {
@@ -223,7 +225,7 @@ mod tests {
             outstanding_messages: HashMap::new(),
             quorum_size: 2,
             quorum_worker_tasks: quorum_tasks,
-            persistence_work: Arc::new(SegQueue::new()),
+            persistence_work: persistence_tx,
             persistence_response: Arc::new(SegQueue::new()),
             quorum_work: Arc::new(SegQueue::new()),
             quorum_response: Arc::new(SegQueue::new()),

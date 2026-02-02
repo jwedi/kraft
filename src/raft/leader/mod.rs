@@ -290,7 +290,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             candidate_id: request_vote_request.candidate_id,
             parent_span: Span::current(),
         };
-        shared_state.persistence_work.push(persistence_task);
+        shared_state.persistence_work.send(persistence_task).unwrap();
         shared_state.term_votes.insert(request_vote_request.term, request_vote_request.candidate_id);
         shared_state.next_message_id = message_id + 1;
 
@@ -319,6 +319,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::time::Instant;
     use bus::Bus;
+    use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
     use crate::quorum::types::LocalQuorumResponse;
     use crate::quorum::types::LocalQuorumTaskResponseType;
@@ -326,8 +327,9 @@ mod tests {
     use crate::service_utils::storage_utils::SerializationData;
     use crate::transport::capnp::build_owned_write_batch;
 
-    fn create_shared_state() -> SharedState {
-        SharedState {
+    fn create_shared_state() -> (SharedState, crossbeam_channel::Receiver<crate::persistence::worker::PersistenceTaskType>) {
+        let (persistence_tx, persistence_rx) = unbounded();
+        (SharedState {
             server_state: RaftServerState {
                 current_term: 1,
                 leader_id: 1,
@@ -351,7 +353,7 @@ mod tests {
             outstanding_messages: std::collections::HashMap::new(),
             quorum_size: 3,
             quorum_worker_tasks: vec![],
-            persistence_work: Arc::new(SegQueue::new()),
+            persistence_work: persistence_tx,
             persistence_response: Arc::new(SegQueue::new()),
             quorum_work: Arc::new(SegQueue::new()),
             quorum_response: Arc::new(SegQueue::new()),
@@ -359,13 +361,13 @@ mod tests {
             term_votes: HashMap::new(),
             state_machine_config: StateMachineConfig { max_message_size_bytes: 2048 },
             log_entry_bus: Bus::new(5000),
-        }
+        }, persistence_rx)
     }
 
     #[tokio::test]
     async fn test_append_entries_recognize_new_leader() {
         let mut delegate = RaftLeaderStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
         let (tx, rx) = oneshot::channel();
 
         let req = LocalAppendEntries {
@@ -392,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_vote_rejects_invalid_vote() {
         let mut delegate = RaftLeaderStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
         let (tx, rx) = oneshot::channel();
 
         let req = LocalRequestVoteRequest {
@@ -415,7 +417,7 @@ mod tests {
     async fn test_backfill_request_sends_truncate_signal_on_term_mismatch() {
         let mut delegate = RaftLeaderStateDelegate::new();
         delegate.initialized = true;
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
 
         // Initialize as leader for term 3
         shared_state.server_state.current_term = 3;
@@ -471,7 +473,7 @@ mod tests {
     async fn test_backfill_request_sends_truncate_when_follower_ahead() {
         let mut delegate = RaftLeaderStateDelegate::new();
         delegate.initialized = true;
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
 
         shared_state.server_state.current_term = 3;
         shared_state.server_state.leader_id = 0;
@@ -528,7 +530,7 @@ mod tests {
     async fn test_backfill_request_succeeds_when_leader_has_entries() {
         let mut delegate = RaftLeaderStateDelegate::new();
         delegate.initialized = true;
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
 
         shared_state.server_state.current_term = 3;
         shared_state.server_state.leader_id = 0;
@@ -577,7 +579,7 @@ mod tests {
     #[tokio::test]
     async fn test_truncate_log_response_handling() {
         let mut delegate = RaftLeaderStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
 
         shared_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::TruncateLogResponse { id: 123, ok: true },
@@ -590,7 +592,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_batch_happy_path() {
         let mut delegate = RaftLeaderStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, persistence_rx) = create_shared_state();
         let (tx, _rx) = oneshot::channel();
 
         let write_batch_request = LocalRaftWriteBatchRequest {
@@ -616,7 +618,7 @@ mod tests {
         assert_eq!(entry.requests[0].id, "put_1");
 
         assert!(shared_state.outstanding_messages.contains_key(&(shared_state.next_message_id - 1)));
-        assert!(shared_state.persistence_work.pop().is_some());
+        assert!(persistence_rx.try_recv().is_ok());
 
         let queue = &shared_state.quorum_worker_tasks[0];
         assert!(queue.pop().is_some());
@@ -625,7 +627,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_batch_empty_requests_failure() {
         let mut delegate = RaftLeaderStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
         let (tx, _rx) = oneshot::channel();
 
         let write_batch_request = LocalRaftWriteBatchRequest {
@@ -643,6 +645,7 @@ mod tests {
     }
 
     fn create_shared_state_with_quorum() -> SharedState {
+        let (persistence_tx, _persistence_rx) = unbounded();
         SharedState {
             server_state: RaftServerState {
                 current_term: 1,
@@ -667,7 +670,7 @@ mod tests {
             outstanding_messages: std::collections::HashMap::new(),
             quorum_size: 2,
             quorum_worker_tasks: vec![Arc::new(SegQueue::new()), Arc::new(SegQueue::new())],
-            persistence_work: Arc::new(SegQueue::new()),
+            persistence_work: persistence_tx,
             persistence_response: Arc::new(SegQueue::new()),
             quorum_work: Arc::new(SegQueue::new()),
             quorum_response: Arc::new(SegQueue::new()),

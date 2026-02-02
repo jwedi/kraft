@@ -254,7 +254,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             });
             let persistence_span = Span::current();
             let persistence_task = PersistenceTaskType::AppendVote{id: message_id, term: next_term, candidate_id: shared_state.identity, parent_span: persistence_span};
-            shared_state.persistence_work.push(persistence_task);
+            shared_state.persistence_work.send(persistence_task).unwrap();
             shared_state.term_votes.insert(next_term, shared_state.identity); // TODO can this be inserted before persisted? Probably yes
             let message_type = OutstandingMessageType::CandidateElection{ persistence_done: false, quorum_votes: 1}; // Vote for self
             let response_span = tracing::span!(Level::INFO, "append_entries_outstanding_message_processing");
@@ -294,7 +294,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
 
         let message_id = shared_state.next_message_id;
         let persistence_task = PersistenceTaskType::AppendVote{id: message_id, term: request_vote_request.term, candidate_id: request_vote_request.candidate_id, parent_span: Span::current()};
-        shared_state.persistence_work.push(persistence_task);
+        shared_state.persistence_work.send(persistence_task).unwrap();
         shared_state.term_votes.insert(request_vote_request.term, request_vote_request.candidate_id);
         shared_state.next_message_id = message_id+1;
         let response_span = tracing::span!(Level::INFO, "request_vote_outstanding_message_processing");

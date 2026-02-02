@@ -330,13 +330,15 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
     use bus::Bus;
+    use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
     use crate::transport::raft::raftproto::{RemoteLogEntry, RemotePutRequest};
     use crate::service_utils::storage_utils::{SerializationData, serialize_data};
     use crate::persistence::worker::PersistenceResponseType;
 
-    fn create_shared_state() -> SharedState {
-        SharedState {
+    fn create_shared_state() -> (SharedState, crossbeam_channel::Receiver<crate::persistence::worker::PersistenceTaskType>) {
+        let (persistence_tx, persistence_rx) = unbounded();
+        (SharedState {
             server_state: RaftServerState {
                 current_term: 1,
                 leader_id: 1,
@@ -360,7 +362,7 @@ mod tests {
             outstanding_messages: std::collections::HashMap::new(),
             quorum_size: 3,
             quorum_worker_tasks: vec![],
-            persistence_work: Arc::new(SegQueue::new()),
+            persistence_work: persistence_tx,
             persistence_response: Arc::new(SegQueue::new()),
             quorum_work: Arc::new(SegQueue::new()),
             quorum_response: Arc::new(SegQueue::new()),
@@ -368,7 +370,7 @@ mod tests {
             term_votes: HashMap::new(),
             state_machine_config: StateMachineConfig { max_message_size_bytes: 2048 },
             log_entry_bus: Bus::new(5000),
-        }
+        }, persistence_rx)
     }
 
     #[test]
@@ -381,7 +383,7 @@ mod tests {
     #[tokio::test]
     async fn test_append_entries_recognize_new_leader() {
         let mut delegate = RaftFollowerStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
         let (tx, rx) = oneshot::channel();
 
         let req = LocalAppendEntries {
@@ -408,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn test_append_entries_heartbeat_updates_commit_index() {
         let mut delegate = RaftFollowerStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
         let (tx, rx) = oneshot::channel();
 
         let req = LocalAppendEntries {
@@ -434,7 +436,7 @@ mod tests {
     #[tokio::test]
     async fn test_append_entries_appends_log_entry() {
         let mut delegate = RaftFollowerStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
         let (tx, rx) = oneshot::channel();
 
         let put_request = RemotePutRequest {
@@ -523,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_vote_rejects_invalid_vote() {
         let mut delegate = RaftFollowerStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
         let (tx, rx) = oneshot::channel();
 
         let req = LocalRequestVoteRequest {
@@ -545,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn test_time_step_triggers_candidate_transition() {
         let mut delegate = RaftFollowerStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
         delegate.election_timer.election_timeout = 0; // Simulate timeout
 
         let result = delegate.time_step(&mut shared_state);
@@ -558,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn test_truncate_log_basic_functionality() {
         let delegate = RaftFollowerStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
 
         // Set up a log with multiple terms using absolute indexing
         shared_state
@@ -621,7 +623,7 @@ mod tests {
     #[tokio::test]
     async fn test_truncate_log_to_term_boundary() {
         let delegate = RaftFollowerStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
 
         // Set up a log with multiple terms
         shared_state
@@ -673,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn test_truncate_log_with_absolute_index() {
         let delegate = RaftFollowerStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
 
         // Set up a log with only term 3
         shared_state
@@ -710,7 +712,7 @@ mod tests {
     #[tokio::test]
     async fn test_truncate_log_no_truncation_needed() {
         let delegate = RaftFollowerStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
 
         // Set up a log
         shared_state
@@ -747,7 +749,7 @@ mod tests {
     #[tokio::test]
     async fn test_follower_handles_truncate_log_message() {
         let mut delegate = RaftFollowerStateDelegate::new();
-        let mut shared_state = create_shared_state();
+        let (mut shared_state, _persistence_rx) = create_shared_state();
 
         // Set up a log that will be truncated
         shared_state

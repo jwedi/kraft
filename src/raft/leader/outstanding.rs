@@ -267,6 +267,7 @@ mod tests {
         StateMachineConfig,
     };
     use bus::Bus;
+    use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
@@ -274,6 +275,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     fn create_test_shared_state() -> SharedState {
+        let (persistence_tx, _persistence_rx) = unbounded();
         SharedState {
             server_state: RaftServerState {
                 current_term: 2,
@@ -298,7 +300,7 @@ mod tests {
             outstanding_messages: HashMap::new(),
             quorum_size: 2,
             quorum_worker_tasks: vec![Arc::new(SegQueue::new()), Arc::new(SegQueue::new())],
-            persistence_work: Arc::new(SegQueue::new()),
+            persistence_work: persistence_tx,
             persistence_response: Arc::new(SegQueue::new()),
             quorum_work: Arc::new(SegQueue::new()),
             quorum_response: Arc::new(SegQueue::new()),

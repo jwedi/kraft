@@ -150,8 +150,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queues = startup::AppQueues::new();
 
     // Create and initialize persistence worker, recover data
-    let mut persistence_worker =
-        startup::create_persistence_worker(&queues, cfg.persistence_dir.clone());
+    let mut persistence_worker = startup::create_persistence_worker(
+        queues.persistence_work_receiver.clone(),
+        Arc::clone(&queues.persistence_response_queue),
+        cfg.persistence_dir.clone(),
+    );
     let votes = persistence_worker.read_votes()?;
     let log_bytes = persistence_worker.read_log()?;
 

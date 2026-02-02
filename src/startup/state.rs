@@ -73,7 +73,7 @@ pub fn create_shared_state(
     let shared_state = SharedState {
         server_state,
         volatile_server_state,
-        persistence_work: Arc::clone(&queues.persistence_work_queue),
+        persistence_work: queues.persistence_work_sender.clone(),
         persistence_response: Arc::clone(&queues.persistence_response_queue),
         quorum_work: Arc::clone(&queues.quorum_work_queue),
         quorum_response: Arc::clone(&queues.quorum_response_queue),

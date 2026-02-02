@@ -202,7 +202,7 @@ pub fn apply_log_entry(
         parent_span: Span::current(),
         request_id: request.request_id,
     };
-    shared_state.persistence_work.push(persistence_task);
+    shared_state.persistence_work.send(persistence_task).unwrap();
 
     match deserialize_data(&data, 0) {
         Ok((_, deserialized)) => {
@@ -295,12 +295,14 @@ mod tests {
     };
     use crate::transport::raft::raftproto::RemoteLogEntry;
     use bus::Bus;
+    use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
     use tokio::sync::oneshot;
 
     fn create_test_shared_state() -> SharedState {
+        let (persistence_tx, _persistence_rx) = unbounded();
         SharedState {
             server_state: RaftServerState {
                 current_term: 1,
@@ -325,7 +327,7 @@ mod tests {
             outstanding_messages: HashMap::new(),
             quorum_size: 3,
             quorum_worker_tasks: vec![],
-            persistence_work: Arc::new(SegQueue::new()),
+            persistence_work: persistence_tx,
             persistence_response: Arc::new(SegQueue::new()),
             quorum_work: Arc::new(SegQueue::new()),
             quorum_response: Arc::new(SegQueue::new()),

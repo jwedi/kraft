@@ -1,10 +1,9 @@
-use std::any::Any;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::Debug;
 use tokio::sync::oneshot;
+use crossbeam_channel::Sender;
 use crossbeam_queue::SegQueue;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use tracing::{Level, Span};
@@ -80,7 +79,7 @@ pub struct StateMachineConfig {
 pub struct SharedState {
     pub server_state: RaftServerState,
     pub volatile_server_state: RaftVolatileState,
-    pub persistence_work: Arc<SegQueue<PersistenceTaskType>>,
+    pub persistence_work: Sender<PersistenceTaskType>,
     pub persistence_response: Arc<SegQueue<PersistenceResponseType>>,
     pub quorum_work: Arc<SegQueue<LocalQuorumWorkerTask>>,
     pub quorum_response: Arc<SegQueue<LocalQuorumResponse>>,
@@ -451,9 +450,11 @@ mod integration_tests {
     use crate::service_utils::storage_utils::SerializationData;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
 
     fn create_shared_state() -> SharedState {
+        let (persistence_tx, _persistence_rx) = unbounded();
         SharedState {
             server_state: RaftServerState {
                 current_term: 1,
@@ -478,7 +479,7 @@ mod integration_tests {
             outstanding_messages: std::collections::HashMap::new(),
             quorum_size: 3,
             quorum_worker_tasks: vec![Arc::new(SegQueue::new()); 3],
-            persistence_work: Arc::new(SegQueue::new()),
+            persistence_work: persistence_tx,
             persistence_response: Arc::new(SegQueue::new()),
             quorum_work: Arc::new(SegQueue::new()),
             quorum_response: Arc::new(SegQueue::new()),

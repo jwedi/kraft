@@ -1,6 +1,7 @@
 //! Queue and channel creation for inter-component communication.
 
 use std::sync::Arc;
+use crossbeam_channel::{Sender, Receiver, unbounded};
 use crossbeam_queue::SegQueue;
 
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
@@ -17,8 +18,10 @@ pub struct AppQueues {
     pub write_work_queue: Arc<SegQueue<WriteBatch>>,
     /// Query queue for read requests.
     pub query_queue: Arc<SegQueue<QueryRequest>>,
-    /// Persistence work queue for log/vote persistence tasks.
-    pub persistence_work_queue: Arc<SegQueue<PersistenceTaskType>>,
+    /// Persistence work sender for log/vote persistence tasks.
+    pub persistence_work_sender: Sender<PersistenceTaskType>,
+    /// Persistence work receiver (moved to worker on startup).
+    pub persistence_work_receiver: Receiver<PersistenceTaskType>,
     /// Persistence response queue for completion notifications.
     pub persistence_response_queue: Arc<SegQueue<PersistenceResponseType>>,
     /// Quorum work queue (used for general quorum tasks).
@@ -30,11 +33,14 @@ pub struct AppQueues {
 impl AppQueues {
     /// Creates all application queues.
     pub fn new() -> Self {
+        // This has to be unbounded, otherwise the raft state machine can block on send.
+        let (persistence_tx, persistence_rx) = unbounded();
         Self {
             task_queue: Arc::new(SegQueue::new()),
             write_work_queue: Arc::new(SegQueue::new()),
             query_queue: Arc::new(SegQueue::new()),
-            persistence_work_queue: Arc::new(SegQueue::new()),
+            persistence_work_sender: persistence_tx,
+            persistence_work_receiver: persistence_rx,
             persistence_response_queue: Arc::new(SegQueue::new()),
             quorum_work_queue: Arc::new(SegQueue::new()),
             quorum_response_queue: Arc::new(SegQueue::new()),
@@ -60,7 +66,7 @@ mod tests {
         assert!(queues.task_queue.is_empty());
         assert!(queues.write_work_queue.is_empty());
         assert!(queues.query_queue.is_empty());
-        assert!(queues.persistence_work_queue.is_empty());
+        assert!(queues.persistence_work_receiver.is_empty());
         assert!(queues.persistence_response_queue.is_empty());
         assert!(queues.quorum_work_queue.is_empty());
         assert!(queues.quorum_response_queue.is_empty());

@@ -79,7 +79,7 @@ pub fn queue_persistence_task(message_id: u64, shared_data: Arc<Vec<u8>>, shared
         parent_span: Span::current(),
         request_id: message_id,
     };
-    shared_state.persistence_work.push(persistence_task);
+    shared_state.persistence_work.send(persistence_task).unwrap();
 }
 
 /// Builds an OwnedLogEntry for the write batch.
@@ -186,15 +186,17 @@ mod tests {
     };
     use crate::transport::capnp::build_owned_write_batch;
     use bus::Bus;
+    use crossbeam_channel::{unbounded, Receiver};
     use crossbeam_queue::SegQueue;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
 
-    fn create_test_shared_state() -> SharedState {
+    fn create_test_shared_state() -> (SharedState, Receiver<PersistenceTaskType>) {
         let quorum_tasks: Vec<Arc<SegQueue<crate::quorum::types::LocalQuorumWorkerTask>>> =
             vec![Arc::new(SegQueue::new()), Arc::new(SegQueue::new())];
+        let (persistence_tx, persistence_rx) = unbounded();
 
-        SharedState {
+        (SharedState {
             server_state: RaftServerState {
                 current_term: 2,
                 leader_id: 1,
@@ -218,7 +220,7 @@ mod tests {
             outstanding_messages: HashMap::new(),
             quorum_size: 2,
             quorum_worker_tasks: quorum_tasks,
-            persistence_work: Arc::new(SegQueue::new()),
+            persistence_work: persistence_tx,
             persistence_response: Arc::new(SegQueue::new()),
             quorum_work: Arc::new(SegQueue::new()),
             quorum_response: Arc::new(SegQueue::new()),
@@ -228,7 +230,7 @@ mod tests {
                 max_message_size_bytes: 2048,
             },
             log_entry_bus: Bus::new(5000),
-        }
+        }, persistence_rx)
     }
 
     fn create_write_batch_request_with_data() -> LocalRaftWriteBatchRequest {
@@ -276,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_create_serialization_data_populates_fields_correctly() {
-        let shared_state = create_test_shared_state();
+        let (shared_state, _persistence_rx) = create_test_shared_state();
         let request = create_write_batch_request_with_data();
 
         let data = create_serialization_data(&request, 10, 200, &shared_state);
@@ -293,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_serialize_and_append_to_log_adds_to_replication_log() {
-        let mut shared_state = create_test_shared_state();
+        let (mut shared_state, _persistence_rx) = create_test_shared_state();
 
         let serialization_data = SerializationData {
             index: 6,
@@ -331,14 +333,14 @@ mod tests {
 
     #[test]
     fn test_queue_persistence_task_adds_to_queue() {
-        let shared_state = create_test_shared_state();
+        let (shared_state, persistence_rx) = create_test_shared_state();
         let data = Arc::new(vec![1, 2, 3, 4, 5]);
 
         queue_persistence_task(42, data, &shared_state);
 
-        // Should have one task in the persistence queue
-        let task = shared_state.persistence_work.pop();
-        assert!(task.is_some());
+        // Should have one task in the persistence channel
+        let task = persistence_rx.try_recv();
+        assert!(task.is_ok());
 
         match task.unwrap() {
             crate::persistence::worker::PersistenceTaskType::AppendLog { id, data, .. } => {
@@ -351,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_to_quorum_sends_to_all_workers() {
-        let shared_state = create_test_shared_state();
+        let (shared_state, _persistence_rx) = create_test_shared_state();
 
         let owned_entry = Arc::new(build_owned_log_entry(|mut builder| {
             builder.set_index(10);
@@ -383,7 +385,7 @@ mod tests {
 
     #[test]
     fn test_register_outstanding_message_adds_to_map() {
-        let mut shared_state = create_test_shared_state();
+        let (mut shared_state, _persistence_rx) = create_test_shared_state();
         let (tx, _rx) = oneshot::channel();
 
         register_outstanding_message(42, 10, 5, tx, &mut shared_state);
@@ -398,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_update_volatile_state_updates_indices() {
-        let mut shared_state = create_test_shared_state();
+        let (mut shared_state, _persistence_rx) = create_test_shared_state();
 
         update_volatile_state(10, &mut shared_state);
 
