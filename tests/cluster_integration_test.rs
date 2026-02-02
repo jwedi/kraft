@@ -6,10 +6,13 @@
 //! - Consensus on committed entries
 //! - Leader forwarding (non-leader nodes forward writes to leader)
 
+use std::fs;
 use std::fs::File;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
+
+use kraft_lib::service_utils::storage_utils::{deserialize_all_data, SerializationData};
 use tonic::transport::Channel;
 
 // Include generated proto code
@@ -98,6 +101,10 @@ impl NodeHandle {
     fn read_stderr(&self) -> String {
         std::fs::read_to_string(self.temp_dir.path().join("stderr.log"))
             .unwrap_or_else(|_| "<no stderr>".to_string())
+    }
+
+    fn log_file_path(&self) -> std::path::PathBuf {
+        self.temp_dir.path().join("data").join("log.sbe")
     }
 }
 
@@ -239,6 +246,19 @@ impl TestCluster {
         Err(last_error.unwrap_or_else(|| "No attempts made".into()))
     }
 
+    fn read_transaction_log(&self, node_idx: usize) -> Vec<SerializationData> {
+        let log_path = self.nodes[node_idx].log_file_path();
+        let log_bytes = fs::read(&log_path)
+            .expect(&format!("Failed to read log file for node {}", node_idx + 1));
+
+        if log_bytes.is_empty() {
+            return Vec::new();
+        }
+
+        deserialize_all_data(&log_bytes)
+            .expect(&format!("Failed to deserialize log for node {}", node_idx + 1))
+    }
+
     /// Wait for a key to replicate to all nodes
     async fn wait_for_replication(&self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let deadline = tokio::time::Instant::now() + REPLICATION_TIMEOUT;
@@ -303,4 +323,26 @@ async fn test_three_node_cluster_consensus() {
             );
         }
     }
+
+    // ===== Transaction Log Verification =====
+    let logs: Vec<Vec<SerializationData>> = (0..3)
+        .map(|i| cluster.read_transaction_log(i))
+        .collect();
+
+    // Verify all logs are identical across nodes
+    assert!(logs.windows(2).all(|w| w[0] == w[1]), "Transaction logs differ between nodes");
+
+    // Verify all written entries appear in the log with correct values
+    let log_entries: std::collections::HashMap<_, _> = logs[0]
+        .iter()
+        .flat_map(|e| e.requests.iter().map(|r| (r.id.clone(), r.payload.clone())))
+        .collect();
+
+    for i in 0..entry_count {
+        let key = format!("key-{}", i);
+        let expected = format!("value-{}", i);
+        assert_eq!(log_entries.get(&key), Some(&expected), "Key {} mismatch in log", key);
+    }
+
+    println!("Transaction log verification passed: {} entries across all nodes", logs[0].len());
 }
