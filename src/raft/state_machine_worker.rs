@@ -26,14 +26,11 @@ impl StateMachineWorker {
             let mut work_done: u64 = 0;
 
             work_done += self.state_machine.time_step();
-            let task = self.work_queue.pop();
 
-            match task {
-                Some(task) => {
-                    self.state_machine.accept(task);
-                    work_done += 1;
-                }
-                None => {}
+            // Drain the work queue
+            while let Some(task) = self.work_queue.pop() {
+                self.state_machine.accept(task);
+                work_done += 1;
             }
 
             if work_done > 0 {
