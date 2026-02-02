@@ -513,15 +513,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = LoadTestConfig {
-        concurrency: 1500,
+        concurrency: 1000,
         max_requests: 1_500_000,
         checkpoint_interval_secs: 5,
         ..Default::default()
     };
 
-    let mixed_handle = do_mixed_operations_async(&config, 0.2);
+    //let mixed_handle = do_mixed_operations_async(&config, 0.2);
     //let mixed_handle = do_get_record_async(&config);
-    //let mixed_handle = do_write_batch_async(&config);
+    let mixed_handle = do_write_batch_async(&config);
 
     join!(mixed_handle).await;
     //do_get_one_record_async(&config).await;

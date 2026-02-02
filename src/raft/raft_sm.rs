@@ -470,7 +470,6 @@ mod integration_tests {
                 next_log_index: 1,
                 commit_state: Arc::new(CommitState{
                     commit_index: AtomicU64::new(0),
-                    term: AtomicU64::new(0),
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
