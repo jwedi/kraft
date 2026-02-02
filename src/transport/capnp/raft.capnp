@@ -180,3 +180,17 @@ struct InternalWriteBatchResponse {
   responses @0 :List(InternalPutResponse);
   batchId @1 :Text;
 }
+
+# =============================================================================
+# Datastore GET request/response for TCP transport
+# =============================================================================
+
+struct DatastoreGetRequest {
+  id @0 :Text;
+}
+
+struct DatastoreGetResponse {
+  found @0 :Bool;
+  id @1 :Text;
+  payload @2 :Data;
+}

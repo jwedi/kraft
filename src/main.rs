@@ -48,7 +48,7 @@ mod config {
     pub mod config;
 }
 
-mod transport {
+pub mod transport {
     pub mod capnp;
     pub mod capnp_stream_manager;
     pub mod datastore;
@@ -57,6 +57,7 @@ mod transport {
     pub mod ping;
     pub mod raft;
     pub mod stream_manager;
+    pub mod tcp_datastore;
     pub mod write_proxy;
 }
 
@@ -249,6 +250,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start metrics server
     let metrics_handle = startup::spawn_metrics_server(cfg.metrics_port);
 
+    // Start TCP datastore server if configured
+    let tcp_datastore_handle = if cfg.tcp_datastore_port > 0 {
+        Some(startup::spawn_tcp_datastore_server(
+            cfg.tcp_datastore_port,
+            Arc::clone(&queues.write_work_queue),
+            Arc::clone(&queues.query_queue),
+            Arc::clone(&commit_state),
+        ))
+    } else {
+        None
+    };
+
     info!("Starting server at {}", addr);
 
     // Start gRPC server (this blocks until shutdown)
@@ -274,6 +287,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     join_all(cluster_worker_handles).await;
 
     if let Some(handle) = capnp_listener_handle {
+        let _ = handle.await;
+    }
+
+    if let Some(handle) = tcp_datastore_handle {
         let _ = handle.await;
     }
 

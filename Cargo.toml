@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "kraft-client"
 path = "src/client.rs"
 
+[[bin]] # Bin to run the TCP datastore client
+name = "tcp-client"
+path = "src/tcp_client.rs"
+
 [[bench]]
 name = "replication_log"
 harness = false
@@ -57,6 +61,8 @@ bus = "2.4.1"
 capnp = "0.23"
 crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"
+bytes = "1.5"
+dashmap = "5.5"
 
 [dev-dependencies]
 criterion = "0.5"

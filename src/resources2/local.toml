@@ -6,6 +6,7 @@ max_message_size_bytes = 4096
 metrics_port = 51052
 use_capnp_transport = true
 capnp_port = 51152
+tcp_datastore_port = 49012
 [[cluster_nodes]]
 endpoint = "http://[::1]:50051"
 capnp_endpoint = "[::1]:51151"

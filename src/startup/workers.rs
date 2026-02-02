@@ -16,6 +16,7 @@ use crate::raft::raft_sm::{CommitState, LocalRaftMessage, SharedState};
 use crate::service_utils::storage_utils::SerializationData;
 use crate::startup::queues::AppQueues;
 use crate::transport::capnp_stream_manager::CapnpStreamManager;
+use crate::transport::tcp_datastore::TcpDatastoreServer;
 use crate::transport::write_proxy::{WriteBatch, WriteProxy};
 
 /// Creates and initializes the persistence worker.
@@ -163,6 +164,26 @@ pub fn spawn_metrics_server(metrics_port: u32) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = crate::transport::metrics_server::start_metrics_server(metrics_port as u16).await {
             log::error!("Failed to start metrics server: {}", e);
+        }
+    })
+}
+
+/// Spawns the TCP datastore server.
+pub fn spawn_tcp_datastore_server(
+    port: u32,
+    task_queue: Arc<SegQueue<WriteBatch>>,
+    query_queue: Arc<SegQueue<QueryRequest>>,
+    commit_state: Arc<CommitState>,
+) -> JoinHandle<()> {
+    let addr: std::net::SocketAddr = format!("[::1]:{}", port)
+        .parse()
+        .expect("Invalid tcp_datastore_port");
+
+    tokio::spawn(async move {
+        log::info!("Starting TCP datastore server on port {}", port);
+        let server = TcpDatastoreServer::new(addr, task_queue, query_queue, commit_state);
+        if let Err(e) = server.run().await {
+            log::error!("TCP datastore server failed: {}", e);
         }
     })
 }

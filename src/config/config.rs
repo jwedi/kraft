@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub use_capnp_transport: bool,
     #[serde(default)]
     pub capnp_port: u32,
+    #[serde(default)]
+    pub tcp_datastore_port: u32,
 }
 
 
