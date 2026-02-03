@@ -1,18 +1,18 @@
-use std::any::Any;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::Debug;
 use tokio::sync::oneshot;
+use crossbeam_channel::Sender;
 use crossbeam_queue::SegQueue;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
-use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask};
+use crate::quorum::types::{LocalQuorumResponse, LocalQuorumWorkerTask};
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::transport::raft::raftproto::{RemoteLogEntry, RemotePutRequest, RemotePutResponse};
+use crate::transport::capnp::{OwnedWriteBatch, OwnedWriteBatchResponse, build_owned_write_batch_response};
 use crate::transport::raft::raftproto::raft_server::Raft;
 use crate::service_utils::app_time::now_millis;
 use crate::service_utils::storage_utils::SerializationData;
@@ -20,7 +20,7 @@ use crate::transport::write_proxy::{WriteBatch, WriteResponse};
 use std::time::{Duration, Instant};
 use bus::Bus;
 use log::kv::Source;
-use log::warn;
+use log::{info, warn};
 
 #[derive(Copy, Clone)]
 
@@ -55,7 +55,6 @@ pub struct RaftVolatileState {
 
 pub struct CommitState {
     pub commit_index: AtomicU64,
-    pub term: AtomicU64,
     pub version: AtomicU64,
 }
 
@@ -80,7 +79,7 @@ pub struct StateMachineConfig {
 pub struct SharedState {
     pub server_state: RaftServerState,
     pub volatile_server_state: RaftVolatileState,
-    pub persistence_work: Arc<SegQueue<PersistenceTaskType>>,
+    pub persistence_work: Sender<PersistenceTaskType>,
     pub persistence_response: Arc<SegQueue<PersistenceResponseType>>,
     pub quorum_work: Arc<SegQueue<LocalQuorumWorkerTask>>,
     pub quorum_response: Arc<SegQueue<LocalQuorumResponse>>,
@@ -182,8 +181,8 @@ impl StateMachineExecutorImpl {
 
 impl RaftStateMachineExecutor for StateMachineExecutorImpl {
 
-    fn time_step(&mut self) {
-        let state_change = self.state_delegate.time_step(&mut self.shared_state);
+    fn time_step(&mut self) -> u64 {
+        let (state_change, work_done) = self.state_delegate.time_step(&mut self.shared_state);
         match state_change {
             RaftMessageStateChange::None => {}
             RaftMessageStateChange::Candidate(new_state) => {
@@ -199,6 +198,7 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                 self.state_delegate = new_state
             }
         }
+        work_done
     }
 
     fn accept(&mut self, raft_message: LocalRaftMessage) {
@@ -265,7 +265,7 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                 } else {
                     log::error!("Received write batch as non-leader. Leader is {}", self.shared_state.server_state.leader_id);
                     let resp = LocalRaftWriteBatchResponse {
-                        responses: vec![],
+                        message: build_owned_write_batch_response(|_| {}),
                         err: Some("Received write batch as non-leader".to_string())
                     };
                     let msg = LocalRaftResponsePayload::WriteBatch(resp);
@@ -280,7 +280,8 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
 pub trait RaftStateMachineExecutor {
     fn accept(&mut self, raft_message: LocalRaftMessage);
 
-    fn time_step(&mut self);
+    /// Returns the number of work items processed in this time step
+    fn time_step(&mut self) -> u64;
 }
 
 // Per-state implementation of the Raft protocol. Handles requests, returns responses through callbacks and notifies about state changes.
@@ -296,7 +297,8 @@ pub trait RaftProtocol {
         tracing::error!(message = "write batch not allowed in this node state");
     }
 
-    fn time_step(&mut self, shared_state: &mut SharedState) -> RaftMessageStateChange;
+    /// Returns (state_change, work_done_count)
+    fn time_step(&mut self, shared_state: &mut SharedState) -> (RaftMessageStateChange, u64);
 
     fn validate_append_entries(&mut self, append_entries_request: &LocalAppendEntries, prev_index: u64, prev_term: u64) -> bool {
         if append_entries_request.prev_term != prev_term {
@@ -311,16 +313,16 @@ pub trait RaftProtocol {
     fn should_accept_vote(&mut self, term: u64, last_log_term: u64, last_log_index: u64, shared_state: &mut SharedState) -> bool {
         if let Some(voted_for) = shared_state.term_votes.get(&term) {
             // Node have already voted for someone this term.
-            tracing::info!(message = "Rejecting vote, node has already voted this term.", term);
+            info!("Rejecting vote, node has already voted for candidate {} this term {}", voted_for, term);
             return false
         }
 
         if term <= shared_state.server_state.current_term {
-            tracing::info!(message = "Rejecting vote, proposed term is lower than current.", term);
+            info!("Rejecting vote, proposed term {} is lower than current {}.", term, shared_state.server_state.current_term);
             return false
         }
-        if last_log_term < shared_state.volatile_server_state.last_log_term || last_log_index < shared_state.volatile_server_state.last_log_index {
-            tracing::info!(message = "Rejecting vote, proposer has fewer log entries than node.", term);
+        if last_log_index < shared_state.volatile_server_state.last_log_index {
+            info!("Rejecting vote, proposer has fewer log entries than node {}.", term);
             return false
         }
         true
@@ -371,10 +373,16 @@ pub enum LocalAppendEntriesCallbackResponse {
     TruncateLog{ prev_term: u64, prev_index: u64} // Leader is telling follower to truncate log to this point
 }
 
-#[derive(Debug)]
+/// Response from a write batch operation, using Cap'n Proto for zero-copy.
 pub struct LocalRaftWriteBatchResponse {
-    pub responses: Vec<RemotePutResponse>,
+    pub message: OwnedWriteBatchResponse,
     pub err: Option<String>
+}
+
+impl std::fmt::Debug for LocalRaftWriteBatchResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LocalRaftWriteBatchResponse {{ message: {:?}, err: {:?} }}", self.message, self.err)
+    }
 }
 
 #[derive(Debug)]
@@ -382,8 +390,15 @@ pub struct LocalRaftResponseMessage {
     pub payload: LocalRaftResponsePayload,
 }
 
+/// Write batch request using Cap'n Proto for zero-copy internal handling.
 pub struct LocalRaftWriteBatchRequest {
-    pub requests: Vec<RemotePutRequest>,
+    pub message: OwnedWriteBatch,
+}
+
+impl std::fmt::Debug for LocalRaftWriteBatchRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LocalRaftWriteBatchRequest {{ message: {:?} }}", self.message)
+    }
 }
 
 pub enum LocalRaftMessagePayload {
@@ -434,13 +449,15 @@ mod integration_tests {
     use super::*;
     use crate::raft::leader::RaftLeaderStateDelegate;
     use crate::raft::follower::RaftFollowerStateDelegate;
-    use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumTaskResponseType, LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
+    use crate::quorum::types::{LocalQuorumResponse, LocalQuorumTaskResponseType, LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
     use crate::service_utils::storage_utils::SerializationData;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
 
     fn create_shared_state() -> SharedState {
+        let (persistence_tx, _persistence_rx) = unbounded();
         SharedState {
             server_state: RaftServerState {
                 current_term: 1,
@@ -457,7 +474,6 @@ mod integration_tests {
                 next_log_index: 1,
                 commit_state: Arc::new(CommitState{
                     commit_index: AtomicU64::new(0),
-                    term: AtomicU64::new(0),
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
@@ -466,7 +482,7 @@ mod integration_tests {
             outstanding_messages: std::collections::HashMap::new(),
             quorum_size: 3,
             quorum_worker_tasks: vec![Arc::new(SegQueue::new()); 3],
-            persistence_work: Arc::new(SegQueue::new()),
+            persistence_work: persistence_tx,
             persistence_response: Arc::new(SegQueue::new()),
             quorum_work: Arc::new(SegQueue::new()),
             quorum_response: Arc::new(SegQueue::new()),
@@ -529,7 +545,7 @@ mod integration_tests {
         });
 
         // Step 2: Leader processes and detects term mismatch
-        let result = leader_delegate.time_step(&mut leader_state);
+        let (result, _work_done) = leader_delegate.time_step(&mut leader_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Step 3: Verify leader sent truncate signal to last matching point
@@ -576,7 +592,7 @@ mod integration_tests {
             }
         });
 
-        let result = follower_delegate.time_step(&mut follower_state);
+        let (result, _work_done) = follower_delegate.time_step(&mut follower_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Step 5: Verify follower truncated correctly
@@ -594,7 +610,7 @@ mod integration_tests {
             }
         });
 
-        let result = leader_delegate.time_step(&mut leader_state);
+        let (result, _work_done) = leader_delegate.time_step(&mut leader_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Step 7: Verify leader sent backfill data (not truncate)
@@ -657,7 +673,7 @@ mod integration_tests {
             }
         });
 
-        let result = leader_delegate.time_step(&mut leader_state);
+        let (result, _work_done) = leader_delegate.time_step(&mut leader_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Should send backfill (not truncate) since term matches at index 4
@@ -717,7 +733,7 @@ mod integration_tests {
             }
         });
 
-        let result = leader_delegate.time_step(&mut leader_state);
+        let (result, _work_done) = leader_delegate.time_step(&mut leader_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Should send backfill since term matches at index 4
@@ -742,7 +758,7 @@ mod integration_tests {
             }
         });
 
-        let result = leader_delegate.time_step(&mut leader_state);
+        let (result, _work_done) = leader_delegate.time_step(&mut leader_state);
         assert!(matches!(result, RaftMessageStateChange::None));
 
         // Should send truncate since term mismatch at index 5

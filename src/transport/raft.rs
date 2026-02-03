@@ -12,6 +12,7 @@ use crate::runtime_core::types::{Command, RuntimeTask, RuntimeTaskResponse, Comm
 use crate::transport::raft::raftproto::{RemoteAppendEntriesRequest, RemoteAppendEntriesResponse, RemoteVoteRequest, RemoteVoteResponse, RemotePutBatchRequest, RemotePutBatchResponse, RemotePutResponse, RemoteQuorumMessage, StreamResponse};
 use crate::service_utils::errors::ServiceError;
 use crate::raft::raft_sm::{RaftStateMachineExecutor, StateMachineExecutorImpl, RaftServerState, TermVote, RaftVolatileState, SharedState, LocalRaftMessage, LocalRaftMessagePayload, LocalRequestVoteRequest, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalAppendEntries, LocalRaftWriteBatchRequest, LocalAppendEntriesCallbackResponse};
+use crate::transport::capnp::build_owned_write_batch;
 use crossbeam_queue::SegQueue;
 use futures::FutureExt;
 use tokio::sync::oneshot::error::RecvError;
@@ -56,8 +57,21 @@ impl Raft for RaftServerImpl {
 
         let req = request.into_inner();
         let callback: (Sender<LocalRaftResponseMessage>, Receiver<LocalRaftResponseMessage>) = oneshot::channel();
+
+        // Convert protobuf to OwnedWriteBatch for internal handling
+        let message = build_owned_write_batch(|mut builder| {
+            builder.set_batch_id(&req.batch_id);
+            let mut requests = builder.init_requests(req.put_request.len() as u32);
+            for (i, r) in req.put_request.iter().enumerate() {
+                let mut out = requests.reborrow().get(i as u32);
+                out.set_id(&r.id);
+                out.set_payload(r.payload.as_bytes());
+                out.set_node_id(r.node_id);
+            }
+        });
+
         let payload = LocalRaftMessagePayload::WriteBatch(LocalRaftWriteBatchRequest {
-            requests: req.put_request,
+            message,
         });
 
         let span = tracing::span!(Level::INFO, "awaiting_put_batch");
@@ -89,7 +103,8 @@ impl Raft for RaftServerImpl {
                         false
                     }
                     LocalRaftResponsePayload::WriteBatch(resp) => {
-                        tracing::info!("write batch responses {}", resp.responses.len());
+                        let response_count = resp.message.to_protobuf_responses().len();
+                        tracing::info!("write batch responses {}", response_count);
                         true
                     }
                 }

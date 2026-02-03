@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
-use crate::quorum::worker::{LocalQuorumResponse, LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
+use crate::quorum::types::{LocalQuorumResponse, LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::raft::leader::RaftLeaderStateDelegate;
 use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRequestVoteRequest, SharedState, TermVote};
@@ -83,10 +83,13 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         RaftMessageStateChange::None
     }
 
-    fn time_step(&mut self, shared_state: &mut SharedState) -> RaftMessageStateChange {
+    fn time_step(&mut self, shared_state: &mut SharedState) -> (RaftMessageStateChange, u64) {
         let span_root = Span::none();
+        let mut work_done: u64 = 0;
+
         // Process persistence work
         while let Some(task) = shared_state.persistence_response.pop() {
+            work_done += 1;
             match task {
                 PersistenceResponseType::VotePersisted { id, term, candidate_id } => {
                     if let Some(mut msg) = shared_state.outstanding_messages.remove(&id) {
@@ -118,7 +121,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                         shared_state.volatile_server_state.replication_log.len()
                                     );
 
-                                    return RaftMessageStateChange::Leader(Box::new(RaftLeaderStateDelegate::new()));
+                                    return (RaftMessageStateChange::Leader(Box::new(RaftLeaderStateDelegate::new())), work_done);
                                 } else {
                                     msg.outstanding_responses = new_outstanding_resp;
                                     // TODO maybe not recreate this all of the time.
@@ -158,6 +161,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         }
 
         while let Some(task) = shared_state.quorum_response.pop() {
+            work_done += 1;
             match task.response_type {
                 LocalQuorumTaskResponseType::TruncateLog { quorum_node_id, prev_term, prev_index } => {
                     log::info!("Received truncate log request while candidate, ignoring");
@@ -196,7 +200,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                         shared_state.volatile_server_state.replication_log.len()
                                     );
 
-                                    return RaftMessageStateChange::Leader(Box::new(RaftLeaderStateDelegate::new()));
+                                    return (RaftMessageStateChange::Leader(Box::new(RaftLeaderStateDelegate::new())), work_done);
                                 } else if new_outstanding_resp > 0 {
                                     msg.outstanding_responses = new_outstanding_resp;
                                     // TODO maybe not recreate this all of the time.
@@ -230,6 +234,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
 
         let now = now_millis();
         if self.initiate_election_timeout < now {
+            work_done += 1;
             // Initiate ProposeVote procedure.
             let message_id = shared_state.next_message_id;
             log::warn!("Initiating election due to timeout {}, now {}, id {}", self.initiate_election_timeout, now, message_id);
@@ -254,7 +259,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             });
             let persistence_span = Span::current();
             let persistence_task = PersistenceTaskType::AppendVote{id: message_id, term: next_term, candidate_id: shared_state.identity, parent_span: persistence_span};
-            shared_state.persistence_work.push(persistence_task);
+            shared_state.persistence_work.send(persistence_task).unwrap();
             shared_state.term_votes.insert(next_term, shared_state.identity); // TODO can this be inserted before persisted? Probably yes
             let message_type = OutstandingMessageType::CandidateElection{ persistence_done: false, quorum_votes: 1}; // Vote for self
             let response_span = tracing::span!(Level::INFO, "append_entries_outstanding_message_processing");
@@ -271,12 +276,16 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             self.initiate_election_timeout = now_plus_duration_millis(Duration::from_millis(self.rng.gen_range(500..3000) as u64));
         }
 
-        RaftMessageStateChange::None
+        (RaftMessageStateChange::None, work_done)
     }
 
     fn request_vote(&mut self, request_vote_request: LocalRequestVoteRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange {
         let span = tracing::span!(Level::INFO, "candidate_request_vote");
         let _enter = span.enter();
+
+        if shared_state.volatile_server_state.next_term <= request_vote_request.term {
+            shared_state.volatile_server_state.next_term = request_vote_request.term+1;
+        }
 
         if !self.should_accept_vote(request_vote_request.term, request_vote_request.last_log_term, request_vote_request.last_log_index, shared_state) {
             let payload = LocalRaftResponseMessage {
@@ -288,13 +297,9 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             return RaftMessageStateChange::None
         }
 
-        if shared_state.volatile_server_state.next_term <= request_vote_request.term {
-            shared_state.volatile_server_state.next_term = request_vote_request.term+1;
-        }
-
         let message_id = shared_state.next_message_id;
         let persistence_task = PersistenceTaskType::AppendVote{id: message_id, term: request_vote_request.term, candidate_id: request_vote_request.candidate_id, parent_span: Span::current()};
-        shared_state.persistence_work.push(persistence_task);
+        shared_state.persistence_work.send(persistence_task).unwrap();
         shared_state.term_votes.insert(request_vote_request.term, request_vote_request.candidate_id);
         shared_state.next_message_id = message_id+1;
         let response_span = tracing::span!(Level::INFO, "request_vote_outstanding_message_processing");

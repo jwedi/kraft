@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "kraft-client"
 path = "src/client.rs"
 
+[[bin]] # Bin to run the TCP datastore client
+name = "tcp-client"
+path = "src/tcp_client.rs"
+
 [[bench]]
 name = "replication_log"
 harness = false
@@ -26,6 +30,7 @@ debug = true  # Includes debug symbols without affecting optimizations
 debug = true
 
 [dependencies]
+minstant = { version = "0.1", features = ["fallback-coarse"] }
 tonic = "0.12.3"
 prost = "0.13"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
@@ -55,9 +60,13 @@ hyper = { version = "0.14", features = ["full"] }
 bus = "2.4.1"
 capnp = "0.23"
 crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+bytes = "1.5"
+dashmap = "5.5"
 
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3"
 
 [dependencies.uuid]
 version = "1.11.0"

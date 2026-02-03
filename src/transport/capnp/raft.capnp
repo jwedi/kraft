@@ -135,3 +135,62 @@ interface RaftPeer {
 interface Raft {
   connect @0 (myPeer :RaftPeer) -> (remotePeer :RaftPeer);
 }
+
+# =============================================================================
+# Internal types for zero-copy internal communication
+# These types are used for internal queues and state machine communication
+# =============================================================================
+
+# Internal put request - uses Data for payload to enable zero-copy
+struct InternalPutRequest {
+  id @0 :Text;
+  payload @1 :Data;  # Zero-copy bytes (not Text)
+  nodeId @2 :UInt32;
+}
+
+# Internal write batch - used for internal queue communication
+struct InternalWriteBatch {
+  batchId @0 :Text;
+  requests @1 :List(InternalPutRequest);
+}
+
+# Internal log entry - contains all data needed for replication and storage
+struct InternalLogEntry {
+  index @0 :UInt64;
+  term @1 :UInt64;
+  prevLogIndex @2 :UInt64;
+  prevLogTerm @3 :UInt64;
+  messageId @4 :UInt64;
+  timestamp @5 :UInt64;
+  commands @6 :List(InternalPutRequest);
+  data @7 :Data;  # SBE serialized bytes for network transmission
+}
+
+# Internal put response
+struct InternalPutResponse {
+  id @0 :Text;
+  responseType @1 :RemoteResponseType;
+  message @2 :Text;
+  nodeId @3 :UInt32;
+  batchId @4 :Text;
+}
+
+# Internal write batch response
+struct InternalWriteBatchResponse {
+  responses @0 :List(InternalPutResponse);
+  batchId @1 :Text;
+}
+
+# =============================================================================
+# Datastore GET request/response for TCP transport
+# =============================================================================
+
+struct DatastoreGetRequest {
+  id @0 :Text;
+}
+
+struct DatastoreGetResponse {
+  found @0 :Bool;
+  id @1 :Text;
+  payload @2 :Data;
+}

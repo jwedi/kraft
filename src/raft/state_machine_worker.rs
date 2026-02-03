@@ -1,10 +1,8 @@
 use std::sync::Arc;
 use std::thread;
-use std::thread::sleep;
 use std::time::Duration;
 use crossbeam_queue::SegQueue;
-use tokio::task::yield_now;
-use tokio::time::Instant;
+use crossbeam_utils::Backoff;
 use crate::raft::raft_sm::{LocalRaftMessage, SharedState, StateMachineExecutorImpl};
 use crate::raft::raft_sm::RaftStateMachineExecutor;
 
@@ -23,25 +21,27 @@ impl StateMachineWorker {
 
     pub fn run(&mut self) {
         log::info!("Running worker");
-        let desired_cadence_micros = 10;
+        let backoff = Backoff::new();
         loop {
-            let start_time = Instant::now();
-            self.state_machine.time_step();
-            let task = self.work_queue.pop();
+            let mut work_done: u64 = 0;
 
-            match task {
-                Some(task) => {
-                    self.state_machine.accept(task)
-                }
-                None => {
-                    thread::yield_now()
-                }
+            work_done += self.state_machine.time_step();
+
+            // Drain the work queue
+            while let Some(task) = self.work_queue.pop() {
+                self.state_machine.accept(task);
+                work_done += 1;
             }
-            let elapsed_micros = start_time.elapsed().as_micros();
-            if elapsed_micros < desired_cadence_micros {
-                sleep(Duration::from_micros((desired_cadence_micros-elapsed_micros) as u64));
+
+            if work_done > 0 {
+                backoff.reset();
             } else {
-                thread::yield_now()
+                if backoff.is_completed() {
+                    thread::park_timeout(Duration::from_micros(500));
+                    backoff.reset();
+                } else {
+                    backoff.snooze();
+                }
             }
         }
     }
