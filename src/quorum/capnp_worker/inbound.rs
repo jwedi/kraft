@@ -9,7 +9,7 @@ use crate::quorum::types::{LocalQuorumResponse, LocalQuorumTaskResponseType};
 use crate::raft::raft_sm::{
     LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftMessage,
     LocalRaftMessagePayload, LocalRaftResponseMessage, LocalRaftResponsePayload,
-    LocalRaftWriteBatchRequest, LocalRequestVoteRequest,
+    LocalRaftWriteBatchRequest, LocalRequestVoteRequest, LogEntry,
 };
 use crate::transport::capnp::owned_message::OwnedQuorumMessage;
 use crate::transport::capnp::raft_capnp::remote_quorum_message;
@@ -19,7 +19,6 @@ use crate::transport::capnp::{
     build_put_batch_response_message, build_truncate_log_response_message,
 };
 use crate::transport::metrics::{QUORUM_APPEND_ENTRIES_LATENCY, QUORUM_PUT_BATCH_LATENCY};
-use crate::transport::raft::raftproto::RemoteLogEntry;
 use crate::transport::write_proxy::WriteResponse;
 
 use super::{OngoingBackfill, PendingQuorumTask, PendingQuorumTaskEnum, PendingWriteBatch};
@@ -355,7 +354,7 @@ fn on_append_entries_request_capnp(
                 e.get_term(),
                 data.len()
             );
-            let proto_entry = RemoteLogEntry {
+            let proto_entry = LogEntry {
                 index: e.get_index(),
                 data,
                 batch_index: e.get_batch_index(),

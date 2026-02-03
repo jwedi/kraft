@@ -24,17 +24,8 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
-use tonic::transport::Channel;
 
 use kraft_lib::transport::capnp::{raft_capnp, OwnedLogEntry};
-
-// Include generated proto code for ping health check
-pub mod ping {
-    tonic::include_proto!("ping");
-}
-
-use ping::ping_pong_client::PingPongClient;
-use ping::PingRequest;
 
 // ============================================================================
 // TCP Codec (inline implementation)
@@ -93,8 +84,7 @@ const RPC_PUT_RECORD: u8 = 1;
 const RPC_GET_RECORD: u8 = 2;
 
 /// Port configuration for test nodes
-const BASE_GRPC_PORT: u32 = 60051;
-const BASE_CAPNP_PORT: u32 = 61151;
+const BASE_CLUSTER_PORT: u32 = 61151;
 const BASE_METRICS_PORT: u32 = 62051;
 const BASE_TCP_DATASTORE_PORT: u32 = 63051;
 
@@ -234,7 +224,6 @@ impl TcpConnection {
 struct NodeHandle {
     process: Child,
     temp_dir: TempDir,
-    grpc_endpoint: String,
     tcp_endpoint: SocketAddr,
     node_id: u32,
 }
@@ -265,34 +254,19 @@ impl NodeHandle {
             .stderr(Stdio::from(stderr_file))
             .spawn()?;
 
-        let grpc_endpoint = format!("http://[::1]:{}", BASE_GRPC_PORT + node_id - 1);
         let tcp_port = BASE_TCP_DATASTORE_PORT + node_id - 1;
         let tcp_endpoint: SocketAddr = format!("[::1]:{}", tcp_port).parse()?;
 
         Ok(NodeHandle {
             process,
             temp_dir,
-            grpc_endpoint,
             tcp_endpoint,
             node_id,
         })
     }
 
+    /// Check if node is ready by attempting TCP datastore connection
     async fn is_ready(&self) -> bool {
-        let Ok(channel) = Channel::from_shared(self.grpc_endpoint.clone())
-            .and_then(|c| Ok(c.connect_timeout(Duration::from_secs(1))))
-        else {
-            return false;
-        };
-
-        let Ok(channel) = channel.connect().await else {
-            return false;
-        };
-
-        PingPongClient::new(channel).ping(PingRequest {}).await.is_ok()
-    }
-
-    async fn is_tcp_ready(&self) -> bool {
         TcpStream::connect(self.tcp_endpoint).await.is_ok()
     }
 
@@ -307,34 +281,29 @@ impl NodeHandle {
 }
 
 fn generate_config(node_id: u32, cluster_size: u32, temp_dir: &str) -> String {
-    let grpc_port = BASE_GRPC_PORT + node_id - 1;
-    let capnp_port = BASE_CAPNP_PORT + node_id - 1;
+    let cluster_port = BASE_CLUSTER_PORT + node_id - 1;
     let metrics_port = BASE_METRICS_PORT + node_id - 1;
     let tcp_datastore_port = BASE_TCP_DATASTORE_PORT + node_id - 1;
 
     let mut config = format!(
-        r#"port = {grpc_port}
-node_id = {node_id}
+        r#"node_id = {node_id}
 persistence_dir = "{temp_dir}/data/"
 max_message_size_bytes = 4096
 max_batch_size = 512
 min_batch_interval_ms = 2
 metrics_port = {metrics_port}
 enable_otel_tracing = false
-use_capnp_transport = true
-capnp_port = {capnp_port}
+cluster_port = {cluster_port}
 tcp_datastore_port = {tcp_datastore_port}
 "#
     );
 
     for i in 1..=cluster_size {
-        let node_grpc_port = BASE_GRPC_PORT + i - 1;
-        let node_capnp_port = BASE_CAPNP_PORT + i - 1;
+        let node_cluster_port = BASE_CLUSTER_PORT + i - 1;
         config.push_str(&format!(
             r#"
 [[cluster_nodes]]
-endpoint = "http://[::1]:{node_grpc_port}"
-capnp_endpoint = "[::1]:{node_capnp_port}"
+endpoint = "[::1]:{node_cluster_port}"
 node_id = {i}
 "#
         ));
@@ -362,7 +331,7 @@ impl TestCluster {
     }
 
     async fn wait_for_ready(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Wait for all nodes to respond to ping
+        // Wait for all nodes TCP endpoints to be ready
         let deadline = tokio::time::Instant::now() + NODE_STARTUP_TIMEOUT;
         for node in &self.nodes {
             while tokio::time::Instant::now() < deadline {
@@ -373,19 +342,6 @@ impl TestCluster {
             }
             if !node.is_ready().await {
                 eprintln!("Node {} stderr:\n{}", node.node_id, node.read_stderr());
-                return Err(format!("Node {} failed to start", node.node_id).into());
-            }
-        }
-
-        // Wait for TCP endpoints to be ready
-        for node in &self.nodes {
-            while tokio::time::Instant::now() < deadline {
-                if node.is_tcp_ready().await {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            if !node.is_tcp_ready().await {
                 return Err(format!("Node {} TCP endpoint not ready", node.node_id).into());
             }
         }

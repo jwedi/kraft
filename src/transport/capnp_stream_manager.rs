@@ -48,13 +48,13 @@ impl CapnpStreamManager {
             return Ok(tx.clone());
         }
 
-        // Find node's capnp_endpoint
+        // Find node's endpoint
         let node = self.cluster_nodes.iter()
             .find(|n| n.node_id == node_id)
             .ok_or_else(|| CapnpConnectError::NoSuchNode(node_id))?;
 
-        let addr: SocketAddr = node.capnp_endpoint.parse()
-            .map_err(|e| CapnpConnectError::InvalidEndpoint(format!("{}: {}", node.capnp_endpoint, e)))?;
+        let addr: SocketAddr = node.endpoint.parse()
+            .map_err(|e| CapnpConnectError::InvalidEndpoint(format!("{}: {}", node.endpoint, e)))?;
 
         // Create crossbeam channel for this connection
         let (tx, rx) = crossbeam_channel::unbounded();

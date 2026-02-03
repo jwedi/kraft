@@ -3,15 +3,11 @@ name = "kraft"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]] # Bin to run the HelloWorld gRPC server
+[[bin]]
 name = "kraft"
 path = "src/main.rs"
 
-[[bin]] # Bin to run the HelloWorld gRPC client
-name = "kraft-client"
-path = "src/client.rs"
-
-[[bin]] # Bin to run the TCP datastore client
+[[bin]]
 name = "tcp-client"
 path = "src/tcp_client.rs"
 
@@ -21,7 +17,7 @@ harness = false
 
 [lib]
 name = "kraft_lib"
-path = "src/main.rs"
+path = "src/lib.rs"
 
 [profile.release]
 debug = true  # Includes debug symbols without affecting optimizations
@@ -31,8 +27,6 @@ debug = true
 
 [dependencies]
 minstant = { version = "0.1", features = ["fallback-coarse"] }
-tonic = "0.12.3"
-prost = "0.13"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
 log = "0.4.22"
 tracing-subscriber = "0.3.19"
@@ -76,5 +70,4 @@ features = [
 ]
 
 [build-dependencies]
-tonic-build = "*"
 capnpc = "0.23"

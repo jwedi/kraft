@@ -7,64 +7,9 @@ use opentelemetry_sdk::{trace, Resource};
 use tokio::join;
 use tracing_subscriber::{Layer, layer::SubscriberExt, Registry};
 
-use crate::config::config::{read_config, ClusterNode};
-use crate::transport::capnp_stream_manager::CapnpStreamManager;
-use crate::transport::ping::PingServer;
-
-pub mod service_utils {
-    pub mod app_time;
-    pub mod errors;
-    pub mod tracing_utils;
-}
-
-mod runtime_core {
-    pub mod task_buffer;
-    pub mod types;
-}
-
-mod raft {
-    pub mod candidate;
-    pub mod follower;
-    pub mod leader;
-    pub mod raft_sm;
-    pub mod state_machine_worker;
-}
-
-mod persistence {
-    pub mod worker;
-}
-
-mod quorum {
-    pub mod capnp_worker;
-    pub mod types;
-}
-
-mod query {
-    pub mod worker;
-}
-
-mod config {
-    pub mod config;
-}
-
-pub mod transport {
-    pub mod capnp;
-    pub mod capnp_stream_manager;
-    pub mod datastore;
-    pub mod metrics;
-    pub mod metrics_server;
-    pub mod ping;
-    pub mod raft;
-    pub mod stream_manager;
-    pub mod tcp_datastore;
-    pub mod write_proxy;
-}
-
-mod client {
-    pub mod cluster_node_client;
-}
-
-mod startup;
+use kraft_lib::config::config::{read_config, ClusterNode};
+use kraft_lib::transport::capnp_stream_manager::CapnpStreamManager;
+use kraft_lib::{startup, transport};
 
 /// Initialize OpenTelemetry tracing if enabled.
 /// When disabled, tracing macros become no-ops to reduce performance overhead.
@@ -104,26 +49,21 @@ fn init_tracing(node_id: u32, enable_otel: bool) -> Option<SDKTracer> {
     Some(tracer)
 }
 
-/// Creates the Cap'n Proto stream manager if enabled.
+/// Creates the Cap'n Proto stream manager for cluster communication.
 fn create_capnp_stream_manager(
-    use_capnp: bool,
     node_id: u32,
     cluster_nodes: &[ClusterNode],
-    capnp_port: u32,
-) -> Option<Arc<CapnpStreamManager>> {
-    if !use_capnp {
-        return None;
-    }
-
-    let capnp_addr: std::net::SocketAddr = format!("[::1]:{}", capnp_port)
+    cluster_port: u32,
+) -> Arc<CapnpStreamManager> {
+    let capnp_addr: std::net::SocketAddr = format!("[::1]:{}", cluster_port)
         .parse()
-        .expect("Invalid capnp_port");
+        .expect("Invalid cluster_port");
 
-    Some(Arc::new(CapnpStreamManager::new(
+    Arc::new(CapnpStreamManager::new(
         node_id,
         cluster_nodes.to_vec(),
         capnp_addr,
-    )))
+    ))
 }
 
 #[tokio::main]
@@ -140,8 +80,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = read_config()?;
     let node_id = cfg.node_id;
     let enable_otel = cfg.enable_otel_tracing;
-    let use_capnp_transport = cfg.use_capnp_transport;
-    let addr: std::net::SocketAddr = format!("[::1]:{}", cfg.port).parse()?;
 
     // Initialize tracing
     let _tracer = init_tracing(node_id, enable_otel);
@@ -172,25 +110,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .cloned()
         .collect();
 
-    // Create Cap'n Proto stream manager if enabled
+    // Create Cap'n Proto stream manager for cluster communication
     let capnp_stream_manager = create_capnp_stream_manager(
-        use_capnp_transport,
         node_id,
         &cluster_nodes_without_self,
-        cfg.capnp_port,
+        cfg.cluster_port,
     );
 
     // Create quorum workers
     log::info!("Using Cap'n Proto transport for cluster communication");
-    let capnp_sm = capnp_stream_manager
-        .as_ref()
-        .expect("Cap'n Proto stream manager is required");
 
     let (cluster_workers, quorum_send_channels) = startup::create_capnp_quorum_workers(
         &queues,
         &cluster_nodes_without_self,
         node_id,
-        Arc::clone(capnp_sm),
+        Arc::clone(&capnp_stream_manager),
         cfg.max_message_size_bytes,
     );
 
@@ -207,12 +141,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quorum_size,
         cfg.max_message_size_bytes,
     );
-
-    // Create gRPC servers
-    let stream_manager = startup::create_stream_manager(node_id, cluster_nodes_without_self.clone());
-    let raft_server = startup::create_raft_server(&queues, node_id, stream_manager);
-    let datastore_server = startup::create_datastore_server(&queues, Arc::clone(&commit_state));
-    let pinger = PingServer::default();
 
     // Spawn workers
     let write_proxy_handle = startup::spawn_write_proxy(
@@ -237,11 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let persistence_handle = startup::spawn_persistence_worker(persistence_worker);
 
     // Start Cap'n Proto listener
-    let capnp_listener_handle = if use_capnp_transport {
-        Some(startup::spawn_capnp_listener(capnp_stream_manager.clone().unwrap()))
-    } else {
-        None
-    };
+    let capnp_listener_handle = startup::spawn_capnp_listener(Arc::clone(&capnp_stream_manager));
 
     // Spawn cluster workers
     let cluster_worker_handles = startup::spawn_capnp_quorum_workers(cluster_workers);
@@ -249,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start metrics server
     let metrics_handle = startup::spawn_metrics_server(cfg.metrics_port);
 
-    // Start TCP datastore server if configured
+    // Start TCP datastore server
     let tcp_datastore_handle = if cfg.tcp_datastore_port > 0 {
         Some(startup::spawn_tcp_datastore_server(
             cfg.tcp_datastore_port,
@@ -261,19 +185,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    info!("Starting server at {}", addr);
-
-    // Start gRPC server (this blocks until shutdown)
-    startup::start_grpc_server(
-        addr,
-        node_id,
-        enable_otel,
-        use_capnp_transport,
-        pinger,
-        raft_server,
-        datastore_server,
-    )
-    .await?;
+    info!("Kraft server started - node_id={}, cluster_port={}, tcp_datastore_port={}",
+          node_id, cfg.cluster_port, cfg.tcp_datastore_port);
 
     // Wait for all workers to complete
     let _ = join!(
@@ -281,13 +194,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         persistence_handle,
         write_proxy_handle,
         metrics_handle,
-        query_worker_handle
+        query_worker_handle,
+        capnp_listener_handle
     );
     join_all(cluster_worker_handles).await;
-
-    if let Some(handle) = capnp_listener_handle {
-        let _ = handle.await;
-    }
 
     if let Some(handle) = tcp_datastore_handle {
         let _ = handle.await;

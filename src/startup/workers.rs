@@ -55,7 +55,7 @@ pub fn create_capnp_quorum_workers(
             node_id,
             0,
             node.node_id.into(),
-            node.capnp_endpoint.clone(),
+            node.endpoint.clone(),
             Arc::clone(&capnp_stream_manager),
             Arc::clone(&queues.task_queue),
             max_message_size_bytes,

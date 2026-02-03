@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use super::raft_capnp::{internal_write_batch, internal_log_entry, internal_write_batch_response};
-use crate::transport::raft::raftproto::{RemotePutRequest, RemotePutResponse};
 
 /// Zero-copy write batch wrapper - owns the serialized bytes via Arc.
 /// Can be cloned and sent to multiple crossbeam queues without copying the data.
@@ -58,22 +57,6 @@ impl OwnedWriteBatch {
                 }).sum()
             }).unwrap_or(0)
         }).unwrap_or(0)
-    }
-
-    /// Convert to protobuf requests for legacy code that still needs Vec<RemotePutRequest>
-    /// This is a temporary bridge method during migration.
-    pub fn to_protobuf_requests(&self) -> Vec<RemotePutRequest> {
-        self.with_message(|r| {
-            r.get_requests().map(|reqs| {
-                reqs.iter().map(|req| {
-                    RemotePutRequest {
-                        id: req.get_id().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default(),
-                        payload: req.get_payload().map(|p| String::from_utf8_lossy(p).to_string()).unwrap_or_default(),
-                        node_id: req.get_node_id(),
-                    }
-                }).collect()
-            }).unwrap_or_default()
-        }).unwrap_or_default()
     }
 
     /// Check if the batch is empty
@@ -267,28 +250,6 @@ impl OwnedWriteBatchResponse {
     /// Get the batch ID
     pub fn batch_id(&self) -> capnp::Result<String> {
         self.with_message(|r| r.get_batch_id().map(|s| s.to_string().unwrap_or_default()))?.map_err(|e| capnp::Error::failed(format!("{:?}", e)))
-    }
-
-    /// Convert to protobuf responses for legacy code that still needs Vec<RemotePutResponse>
-    /// This is a temporary bridge method during migration.
-    pub fn to_protobuf_responses(&self) -> Vec<RemotePutResponse> {
-        self.with_message(|r| {
-            r.get_responses().map(|resps| {
-                resps.iter().map(|resp| {
-                    RemotePutResponse {
-                        id: resp.get_id().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default(),
-                        response_type: match resp.get_response_type() {
-                            Ok(crate::transport::capnp::raft_capnp::RemoteResponseType::Ok) => 1,
-                            Ok(crate::transport::capnp::raft_capnp::RemoteResponseType::Invalid) => 2,
-                            _ => 0,
-                        },
-                        message: resp.get_message().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default(),
-                        node_id: resp.get_node_id(),
-                        batch_id: resp.get_batch_id().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default(),
-                    }
-                }).collect()
-            }).unwrap_or_default()
-        }).unwrap_or_default()
     }
 }
 

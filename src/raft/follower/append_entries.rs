@@ -292,9 +292,8 @@ fn update_commit_index(shared_state: &mut SharedState, new_commit_index: u64) {
 mod tests {
     use super::*;
     use crate::raft::raft_sm::{
-        CommitState, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig,
+        CommitState, LogEntry, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig,
     };
-    use crate::transport::raft::raftproto::RemoteLogEntry;
     use bus::Bus;
     use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
@@ -507,7 +506,7 @@ mod tests {
             prev_index: 10,
             commit_index: 3,
             request_id: 5,
-            entry: Some(RemoteLogEntry {
+            entry: Some(LogEntry {
                 index: 11,
                 term: 1,
                 data: vec![1, 2, 3],

@@ -336,7 +336,6 @@ mod tests {
     use bus::Bus;
     use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
-    use crate::transport::raft::raftproto::RemoteLogEntry;
     use crate::transport::capnp::build_owned_log_entry;
     use crate::persistence::worker::PersistenceResponseType;
 
@@ -466,7 +465,7 @@ mod tests {
             prev_index: 0,
             commit_index: 1,
             request_id: 1,
-            entry: Some(RemoteLogEntry {
+            entry: Some(LogEntry {
                 term: 1,
                 index: 1,
                 data: capnp_bytes,

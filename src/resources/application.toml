@@ -1,5 +1,3 @@
-
-port = 50051
 node_id = 1
 persistence_dir = "out/"
 max_message_size_bytes = 4096
@@ -7,19 +5,17 @@ max_batch_size = 512
 min_batch_interval_ms = 2
 metrics_port = 51051
 enable_otel_tracing = false
-use_capnp_transport = true
-capnp_port = 51151
-
+cluster_port = 51151
 tcp_datastore_port = 49011
+
 [[cluster_nodes]]
-endpoint = "http://[::1]:50051"
-capnp_endpoint = "[::1]:51151"
+endpoint = "[::1]:51151"
 node_id = 1
+
 [[cluster_nodes]]
-endpoint = "http://[::1]:50052"
-capnp_endpoint = "[::1]:51152"
+endpoint = "[::1]:51152"
 node_id = 2
+
 [[cluster_nodes]]
-endpoint = "http://[::1]:50053"
-capnp_endpoint = "[::1]:51153"
+endpoint = "[::1]:51153"
 node_id = 3

@@ -1,24 +1,20 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::thread;
 use tokio::sync::oneshot;
 use crossbeam_channel::Sender;
 use crossbeam_queue::SegQueue;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
 use crate::quorum::types::{LocalQuorumResponse, LocalQuorumWorkerTask};
 use crate::raft::follower::RaftFollowerStateDelegate;
-use crate::transport::raft::raftproto::{RemoteLogEntry, RemotePutRequest, RemotePutResponse};
 use crate::transport::capnp::{OwnedWriteBatch, OwnedWriteBatchResponse, OwnedLogEntry, build_owned_write_batch_response};
-use crate::transport::raft::raftproto::raft_server::Raft;
-use crate::service_utils::app_time::now_millis;
 use crate::transport::write_proxy::{WriteBatch, WriteResponse};
 use std::time::{Duration, Instant};
 use bus::Bus;
-use log::kv::Source;
 use log::{info, warn};
 
 #[derive(Copy, Clone)]
@@ -339,13 +335,25 @@ pub struct LocalRequestVoteRequest {
     pub last_log_term: u64
 }
 
+/// Log entry for replication - replaces the protobuf RemoteLogEntry
+#[derive(Clone, Debug)]
+pub struct LogEntry {
+    pub index: u64,
+    pub data: Vec<u8>,
+    pub batch_index: u64,
+    pub term: u64,
+    pub prev_log_term: u64,
+    pub prev_log_index: u64,
+    pub message_id: u64,
+}
+
 pub struct LocalAppendEntries {
     pub term: u64,
     pub leader_id: u32,
     pub prev_index: u64,
     pub prev_term: u64,
     pub request_id: u64,
-    pub entry: Option<RemoteLogEntry>,
+    pub entry: Option<LogEntry>,
     pub commit_index: u64
 }
 
@@ -428,19 +436,19 @@ struct RaftState {
 pub struct FollowerState {
     pub current_term: u64,
     pub voted_for: Option<u64>,
-    pub log: Vec<RemoteLogEntry>
+    pub log: Vec<LogEntry>
 }
 
 pub struct LeaderState {
     pub current_term: u64,
-    pub log : Vec<RemoteLogEntry>,
+    pub log : Vec<LogEntry>,
     pub max_heartbeat_cadence: u64,
 }
 
 pub struct RaftSM {
     pub current_term: u64,
     pub voted_for: Option<u64>,
-    pub log: Vec<RemoteLogEntry>
+    pub log: Vec<LogEntry>
 }
 
 #[cfg(test)]
