@@ -13,7 +13,7 @@ use crate::query::worker::QueryRequest;
 use crate::quorum::capnp_worker::CapnpQuorumWorker;
 use crate::quorum::types::LocalQuorumWorkerTask;
 use crate::raft::raft_sm::{CommitState, LocalRaftMessage, SharedState};
-use crate::service_utils::storage_utils::SerializationData;
+use crate::transport::capnp::OwnedLogEntry;
 use crate::startup::queues::AppQueues;
 use crate::transport::capnp_stream_manager::CapnpStreamManager;
 use crate::transport::tcp_datastore::TcpDatastoreServer;
@@ -94,7 +94,7 @@ pub fn spawn_write_proxy(
 
 /// Spawns the query worker.
 pub fn spawn_query_worker(
-    bus_reader: BusReader<Arc<SerializationData>>,
+    bus_reader: BusReader<Arc<OwnedLogEntry>>,
     commit_state: Arc<CommitState>,
     query_queue: Arc<SegQueue<QueryRequest>>,
 ) -> JoinHandle<bool> {

@@ -61,7 +61,7 @@ impl PersistenceWorker {
             .write(true)
             .create(true)
             .append(true)
-            .open(format!("{}log.sbe", self.persistence_config.out_dir))
+            .open(format!("{}log.capnp", self.persistence_config.out_dir))
             .unwrap();
         let mut log_write_buffer = BufWriter::new(log_write_file_handle);
 
@@ -214,7 +214,7 @@ impl PersistenceWorker {
             .read(true)
             .write(true)
             .create(true)
-            .open(format!("{}log.sbe", self.persistence_config.out_dir))?;
+            .open(format!("{}log.capnp", self.persistence_config.out_dir))?;
 
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;

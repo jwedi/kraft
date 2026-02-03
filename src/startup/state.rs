@@ -12,7 +12,7 @@ use crate::raft::raft_sm::{
     CommitState, OutstandingMessage, RaftServerState, RaftVolatileState, SharedState,
     StateMachineConfig,
 };
-use crate::service_utils::storage_utils::SerializationData;
+use crate::transport::capnp::OwnedLogEntry;
 use crate::startup::queues::AppQueues;
 use crate::startup::recovery::RecoveredData;
 
@@ -60,14 +60,14 @@ pub fn create_shared_state(
     node_id: u32,
     quorum_size: u32,
     max_message_size_bytes: usize,
-) -> (SharedState, bus::BusReader<Arc<SerializationData>>) {
+) -> (SharedState, bus::BusReader<Arc<OwnedLogEntry>>) {
     let server_state = create_server_state();
     let term_votes = recovered.term_votes.clone();
     let volatile_server_state = create_volatile_state(recovered, commit_state);
 
     let outstanding_messages: HashMap<u64, OutstandingMessage> = HashMap::new();
 
-    let mut log_entry_bus: Bus<Arc<SerializationData>> = Bus::new(5000);
+    let mut log_entry_bus: Bus<Arc<OwnedLogEntry>> = Bus::new(5000);
     let query_bus_reader = log_entry_bus.add_rx();
 
     let shared_state = SharedState {

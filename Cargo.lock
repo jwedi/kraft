@@ -1646,7 +1646,6 @@ dependencies = [
  "prometheus",
  "prost",
  "rand",
- "sbe_kraft_replication_schema",
  "serde",
  "tempfile",
  "time",
@@ -2434,10 +2433,6 @@ checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
 ]
-
-[[package]]
-name = "sbe_kraft_replication_schema"
-version = "0.1.0"
 
 [[package]]
 name = "scopeguard"

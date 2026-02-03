@@ -142,15 +142,9 @@ pub fn build_append_entries_message(
                 entry_builder.set_prev_log_term(reader.get_prev_log_term());
                 entry_builder.set_message_id(reader.get_message_id());
                 entry_builder.set_batch_index(reader.get_index()); // batch_index = index
-                // Copy data bytes (SBE serialized) for network transmission
-                match reader.get_data() {
-                    Ok(data) => {
-                        entry_builder.set_data(data);
-                    }
-                    Err(e) => {
-                        log::error!("Failed to read data from OwnedLogEntry: {:?}", e);
-                    }
-                }
+                // Set data to full Cap'n Proto bytes for network transmission
+                // Followers will parse this with OwnedLogEntry::from_bytes()
+                entry_builder.set_data(log_entry.as_bytes());
             }) {
                 Ok(_) => {}
                 Err(e) => {

@@ -9,17 +9,17 @@ use crossbeam_queue::SegQueue;
 use log::{debug, info, warn};
 use tokio::sync::oneshot;
 use crate::raft::raft_sm::CommitState;
-use crate::service_utils::storage_utils::SerializationData;
+use crate::transport::capnp::OwnedLogEntry;
 
 pub struct QueryWorker {
-    bus: BusReader<Arc<SerializationData>>,
+    bus: BusReader<Arc<OwnedLogEntry>>,
     commit_state: Arc<CommitState>,
-    query_structure: HashMap<String, Arc<String>>,
+    query_structure: HashMap<String, Arc<Vec<u8>>>,
     pending_queries: Arc<SegQueue<QueryRequest>>
 }
 
 pub struct QueryResponse {
-    pub value: Option<Arc<String>>
+    pub value: Option<Arc<Vec<u8>>>
 }
 
 pub struct QueryRequest {
@@ -31,7 +31,7 @@ pub struct QueryRequest {
 impl QueryWorker {
 
     pub fn new(
-        bus: BusReader<Arc<SerializationData>>,
+        bus: BusReader<Arc<OwnedLogEntry>>,
         commit_state: Arc<CommitState>,
         pending_queries: Arc<SegQueue<QueryRequest>>
     ) -> Self {
@@ -46,7 +46,7 @@ impl QueryWorker {
     pub fn run(&mut self) {
 
         let mut last_version = 0;
-        let mut parked: Option<Arc<SerializationData>> = None;
+        let mut parked: Option<Arc<OwnedLogEntry>> = None;
         let mut parked_request: Option<QueryRequest> = None;
         let mut applied_index: u64 = 0;
         let backoff = Backoff::new();
@@ -61,11 +61,11 @@ impl QueryWorker {
                 match parked.take() {
                     None => {}
                     Some(parked_value) => {
-                        if (parked_value.index <= index) {
-                            for req in parked_value.requests.iter() {
-                                self.query_structure.insert(req.id.clone(), Arc::new(req.payload.clone()));
-                            }
-                            applied_index = parked_value.index;
+                        if parked_value.index() <= index {
+                            let _ = parked_value.for_each_command(|id, payload, _| {
+                                self.query_structure.insert(id.to_string(), Arc::new(payload.to_vec()));
+                            });
+                            applied_index = parked_value.index();
                             num_entries_applied += 1;
                         } else {
                             parked = Some(parked_value)
@@ -76,15 +76,16 @@ impl QueryWorker {
                 loop {
                     match self.bus.try_recv() {
                         Ok(val) => {
-                            if val.index <= index {
-                                for req in val.requests.iter() {
-                                    self.query_structure.insert(req.id.clone(), Arc::new(req.payload.clone()));
-                                    if val.index < applied_index {
-                                        warn!("Received index {} less than previously applied index {}", val.index, applied_index);
+                            if val.index() <= index {
+                                let entry_index = val.index();
+                                let _ = val.for_each_command(|id, payload, _| {
+                                    self.query_structure.insert(id.to_string(), Arc::new(payload.to_vec()));
+                                    if entry_index < applied_index {
+                                        warn!("Received index {} less than previously applied index {}", entry_index, applied_index);
                                     }
-                                    applied_index = val.index;
-                                }
-                            } else if val.term == u64::MAX && val.term == u64::MAX {
+                                });
+                                applied_index = entry_index;
+                            } else if val.term() == u64::MAX {
                                 // Truncate signal
                                 self.query_structure.clear();
                                 last_version = current_version;

@@ -63,7 +63,7 @@ impl Datastore for DatastoreServerImpl {
                         Ok(Response::new((GetDataStoreRecordResponse{
                             record: Some(DataStoreRecord{
                                 id: req_id,
-                                payload: value.to_string()
+                                payload: String::from_utf8_lossy(&value).to_string()
                             })
                         })))
 

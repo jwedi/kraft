@@ -12,10 +12,9 @@ use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
 use crate::quorum::types::{LocalQuorumResponse, LocalQuorumWorkerTask};
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::transport::raft::raftproto::{RemoteLogEntry, RemotePutRequest, RemotePutResponse};
-use crate::transport::capnp::{OwnedWriteBatch, OwnedWriteBatchResponse, build_owned_write_batch_response};
+use crate::transport::capnp::{OwnedWriteBatch, OwnedWriteBatchResponse, OwnedLogEntry, build_owned_write_batch_response};
 use crate::transport::raft::raftproto::raft_server::Raft;
 use crate::service_utils::app_time::now_millis;
-use crate::service_utils::storage_utils::SerializationData;
 use crate::transport::write_proxy::{WriteBatch, WriteResponse};
 use std::time::{Duration, Instant};
 use bus::Bus;
@@ -44,7 +43,7 @@ pub struct RaftVolatileState {
     pub last_log_term: u64,
     pub next_term: u64,// 1 more than the largest term value seen.
     pub next_log_index: u64,
-    pub replication_log: Vec<Arc<SerializationData>>,
+    pub replication_log: Vec<Arc<OwnedLogEntry>>,
     pub replication_log_term_starts: HashMap<u64, u64>,
     pub commit_state: Arc<CommitState>,
     /// Tracks the highest log index that has been broadcast to the bus.
@@ -90,7 +89,7 @@ pub struct SharedState {
     pub quorum_size: u32,
     pub quorum_worker_tasks: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>>,
     pub state_machine_config: StateMachineConfig,
-    pub log_entry_bus: Bus<Arc<SerializationData>>
+    pub log_entry_bus: Bus<Arc<OwnedLogEntry>>
 }
 
 impl SharedState {
@@ -450,7 +449,7 @@ mod integration_tests {
     use crate::raft::leader::RaftLeaderStateDelegate;
     use crate::raft::follower::RaftFollowerStateDelegate;
     use crate::quorum::types::{LocalQuorumResponse, LocalQuorumTaskResponseType, LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
-    use crate::service_utils::storage_utils::SerializationData;
+    use crate::transport::capnp::build_owned_log_entry;
     use std::collections::HashMap;
     use std::sync::Arc;
     use crossbeam_channel::unbounded;
@@ -520,15 +519,15 @@ mod integration_tests {
         for i in 0u64..7 {
             let term = if i < 4 { 2 } else { 3 };
             let prev_term = if i == 0 { 0 } else if i <= 4 { 2 } else { 3 };
-            leader_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-                requests: vec![],
-                term,
-                timestamp: 0,
-                prev_index: if i == 0 { 0 } else { i - 1 },
-                prev_term,
-                index: i, // Absolute index
-                message_id: i,
-            }));
+            let prev_index = if i == 0 { 0 } else { i - 1 };
+            leader_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(term);
+                builder.set_prev_log_index(prev_index);
+                builder.set_prev_log_term(prev_term);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
         }
         leader_state.volatile_server_state.last_log_index = 6;
         leader_state.volatile_server_state.last_log_term = 3;
@@ -569,15 +568,16 @@ mod integration_tests {
         // Follower has 6 entries (indexes 0-5), all term 2
         follower_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
         for i in 0u64..6 {
-            follower_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-                requests: vec![],
-                term: 2,
-                timestamp: 0,
-                prev_index: if i == 0 { 0 } else { i - 1 },
-                prev_term: if i == 0 { 0 } else { 2 },
-                index: i, // Absolute index
-                message_id: i,
-            }));
+            let prev_index = if i == 0 { 0 } else { i - 1 };
+            let prev_term = if i == 0 { 0 } else { 2 };
+            follower_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(2);
+                builder.set_prev_log_index(prev_index);
+                builder.set_prev_log_term(prev_term);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
         }
         follower_state.volatile_server_state.last_log_term = 2;
         follower_state.volatile_server_state.last_log_index = 5;
@@ -649,15 +649,15 @@ mod integration_tests {
         for i in 0u64..10 {
             let term = if i < 3 { 2 } else if i < 6 { 3 } else { 4 };
             let prev_term = if i == 0 { 0 } else if i <= 3 { 2 } else if i <= 6 { 3 } else { 4 };
-            leader_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-                requests: vec![],
-                term,
-                timestamp: 0,
-                prev_index: if i == 0 { 0 } else { i - 1 },
-                prev_term,
-                index: i, // Absolute index
-                message_id: i,
-            }));
+            let prev_index = if i == 0 { 0 } else { i - 1 };
+            leader_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(term);
+                builder.set_prev_log_index(prev_index);
+                builder.set_prev_log_term(prev_term);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
         }
         leader_state.volatile_server_state.last_log_index = 9;
         leader_state.volatile_server_state.last_log_term = 4;
@@ -710,15 +710,15 @@ mod integration_tests {
         for i in 0u64..7 {
             let term = if i < 5 { 2 } else { 3 };
             let prev_term = if i == 0 { 0 } else if i <= 5 { 2 } else { 3 };
-            leader_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-                requests: vec![],
-                term,
-                timestamp: 0,
-                prev_index: if i == 0 { 0 } else { i - 1 },
-                prev_term,
-                index: i, // Absolute index
-                message_id: i,
-            }));
+            let prev_index = if i == 0 { 0 } else { i - 1 };
+            leader_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(term);
+                builder.set_prev_log_index(prev_index);
+                builder.set_prev_log_term(prev_term);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
         }
         leader_state.volatile_server_state.last_log_index = 6;
         leader_state.volatile_server_state.last_log_term = 3;

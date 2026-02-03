@@ -178,7 +178,7 @@ async fn handle_get_record(payload: Bytes, queues: &Queues) -> Bytes {
     // Wait for response
     match callback_rx.await {
         Ok(resp) => match resp.value {
-            Some(value) => build_get_response(true, &key, value.as_bytes()),
+            Some(value) => build_get_response(true, &key, &value),
             None => build_get_response(false, &key, &[]),
         },
         Err(_) => {

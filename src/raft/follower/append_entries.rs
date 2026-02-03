@@ -10,7 +10,7 @@ use crate::raft::raft_sm::{
     LocalRaftResponsePayload, OutstandingMessage, OutstandingMessageType,
     RaftMessageStateChange, SharedState,
 };
-use crate::service_utils::storage_utils::deserialize_data;
+use crate::transport::capnp::OwnedLogEntry;
 
 use super::election::ElectionTimer;
 
@@ -163,6 +163,7 @@ pub fn handle_non_consecutive_request(
 }
 
 /// Applies a log entry from the append entries request.
+/// The entry.data is now expected to be Cap'n Proto serialized OwnedLogEntry bytes.
 pub fn apply_log_entry(
     request: LocalAppendEntries,
     callback: oneshot::Sender<LocalRaftResponseMessage>,
@@ -204,18 +205,18 @@ pub fn apply_log_entry(
     };
     shared_state.persistence_work.send(persistence_task).unwrap();
 
-    match deserialize_data(&data, 0) {
-        Ok((_, deserialized)) => {
-            let serialization_data = Arc::new(deserialized);
+    // Wrap received bytes as OwnedLogEntry (Cap'n Proto format)
+    match OwnedLogEntry::from_bytes(data.to_vec()) {
+        Ok(owned_entry) => {
             shared_state
                 .volatile_server_state
                 .replication_log
-                .push(Arc::clone(&serialization_data));
+                .push(Arc::new(owned_entry));
             // Note: Bus broadcast is deferred until commit_index advances (committed entries only)
         }
         Err(e) => {
             log::error!(
-                "Failed to deserialize append_entries data from leader: {}, term: {}, index: {}, error: {}",
+                "Failed to parse append_entries data from leader: {}, term: {}, index: {}, error: {:?}",
                 request.leader_id,
                 request.term,
                 request.prev_index,

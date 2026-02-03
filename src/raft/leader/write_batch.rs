@@ -9,103 +9,85 @@ use crate::raft::raft_sm::{
     LocalRaftWriteBatchResponse, OutstandingMessage, OutstandingMessageType, SharedState,
 };
 use crate::service_utils::app_time::now_millis;
-use crate::service_utils::storage_utils::{serialize_data, SerializationData};
-use crate::transport::capnp::{build_owned_log_entry, build_owned_write_batch_response};
+use crate::transport::capnp::{build_owned_log_entry, build_owned_write_batch_response, OwnedLogEntry};
 
 /// Validates a write batch request.
 /// Returns None if valid, or an error message if invalid.
 pub fn validate_write_batch(
     write_batch_request: &LocalRaftWriteBatchRequest,
 ) -> Option<&'static str> {
-    let requests = write_batch_request.message.to_protobuf_requests();
-    if requests.is_empty() {
+    if write_batch_request.message.is_empty() {
         return Some("Empty write batch request");
     }
     None
 }
 
-/// Creates SerializationData from a write batch request.
-pub fn create_serialization_data(
+/// Creates an OwnedLogEntry directly from a write batch request and appends to the replication log.
+/// Returns the Arc<OwnedLogEntry> for network transmission.
+pub fn create_and_append_log_entry(
     write_batch_request: &LocalRaftWriteBatchRequest,
     idx: u64,
     message_id: u64,
-    shared_state: &SharedState,
-) -> SerializationData {
-    let requests = write_batch_request.message.to_protobuf_requests();
-    SerializationData {
-        index: idx,
-        term: shared_state.server_state.current_term,
-        timestamp: now_millis() as u64,
-        prev_index: shared_state.volatile_server_state.last_log_index,
-        prev_term: shared_state.volatile_server_state.last_log_term,
-        message_id,
-        requests,
-    }
-}
-
-/// Serializes data and updates the replication log.
-pub fn serialize_and_append_to_log(
-    serialization_data: SerializationData,
     shared_state: &mut SharedState,
-) -> (Arc<SerializationData>, Arc<Vec<u8>>) {
-    let buffer = vec![0u8; shared_state.state_machine_config.max_message_size_bytes];
-    let (limit, mut data) = serialize_data(&serialization_data, buffer, 0);
-    tracing::info!("serialized data size: {}", limit);
-    data.truncate(limit);
+) -> Arc<OwnedLogEntry> {
+    let current_term = shared_state.server_state.current_term;
+    let prev_log_index = shared_state.volatile_server_state.last_log_index;
+    let prev_log_term = shared_state.volatile_server_state.last_log_term;
+    let timestamp = now_millis() as u64;
 
-    if serialization_data.prev_term != serialization_data.term {
-        // First entry of new term.
+    // Build OwnedLogEntry by reading commands from the write batch
+    let owned_entry = Arc::new(write_batch_request.message.with_message(|reader| {
+        let requests = reader.get_requests().ok();
+        let request_count = requests.as_ref().map(|r| r.len()).unwrap_or(0);
+        build_owned_log_entry(|mut builder| {
+            builder.set_index(idx);
+            builder.set_term(current_term);
+            builder.set_prev_log_index(prev_log_index);
+            builder.set_prev_log_term(prev_log_term);
+            builder.set_message_id(message_id);
+            builder.set_timestamp(timestamp);
+            // Build commands from write batch requests
+            let mut commands = builder.init_commands(request_count as u32);
+            if let Some(reqs) = &requests {
+                for (i, req) in reqs.iter().enumerate() {
+                let mut cmd = commands.reborrow().get(i as u32);
+                if let Ok(id) = req.get_id() {
+                    cmd.set_id(id);
+                }
+                if let Ok(payload) = req.get_payload() {
+                    cmd.set_payload(payload);
+                }
+                cmd.set_node_id(req.get_node_id());
+                }
+            }
+        })
+    }).expect("Failed to build log entry from write batch"));
+
+    // Track term start if this is the first entry of a new term
+    if prev_log_term != current_term {
         shared_state.volatile_server_state.replication_log_term_starts.insert(
-            shared_state.server_state.current_term,
+            current_term,
             shared_state.volatile_server_state.replication_log.len() as u64,
         );
     }
 
-    let arc_serialization_data = Arc::new(serialization_data);
-    shared_state
-        .volatile_server_state
-        .replication_log
-        .push(Arc::clone(&arc_serialization_data));
+    // Append to replication log
+    shared_state.volatile_server_state.replication_log.push(Arc::clone(&owned_entry));
 
-    let shared_data = Arc::new(data);
-    (arc_serialization_data, shared_data)
+    tracing::info!("created log entry size: {} bytes", owned_entry.as_bytes().len());
+    owned_entry
 }
 
-/// Queues a persistence task for the write batch.
-pub fn queue_persistence_task(message_id: u64, shared_data: Arc<Vec<u8>>, shared_state: &SharedState) {
+/// Queues a persistence task for the log entry.
+pub fn queue_persistence_task(message_id: u64, entry: &Arc<OwnedLogEntry>, shared_state: &SharedState) {
+    let data = Arc::new(entry.as_bytes().to_vec());
     let persistence_task = PersistenceTaskType::AppendLog {
         id: message_id,
-        data: Arc::clone(&shared_data),
+        data,
         parent_span: Span::current(),
         request_id: message_id,
     };
     shared_state.persistence_work.send(persistence_task).unwrap();
-}
-
-/// Builds an OwnedLogEntry for the write batch.
-pub fn build_log_entry(
-    idx: u64,
-    message_id: u64,
-    shared_data: &Arc<Vec<u8>>,
-    arc_serialization_data: &Arc<SerializationData>,
-    shared_state: &SharedState,
-) -> Arc<crate::transport::capnp::OwnedLogEntry> {
-    Arc::new(build_owned_log_entry(|mut builder| {
-        builder.set_index(idx);
-        builder.set_term(shared_state.server_state.current_term);
-        builder.set_prev_log_index(shared_state.volatile_server_state.last_log_index);
-        builder.set_prev_log_term(shared_state.volatile_server_state.last_log_term);
-        builder.set_message_id(message_id);
-        builder.set_timestamp(now_millis() as u64);
-        builder.set_data(&Arc::clone(shared_data));
-        let mut commands = builder.init_commands(arc_serialization_data.requests.len() as u32);
-        for (i, req) in arc_serialization_data.requests.iter().enumerate() {
-            let mut cmd = commands.reborrow().get(i as u32);
-            cmd.set_id(&req.id);
-            cmd.set_payload(req.payload.as_bytes());
-            cmd.set_node_id(req.node_id);
-        }
-    }))
 }
 
 /// Dispatches append entries tasks to all quorum workers.
@@ -277,39 +259,35 @@ mod tests {
     }
 
     #[test]
-    fn test_create_serialization_data_populates_fields_correctly() {
-        let (shared_state, _persistence_rx) = create_test_shared_state();
+    fn test_create_and_append_log_entry_populates_fields_correctly() {
+        let (mut shared_state, _persistence_rx) = create_test_shared_state();
         let request = create_write_batch_request_with_data();
 
-        let data = create_serialization_data(&request, 10, 200, &shared_state);
+        let entry = create_and_append_log_entry(&request, 10, 200, &mut shared_state);
 
-        assert_eq!(data.index, 10);
-        assert_eq!(data.term, 2); // current_term
-        assert_eq!(data.prev_index, 5); // last_log_index
-        assert_eq!(data.prev_term, 1); // last_log_term
-        assert_eq!(data.message_id, 200);
-        assert_eq!(data.requests.len(), 2);
-        assert_eq!(data.requests[0].id, "req1");
-        assert_eq!(data.requests[1].id, "req2");
+        assert_eq!(entry.index(), 10);
+        assert_eq!(entry.term(), 2); // current_term
+        assert_eq!(entry.prev_log_index(), 5); // last_log_index
+        assert_eq!(entry.prev_log_term(), 1); // last_log_term
+        assert_eq!(entry.message_id(), 200);
+        assert_eq!(entry.command_count(), 2);
+
+        // Verify commands via for_each_command
+        let mut commands = Vec::new();
+        entry.for_each_command(|id, _payload, _node_id| {
+            commands.push(id.to_string());
+        }).unwrap();
+        assert_eq!(commands, vec!["req1", "req2"]);
     }
 
     #[test]
-    fn test_serialize_and_append_to_log_adds_to_replication_log() {
+    fn test_create_and_append_log_entry_adds_to_replication_log() {
         let (mut shared_state, _persistence_rx) = create_test_shared_state();
-
-        let serialization_data = SerializationData {
-            index: 6,
-            term: 2,
-            timestamp: 12345,
-            prev_index: 5,
-            prev_term: 1, // Different from term, so first entry of new term
-            message_id: 100,
-            requests: vec![],
-        };
+        let request = create_write_batch_request_with_data();
 
         let initial_log_len = shared_state.volatile_server_state.replication_log.len();
 
-        let (arc_data, serialized) = serialize_and_append_to_log(serialization_data, &mut shared_state);
+        let entry = create_and_append_log_entry(&request, 6, 100, &mut shared_state);
 
         // Log should have grown
         assert_eq!(
@@ -317,14 +295,14 @@ mod tests {
             initial_log_len + 1
         );
 
-        // Arc data should match
-        assert_eq!(arc_data.index, 6);
-        assert_eq!(arc_data.term, 2);
+        // Entry should match
+        assert_eq!(entry.index(), 6);
+        assert_eq!(entry.term(), 2);
 
-        // Serialized data should not be empty
-        assert!(!serialized.is_empty());
+        // Serialized bytes should not be empty
+        assert!(!entry.as_bytes().is_empty());
 
-        // Term start should be recorded since prev_term != term
+        // Term start should be recorded since prev_term (1) != term (2)
         assert!(shared_state
             .volatile_server_state
             .replication_log_term_starts
@@ -333,10 +311,11 @@ mod tests {
 
     #[test]
     fn test_queue_persistence_task_adds_to_queue() {
-        let (shared_state, persistence_rx) = create_test_shared_state();
-        let data = Arc::new(vec![1, 2, 3, 4, 5]);
+        let (mut shared_state, persistence_rx) = create_test_shared_state();
+        let request = create_write_batch_request_with_data();
+        let entry = create_and_append_log_entry(&request, 6, 42, &mut shared_state);
 
-        queue_persistence_task(42, data, &shared_state);
+        queue_persistence_task(42, &entry, &shared_state);
 
         // Should have one task in the persistence channel
         let task = persistence_rx.try_recv();
@@ -345,7 +324,7 @@ mod tests {
         match task.unwrap() {
             crate::persistence::worker::PersistenceTaskType::AppendLog { id, data, .. } => {
                 assert_eq!(id, 42);
-                assert_eq!(data.len(), 5);
+                assert!(!data.is_empty());
             }
             _ => panic!("Expected AppendLog task"),
         }

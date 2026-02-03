@@ -26,8 +26,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 
-use kraft_lib::service_utils::storage_utils::{deserialize_all_data, SerializationData};
-use kraft_lib::transport::capnp::raft_capnp;
+use kraft_lib::transport::capnp::{raft_capnp, OwnedLogEntry};
 
 // Include generated proto code for ping health check
 pub mod ping {
@@ -303,7 +302,7 @@ impl NodeHandle {
     }
 
     fn log_file_path(&self) -> std::path::PathBuf {
-        self.temp_dir.path().join("data").join("log.sbe")
+        self.temp_dir.path().join("data").join("log.capnp")
     }
 }
 
@@ -484,7 +483,7 @@ impl TestCluster {
         Err(last_error.unwrap_or_else(|| "No attempts made".into()))
     }
 
-    fn read_transaction_log(&self, node_idx: usize) -> Vec<SerializationData> {
+    fn read_transaction_log(&self, node_idx: usize) -> Vec<OwnedLogEntry> {
         let log_path = self.nodes[node_idx].log_file_path();
         let log_bytes = fs::read(&log_path)
             .expect(&format!("Failed to read log file for node {}", node_idx + 1));
@@ -493,8 +492,25 @@ impl TestCluster {
             return Vec::new();
         }
 
-        deserialize_all_data(&log_bytes)
-            .expect(&format!("Failed to deserialize log for node {}", node_idx + 1))
+        // Parse concatenated Cap'n Proto messages
+        let mut entries = Vec::new();
+        let mut offset = 0;
+        while offset < log_bytes.len() {
+            let mut slice = &log_bytes[offset..];
+            match capnp::serialize::read_message_from_flat_slice(&mut slice, Default::default()) {
+                Ok(_) => {
+                    let bytes_consumed = log_bytes.len() - offset - slice.len();
+                    let entry_bytes = log_bytes[offset..offset + bytes_consumed].to_vec();
+                    match OwnedLogEntry::from_bytes(entry_bytes) {
+                        Ok(entry) => entries.push(entry),
+                        Err(e) => panic!("Failed to parse log entry at offset {}: {:?}", offset, e),
+                    }
+                    offset += bytes_consumed;
+                }
+                Err(e) => panic!("Failed to read capnp message at offset {}: {:?}", offset, e),
+            }
+        }
+        entries
     }
 
     async fn wait_for_replication_tcp(&self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -552,23 +568,34 @@ async fn test_three_node_cluster_consensus_tcp() {
 
     // Verify all entries via transaction log (more reliable than parsing responses)
     // ===== Transaction Log Verification =====
-    let logs: Vec<Vec<SerializationData>> = (0..3)
+    let logs: Vec<Vec<OwnedLogEntry>> = (0..3)
         .map(|i| cluster.read_transaction_log(i))
         .collect();
 
-    // Verify all logs are identical across nodes
-    assert!(logs.windows(2).all(|w| w[0] == w[1]), "Transaction logs differ between nodes");
+    // Verify all logs have the same length (identical entry count)
+    assert!(logs.windows(2).all(|w| w[0].len() == w[1].len()), "Transaction logs have different lengths");
+
+    // Verify all logs have the same indices and terms
+    for (i, entry_pair) in logs.windows(2).enumerate() {
+        for (j, (e1, e2)) in entry_pair[0].iter().zip(entry_pair[1].iter()).enumerate() {
+            assert_eq!(e1.index(), e2.index(), "Index mismatch at position {} between nodes {} and {}", j, i, i+1);
+            assert_eq!(e1.term(), e2.term(), "Term mismatch at position {} between nodes {} and {}", j, i, i+1);
+        }
+    }
 
     // Verify all written entries appear in the log with correct values
-    let log_entries: std::collections::HashMap<_, _> = logs[0]
-        .iter()
-        .flat_map(|e| e.requests.iter().map(|r| (r.id.clone(), r.payload.clone())))
-        .collect();
+    let mut log_entries: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for entry in &logs[0] {
+        let _ = entry.for_each_command(|id, payload, _node_id| {
+            log_entries.insert(id.to_string(), payload.to_vec());
+        });
+    }
 
     for i in 0..entry_count {
         let key = format!("key-{}", i);
         let expected = format!("value-{}", i);
-        assert_eq!(log_entries.get(&key), Some(&expected), "Key {} mismatch in log", key);
+        let actual = log_entries.get(&key).map(|v| String::from_utf8_lossy(v).to_string());
+        assert_eq!(actual.as_deref(), Some(expected.as_str()), "Key {} mismatch in log", key);
     }
 
     println!("TCP Transport: Transaction log verification passed: {} entries across all nodes", logs[0].len());

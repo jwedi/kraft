@@ -130,6 +130,28 @@ impl OwnedLogEntry {
         Ok(Self { bytes: bytes.into() })
     }
 
+    /// Create from raw bytes without validation (for recovery from trusted sources)
+    pub fn from_bytes_unchecked(bytes: Arc<[u8]>) -> Self {
+        Self { bytes }
+    }
+
+    /// Iterate commands with zero-copy access (key, payload, node_id)
+    pub fn for_each_command<F>(&self, mut f: F) -> capnp::Result<()>
+    where
+        F: FnMut(&str, &[u8], u32),
+    {
+        self.with_message(|r| {
+            if let Ok(commands) = r.get_commands() {
+                for cmd in commands.iter() {
+                    let id = cmd.get_id().ok().and_then(|s| s.to_str().ok()).unwrap_or("");
+                    let payload = cmd.get_payload().unwrap_or(&[]);
+                    let node_id = cmd.get_node_id();
+                    f(id, payload, node_id);
+                }
+            }
+        })
+    }
+
     /// Process the message with a closure. This is the zero-copy access pattern.
     pub fn with_message<F, R>(&self, f: F) -> capnp::Result<R>
     where

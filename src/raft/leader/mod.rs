@@ -151,7 +151,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
     ) {
         let message_id = shared_state.next_message_id;
         let idx = shared_state.volatile_server_state.next_log_index;
-        let batch_size = write_batch_request.message.to_protobuf_requests().len();
+        let batch_size = write_batch_request.message.len();
 
         tracing::info!("writing batches {} as message id: {} with index: {}", batch_size, message_id, idx);
         shared_state.next_message_id += 1;
@@ -165,29 +165,16 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             return;
         }
 
-        // Create serialization data
-        let serialization_data = write_batch::create_serialization_data(
+        // Create OwnedLogEntry directly and append to log
+        let owned_entry = write_batch::create_and_append_log_entry(
             &write_batch_request,
             idx,
             message_id,
             shared_state,
         );
 
-        // Serialize and append to log
-        let (arc_serialization_data, shared_data) =
-            write_batch::serialize_and_append_to_log(serialization_data, shared_state);
-
-        // Queue persistence task
-        write_batch::queue_persistence_task(message_id, Arc::clone(&shared_data), shared_state);
-
-        // Build log entry for quorum workers
-        let owned_entry = write_batch::build_log_entry(
-            idx,
-            message_id,
-            &shared_data,
-            &arc_serialization_data,
-            shared_state,
-        );
+        // Queue persistence task (writes Cap'n Proto bytes directly)
+        write_batch::queue_persistence_task(message_id, &owned_entry, shared_state);
 
         // Dispatch to quorum workers
         write_batch::dispatch_to_quorum(message_id, owned_entry, shared_state);
@@ -328,8 +315,7 @@ mod tests {
     use crate::quorum::types::LocalQuorumResponse;
     use crate::quorum::types::LocalQuorumTaskResponseType;
     use crate::persistence::worker::PersistenceResponseType;
-    use crate::service_utils::storage_utils::SerializationData;
-    use crate::transport::capnp::build_owned_write_batch;
+    use crate::transport::capnp::{build_owned_write_batch, build_owned_log_entry};
 
     fn create_shared_state() -> (SharedState, crossbeam_channel::Receiver<crate::persistence::worker::PersistenceTaskType>) {
         let (persistence_tx, persistence_rx) = unbounded();
@@ -433,15 +419,17 @@ mod tests {
         shared_state.volatile_server_state.replication_log_term_starts.insert(3, 3);
 
         for i in 0..5u64 {
-            shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-                requests: vec![],
-                term: if i < 3 { 2 } else { 3 },
-                timestamp: 0,
-                prev_index: if i > 0 { i - 1 } else { 0 },
-                prev_term: if i < 3 { 2 } else if i == 3 { 2 } else { 3 },
-                index: i,
-                message_id: i,
-            }));
+            let term = if i < 3 { 2 } else { 3 };
+            let prev_index = if i > 0 { i - 1 } else { 0 };
+            let prev_term = if i < 3 { 2 } else if i == 3 { 2 } else { 3 };
+            shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(term);
+                builder.set_prev_log_index(prev_index);
+                builder.set_prev_log_term(prev_term);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
         }
 
         // Set up quorum worker task queues
@@ -483,24 +471,22 @@ mod tests {
         shared_state.server_state.leader_id = 0;
 
         // Leader has 2 entries
-        shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-            index: 0,
-            term: 1,
-            timestamp: 0,
-            prev_index: 0,
-            prev_term: 0,
-            message_id: 0,
-            requests: vec![],
-        }));
-        shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-            index: 1,
-            term: 3,
-            timestamp: 0,
-            prev_index: 0,
-            prev_term: 1,
-            message_id: 0,
-            requests: vec![],
-        }));
+        shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+            builder.set_index(0);
+            builder.set_term(1);
+            builder.set_prev_log_index(0);
+            builder.set_prev_log_term(0);
+            builder.set_message_id(0);
+            builder.set_timestamp(0);
+        })));
+        shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+            builder.set_index(1);
+            builder.set_term(3);
+            builder.set_prev_log_index(0);
+            builder.set_prev_log_term(1);
+            builder.set_message_id(0);
+            builder.set_timestamp(0);
+        })));
 
         shared_state.quorum_worker_tasks = vec![Arc::new(SegQueue::new()); 3];
 
@@ -542,16 +528,16 @@ mod tests {
         shared_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
         shared_state.volatile_server_state.replication_log_term_starts.insert(3, 6);
 
-        for i in 0..10 {
-            shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-                requests: vec![],
-                term: if i < 6 { 2 } else { 3 },
-                timestamp: 0,
-                prev_index: 0,
-                prev_term: 0,
-                index: i,
-                message_id: i,
-            }));
+        for i in 0..10u64 {
+            let term = if i < 6 { 2 } else { 3 };
+            shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(term);
+                builder.set_prev_log_index(0);
+                builder.set_prev_log_term(0);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
         }
 
         shared_state.quorum_worker_tasks = vec![Arc::new(SegQueue::new()); 3];
@@ -616,10 +602,13 @@ mod tests {
 
         assert_eq!(shared_state.volatile_server_state.replication_log.len(), 1);
         let entry = &shared_state.volatile_server_state.replication_log[0];
-        assert_eq!(entry.index, 1);
-        assert_eq!(entry.term, shared_state.server_state.current_term);
-        assert_eq!(entry.requests.len(), 1);
-        assert_eq!(entry.requests[0].id, "put_1");
+        assert_eq!(entry.index(), 1);
+        assert_eq!(entry.term(), shared_state.server_state.current_term);
+        assert_eq!(entry.command_count(), 1);
+        // Verify command via for_each_command
+        let mut ids = Vec::new();
+        entry.for_each_command(|id, _, _| ids.push(id.to_string())).unwrap();
+        assert_eq!(ids[0], "put_1");
 
         assert!(shared_state.outstanding_messages.contains_key(&(shared_state.next_message_id - 1)));
         assert!(persistence_rx.try_recv().is_ok());
@@ -716,24 +705,22 @@ mod tests {
     fn test_time_step_handles_log_persisted_and_quorum_ack_happy_path() {
         let mut delegate = RaftLeaderStateDelegate::new();
         let mut shared_state = create_shared_state_with_quorum();
-        shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-            index: 0,
-            term: 1,
-            timestamp: 0,
-            prev_index: 0,
-            prev_term: 0,
-            message_id: 0,
-            requests: vec![],
-        }));
-        shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-            index: 1,
-            term: 1,
-            timestamp: 0,
-            prev_index: 0,
-            prev_term: 0,
-            message_id: 0,
-            requests: vec![],
-        }));
+        shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+            builder.set_index(0);
+            builder.set_term(1);
+            builder.set_prev_log_index(0);
+            builder.set_prev_log_term(0);
+            builder.set_message_id(0);
+            builder.set_timestamp(0);
+        })));
+        shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+            builder.set_index(1);
+            builder.set_term(1);
+            builder.set_prev_log_index(0);
+            builder.set_prev_log_term(0);
+            builder.set_message_id(0);
+            builder.set_timestamp(0);
+        })));
 
         let (callback_tx, mut callback_rx) = oneshot::channel();
         let msg_id = shared_state.next_message_id;
@@ -778,24 +765,22 @@ mod tests {
         delegate.initialized = true;
         let mut shared_state = create_shared_state_with_quorum();
 
-        shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-            index: 0,
-            term: 1,
-            timestamp: 0,
-            prev_index: 0,
-            prev_term: 0,
-            message_id: 0,
-            requests: vec![],
-        }));
-        shared_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-            index: 1,
-            term: 1,
-            timestamp: 0,
-            prev_index: 0,
-            prev_term: 1,
-            message_id: 1,
-            requests: vec![],
-        }));
+        shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+            builder.set_index(0);
+            builder.set_term(1);
+            builder.set_prev_log_index(0);
+            builder.set_prev_log_term(0);
+            builder.set_message_id(0);
+            builder.set_timestamp(0);
+        })));
+        shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+            builder.set_index(1);
+            builder.set_term(1);
+            builder.set_prev_log_index(0);
+            builder.set_prev_log_term(1);
+            builder.set_message_id(1);
+            builder.set_timestamp(0);
+        })));
 
         shared_state.volatile_server_state.replication_log_term_starts.insert(1, 0);
 
@@ -814,8 +799,8 @@ mod tests {
         match task.task_type {
             LocalQuorumWorkerTaskType::BackfillLog { data } => {
                 assert_eq!(data.len(), 1);
-                assert_eq!(data[0].index, 1);
-                assert_eq!(data[0].term, 1);
+                assert_eq!(data[0].index(), 1);
+                assert_eq!(data[0].term(), 1);
             }
             _ => panic!("Expected BackfillLog task"),
         }

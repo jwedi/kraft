@@ -14,7 +14,6 @@ use crate::transport::ping::PingServer;
 pub mod service_utils {
     pub mod app_time;
     pub mod errors;
-    pub mod storage_utils;
     pub mod tracing_utils;
 }
 
