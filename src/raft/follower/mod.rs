@@ -60,10 +60,6 @@ impl RaftFollowerStateDelegate {
 }
 
 impl RaftProtocol for RaftFollowerStateDelegate {
-    fn init(&self) {
-        todo!()
-    }
-
     fn get_node_type(&self) -> RaftNodeType {
         RaftNodeType::Follower
     }
@@ -211,6 +207,9 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 }
             }
         }
+
+        // Retry deferred broadcasts
+        work_done += shared_state.retry_deferred_broadcast();
 
         // Check election timeout
         if let Some(state_change) = self.election_timer.check_timeout() {
@@ -360,6 +359,7 @@ mod tests {
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
+                has_deferred_broadcast: false,
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),

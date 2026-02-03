@@ -33,7 +33,9 @@ struct ResponseMessage {
 /// Handle a single TCP connection with pipelining support.
 pub async fn handle(stream: TcpStream, queues: Queues) -> std::io::Result<()> {
     let (mut reader, writer) = tokio::io::split(stream);
-    let (response_tx, response_rx) = mpsc::unbounded_channel::<ResponseMessage>();
+    // Use bounded channel to provide backpressure. 1000 pending responses should be
+    // plenty for pipelining while preventing unbounded memory growth.
+    let (response_tx, response_rx) = mpsc::channel::<ResponseMessage>(1000);
 
     // Spawn writer task - sends responses as they arrive (unordered by request ID)
     let writer_handle = tokio::spawn(async move {
@@ -61,11 +63,12 @@ pub async fn handle(stream: TcpStream, queues: Queues) -> std::io::Result<()> {
 
         tokio::spawn(async move {
             let response_payload = dispatch_request(rpc_type, payload, &queues_clone).await;
+            // Use blocking send for bounded channel - provides backpressure when writer is slow
             let _ = tx.send(ResponseMessage {
                 request_id,
                 rpc_type,
                 payload: response_payload,
-            });
+            }).await;
         });
     }
 
@@ -81,7 +84,7 @@ pub async fn handle(stream: TcpStream, queues: Queues) -> std::io::Result<()> {
 /// Writer task: sends responses as they arrive.
 async fn write_responses(
     mut writer: WriteHalf<TcpStream>,
-    mut rx: mpsc::UnboundedReceiver<ResponseMessage>,
+    mut rx: mpsc::Receiver<ResponseMessage>,
 ) {
     while let Some(msg) = rx.recv().await {
         if let Err(e) = write_frame(&mut writer, msg.rpc_type, msg.request_id, &msg.payload).await {

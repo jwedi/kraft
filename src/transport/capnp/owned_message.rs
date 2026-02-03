@@ -23,6 +23,13 @@ impl OwnedQuorumMessage {
         Ok(Self { bytes: bytes.into() })
     }
 
+    /// Create from bytes without validation.
+    /// SAFETY: Only use this when you KNOW the bytes are valid Cap'n Proto messages,
+    /// such as when they were just serialized by this process.
+    fn from_bytes_unchecked(bytes: Vec<u8>) -> Self {
+        Self { bytes: bytes.into() }
+    }
+
     /// Process the message with a closure. This is the zero-copy access pattern.
     /// The reader borrows from the internal bytes and is valid for the closure's scope.
     pub fn with_message<F, R>(&self, f: F) -> capnp::Result<R>
@@ -53,7 +60,9 @@ where
     }
     let mut bytes = Vec::new();
     capnp::serialize::write_message(&mut bytes, &builder).expect("write should not fail");
-    OwnedQuorumMessage::from_bytes(bytes).expect("re-parse should not fail")
+    // Skip re-parsing for validation since we just built this message.
+    // This avoids double serialization overhead in the hot path.
+    OwnedQuorumMessage::from_bytes_unchecked(bytes)
 }
 
 // =============================================================================

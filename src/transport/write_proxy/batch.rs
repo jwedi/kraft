@@ -8,7 +8,7 @@ use crate::transport::capnp::{
 
 use super::{WriteBatch, WriteResponse};
 
-/// Combines multiple WriteBatches into a single OwnedWriteBatch for processing.
+/// Combines multiple WriteBatches into a single OwnedWriteBatch for processing to amortize cost.
 /// This involves extracting data from each batch and building a new combined message.
 /// The callbacks are collected for later response routing.
 pub fn prepare_batch_and_callbacks(
@@ -17,40 +17,56 @@ pub fn prepare_batch_and_callbacks(
 ) -> (OwnedWriteBatch, HashMap<String, Sender<WriteResponse>>) {
     let mut batch_callbacks: HashMap<String, Sender<WriteResponse>> = HashMap::new();
 
-    // First, collect all request data from all batches
-    struct RequestData {
-        id: String,
-        payload: Vec<u8>,
-        node_id: u32,
-    }
-    let mut all_requests: Vec<RequestData> = vec![];
-
-    for b in batches.into_iter() {
-        batch_callbacks.insert(b.batch_id.clone(), b.callback);
-
-        // Extract requests from this batch's OwnedWriteBatch
-        let _ = b.message.with_message(|reader| {
+    // First pass: count total requests and collect callbacks
+    let mut total_requests: u32 = 0;
+    for b in batches.iter() {
+        match b.message.with_message(|reader| {
             if let Ok(reqs) = reader.get_requests() {
-                for req in reqs.iter() {
-                    all_requests.push(RequestData {
-                        id: req.get_id().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default(),
-                        payload: req.get_payload().map(|p| p.to_vec()).unwrap_or_default(),
-                        node_id: req.get_node_id(),
-                    });
-                }
+                total_requests += reqs.len();
             }
-        });
+        }) {
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!("Failed to parse batch message during request counting: {:?}", e);
+                // Continue with other batches - the malformed one will be skipped
+            }
+        }
     }
 
-    // Build combined OwnedWriteBatch
+    // Collect callbacks - we need to move these out of batches
+    let batches_with_callbacks: Vec<_> = batches.into_iter().map(|b| {
+        batch_callbacks.insert(b.batch_id.clone(), b.callback);
+        b.message
+    }).collect();
+
     let combined = build_owned_write_batch(|mut builder| {
         builder.set_batch_id(batch_id);
-        let mut reqs = builder.init_requests(all_requests.len() as u32);
-        for (i, req_data) in all_requests.iter().enumerate() {
-            let mut req = reqs.reborrow().get(i as u32);
-            req.set_id(&req_data.id);
-            req.set_payload(&req_data.payload);
-            req.set_node_id(req_data.node_id);
+        let mut reqs = builder.init_requests(total_requests);
+        let mut req_idx: u32 = 0;
+
+        for message in batches_with_callbacks.iter() {
+            match message.with_message(|reader| {
+                if let Ok(source_reqs) = reader.get_requests() {
+                    for source_req in source_reqs.iter() {
+                        let mut target_req = reqs.reborrow().get(req_idx);
+                        // Copy directly from reader to builder, avoiding intermediate allocation
+                        if let Ok(id) = source_req.get_id() {
+                            target_req.set_id(id);
+                        }
+                        if let Ok(payload) = source_req.get_payload() {
+                            target_req.set_payload(payload);
+                        }
+                        target_req.set_node_id(source_req.get_node_id());
+                        req_idx += 1;
+                    }
+                }
+            }) {
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("Failed to parse batch message during combination: {:?}", e);
+                    // Continue with other batches - errors are logged but don't stop processing
+                }
+            }
         }
     });
 

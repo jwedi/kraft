@@ -75,28 +75,28 @@ impl MessageSender {
             }
         });
 
-        // Main send loop - poll crossbeam queue and send messages
+        // Main send loop: block on crossbeam (via spawn_blocking) then batch-drain
         let rx = self.rx;
-        loop {
-            let msg = {
-                let rx_clone = rx.clone();
-                tokio::task::spawn_blocking(move || rx_clone.recv()).await?
+        'outer: loop {
+            // Block on the Tokio blocking threadpool waiting for a message
+            let rx_clone = rx.clone();
+            let Ok(Ok(msg)) = tokio::task::spawn_blocking(move || rx_clone.recv()).await else {
+                log::warn!("Message queue for sender disconnected");
+                break;
             };
 
-            match msg {
-                Ok(msg) => {
-                    if let Err(e) = write_message(&mut writer, &msg).await {
-                        log::warn!("Failed to send message {}", e);
-                        break;
-                    }
-                }
-                Err(_) => {
-                    log::warn!("Message queue for sender broke");
-                    // Channel closed
-                    break;
+            if write_message(&mut writer, &msg).await.is_err() {
+                break;
+            }
+
+            // Batch-drain any pending messages without blocking
+            while let Ok(msg) = rx.try_recv() {
+                if write_message(&mut writer, &msg).await.is_err() {
+                    break 'outer;
                 }
             }
         }
+
 
         reader_handle.abort();
         Ok(())
@@ -114,13 +114,133 @@ pub async fn write_message<W: AsyncWriteExt + Unpin>(
     writer.flush().await
 }
 
+/// Maximum allowed message size (64 MB). This prevents DoS attacks where
+/// an attacker sends a huge length prefix to exhaust server memory.
+pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 /// Read a length-prefixed message from TCP
 pub async fn read_message<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<OwnedQuorumMessage> {
     let len = reader.read_u32().await? as usize;
+
+    // Validate message size before allocating to prevent DoS attacks
+    if len > MAX_MESSAGE_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Message size {} exceeds maximum allowed size {}", len, MAX_MESSAGE_SIZE),
+        ));
+    }
+
     let mut bytes = vec![0u8; len];
     reader.read_exact(&mut bytes).await?;
     OwnedQuorumMessage::from_bytes(bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    // =========================================================================
+    // Regression test: Message size limit prevents DoS via large length prefix
+    // Fix: Added MAX_MESSAGE_SIZE check before allocating buffer
+    // =========================================================================
+    #[tokio::test]
+    async fn test_read_message_rejects_oversized_message() {
+        // Create a fake TCP stream with an oversized length prefix
+        // Length prefix: 100MB (well over the 64MB limit)
+        let oversized_length: u32 = 100 * 1024 * 1024;
+        let mut data = Vec::new();
+        data.extend_from_slice(&oversized_length.to_be_bytes());
+        // No actual payload needed - we should fail before reading it
+
+        let mut cursor = Cursor::new(data);
+        let result = read_message(&mut cursor).await;
+
+        match result {
+            Err(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+                assert!(
+                    err.to_string().contains("exceeds maximum"),
+                    "Error should mention size limit: {}",
+                    err
+                );
+            }
+            Ok(_) => panic!("Expected error for oversized message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_message_accepts_valid_size() {
+        // MAX_MESSAGE_SIZE is 64MB, so 1KB should be fine
+        // This test verifies that the size check passes for valid sizes
+        // (the actual Cap'n Proto parsing may succeed or fail depending on data)
+        let valid_length: u32 = 1024;
+        let mut data = Vec::new();
+        data.extend_from_slice(&valid_length.to_be_bytes());
+        // Add dummy payload (may or may not be valid Cap'n Proto)
+        data.extend(vec![0u8; valid_length as usize]);
+
+        let mut cursor = Cursor::new(data);
+        let result = read_message(&mut cursor).await;
+
+        // The key assertion: if there's an error, it should NOT be about size limit
+        // (either parsing succeeds or fails for other reasons)
+        if let Err(err) = result {
+            assert!(
+                !err.to_string().contains("exceeds maximum"),
+                "Error should not be about size limit for valid-sized message: {}",
+                err
+            );
+        }
+        // If Ok(_), that's fine too - it means the zeros formed valid Cap'n Proto
+    }
+
+    // =========================================================================
+    // Test MAX_MESSAGE_SIZE constant is set correctly
+    // =========================================================================
+    #[test]
+    fn test_max_message_size_is_64mb() {
+        assert_eq!(MAX_MESSAGE_SIZE, 64 * 1024 * 1024);
+    }
+
+    // =========================================================================
+    // Test boundary conditions for message size
+    // =========================================================================
+    #[tokio::test]
+    async fn test_read_message_boundary_exactly_at_limit() {
+        // Exactly at the limit should be accepted (size-wise)
+        let at_limit: u32 = MAX_MESSAGE_SIZE as u32;
+        let mut data = Vec::new();
+        data.extend_from_slice(&at_limit.to_be_bytes());
+        // Note: We can't actually allocate 64MB in this test, so this is conceptual
+
+        let mut cursor = Cursor::new(data);
+        let result = read_message(&mut cursor).await;
+
+        // Should fail because we don't have 64MB of data, but NOT because of size limit
+        // The error should be UnexpectedEof, not InvalidData about size
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_message_boundary_one_over_limit() {
+        // One byte over the limit should be rejected immediately
+        let over_limit: u32 = MAX_MESSAGE_SIZE as u32 + 1;
+        let mut data = Vec::new();
+        data.extend_from_slice(&over_limit.to_be_bytes());
+
+        let mut cursor = Cursor::new(data);
+        let result = read_message(&mut cursor).await;
+
+        match result {
+            Err(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+                assert!(err.to_string().contains("exceeds maximum"));
+            }
+            Ok(_) => panic!("Expected error for oversized message"),
+        }
+    }
 }

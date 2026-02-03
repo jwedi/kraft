@@ -46,6 +46,9 @@ pub struct RaftVolatileState {
     /// None means no entries have been broadcast yet.
     /// Only committed entries are broadcast to ensure query workers never see truncated data.
     pub last_broadcast_index: Option<u64>,
+    /// Indicates that there are deferred broadcasts pending due to bus full condition.
+    /// When true, time_step will retry broadcasting remaining entries.
+    pub has_deferred_broadcast: bool,
 }
 
 pub struct CommitState {
@@ -110,7 +113,7 @@ impl SharedState {
                         last_broadcast_index = i;
                     }
                     Err(_) => {
-                        last_broadcast_index = self.broadcast_commited_entries_when_bus_full(new_commit_index as usize, idx) as u64;
+                        last_broadcast_index = self.broadcast_committed_entries_when_bus_full(new_commit_index as usize, idx) as u64;
                         break;
                     }
                 }
@@ -125,30 +128,110 @@ impl SharedState {
             log::info!("Broadcasted {} entries in {} ms", entries_broadcasted, elapsed_millis)
         }
         self.volatile_server_state.last_broadcast_index = Some(last_broadcast_index);
+        self.volatile_server_state.has_deferred_broadcast = last_broadcast_index < new_commit_index;
         self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
     }
 
-    fn broadcast_commited_entries_when_bus_full(&mut self, new_absolute_commit_index: usize, start_index: usize) -> usize {
+    /// Broadcasts committed entries when the bus is full.
+    ///
+    /// 1. Attempts to broadcast with a limited number of retries per entry
+    /// 2. Returns early if the bus remains full after max retries
+    /// 3. The caller will retry on the next time_step, allowing other Raft operations to proceed
+    ///
+    /// This prevents blocking elections and heartbeats when consumers are slow.
+    fn broadcast_committed_entries_when_bus_full(&mut self, new_absolute_commit_index: usize, start_index: usize) -> usize {
+        const MAX_RETRIES_PER_ENTRY: u32 = 100;
+        const YIELD_INTERVAL: u32 = 10; // Yield every N retries
+
         self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
         let mut idx = start_index;
+
         while idx <= new_absolute_commit_index {
             if let Some(entry) = self.volatile_server_state.replication_log.get(idx) {
                 let e = Arc::clone(entry);
-                match self.log_entry_bus.try_broadcast(e) {
-                    Ok(_) => {
-                        idx += 1;
-                    }
-                    Err(_) => {
-                        self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
-                        thread::yield_now();
+                let mut retries = 0u32;
+
+                loop {
+                    match self.log_entry_bus.try_broadcast(e.clone()) {
+                        Ok(_) => {
+                            idx += 1;
+                            break;
+                        }
+                        Err(_) => {
+                            retries += 1;
+                            if retries >= MAX_RETRIES_PER_ENTRY {
+                                // Bus is persistently full - return early to allow other operations
+                                // The next call to broadcast_committed_entries will resume from here
+                                log::warn!(
+                                    "Bus full after {} retries at index {}, deferring remaining {} entries",
+                                    retries,
+                                    idx,
+                                    new_absolute_commit_index - idx
+                                );
+                                return if idx > start_index { idx - 1 } else { start_index };
+                            }
+                            if retries % YIELD_INTERVAL == 0 {
+                                self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+                                thread::yield_now();
+                            }
+                        }
                     }
                 }
             } else {
                 log::warn!("No replication log entry at index: {}, returning", idx);
-                return idx;
+                return if idx > start_index { idx - 1 } else { start_index };
             }
         }
-        return new_absolute_commit_index;
+        new_absolute_commit_index
+    }
+
+    /// Maximum entries to broadcast per time_step to avoid blocking Raft operations.
+    const MAX_BROADCAST_PER_TIMESTEP: u64 = 1000;
+
+    /// Retries broadcasting deferred entries. Called from time_step.
+    /// Returns the number of entries successfully broadcast.
+    pub fn retry_deferred_broadcast(&mut self) -> u64 {
+        if !self.volatile_server_state.has_deferred_broadcast {
+            return 0;
+        }
+
+        let commit_index = self.volatile_server_state.commit_index;
+        let start_index = self.volatile_server_state.last_broadcast_index
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        if start_index > commit_index {
+            self.volatile_server_state.has_deferred_broadcast = false;
+            return 0;
+        }
+
+        let mut count = 0u64;
+        let end_index = std::cmp::min(commit_index, start_index + Self::MAX_BROADCAST_PER_TIMESTEP - 1);
+
+        for i in start_index..=end_index {
+            if let Some(entry) = self.volatile_server_state.replication_log.get(i as usize) {
+                match self.log_entry_bus.try_broadcast(Arc::clone(entry)) {
+                    Ok(_) => {
+                        self.volatile_server_state.last_broadcast_index = Some(i);
+                        count += 1;
+                    }
+                    Err(_) => {
+                        // Bus still full, will retry next time_step
+                        return count;
+                    }
+                }
+            }
+        }
+
+        // Check if done
+        if self.volatile_server_state.last_broadcast_index == Some(commit_index) {
+            self.volatile_server_state.has_deferred_broadcast = false;
+        }
+
+        if count > 0 {
+            self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+        }
+        count
     }
 }
 
@@ -246,7 +329,7 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                     let resp = LocalRaftResponseMessage {
                         payload: resp_payload
                     };
-                    raft_message.callback.send(resp).expect("Sending raft callback should not fail")
+                    raft_message.callback.send(resp).unwrap_or_else(|_| log::warn!("Failed to send raft callback: receiver dropped"))
                 })
             }
             LocalRaftMessagePayload::WriteBatch(batch) => {
@@ -264,7 +347,7 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                         err: Some("Received write batch as non-leader".to_string())
                     };
                     let msg = LocalRaftResponsePayload::WriteBatch(resp);
-                    raft_message.callback.send(LocalRaftResponseMessage {payload: msg}).expect("Sending raft callback should not fail")
+                    raft_message.callback.send(LocalRaftResponseMessage {payload: msg}).unwrap_or_else(|_| log::warn!("Failed to send raft callback: receiver dropped"))
                 }
 
             }
@@ -281,8 +364,7 @@ pub trait RaftStateMachineExecutor {
 
 // Per-state implementation of the Raft protocol. Handles requests, returns responses through callbacks and notifies about state changes.
 pub trait RaftProtocol {
-
-    fn init(&self);
+    fn init(&self) {}
 
     fn get_node_type(&self) -> RaftNodeType;
     fn request_vote(&mut self, request_vote_request: LocalRequestVoteRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange;
@@ -484,6 +566,7 @@ mod integration_tests {
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
+                has_deferred_broadcast: false,
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),

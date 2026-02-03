@@ -54,17 +54,13 @@ impl RaftLeaderStateDelegate {
 
         let log_len = shared_state.volatile_server_state.replication_log.len() as u64;
         shared_state.volatile_server_state.next_log_index = log_len;
-        // commit_index should be last_log_index since leader's log is authoritative
-        shared_state.volatile_server_state.commit_index = shared_state.volatile_server_state.last_log_index;
-        info!("Initializing leader with commit index: {}", shared_state.volatile_server_state.commit_index);
-
-        shared_state.volatile_server_state.commit_state.commit_index.store(
-            shared_state.volatile_server_state.last_log_index,
-            Ordering::Release,
+        info!(
+            "Initializing leader for term {}. commit_index remains at {} (will advance after replicating current-term entry)",
+            shared_state.server_state.current_term,
+            shared_state.volatile_server_state.commit_index
         );
-        shared_state.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
 
-        // Update metrics for leader initialization
+        // Update metrics for leader initialization (commit_index unchanged)
         crate::transport::metrics::update_raft_state_metrics(
             shared_state.volatile_server_state.commit_index,
             shared_state.server_state.leader_id,
@@ -73,6 +69,7 @@ impl RaftLeaderStateDelegate {
         );
 
         // Tell quorum workers to start sending heartbeats.
+        // The commit_index sent in heartbeats is the current (unchanged) commit_index.
         shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
             let task = LocalQuorumWorkerTaskType::StartHeartbeats {
                 id: message_id,
@@ -84,8 +81,11 @@ impl RaftLeaderStateDelegate {
             task_queue.push(LocalQuorumWorkerTask { task_type: task });
         });
 
-        // Broadcast committed entries to query workers. The leader's log is authoritative so we can commit all of them
-        shared_state.broadcast_committed_entries(shared_state.volatile_server_state.last_log_index);
+        // Only broadcast entries up to the current commit_index (not last_log_index).
+        // New entries will be broadcast when they are committed via normal replication.
+        if shared_state.volatile_server_state.commit_index > 0 {
+            shared_state.broadcast_committed_entries(shared_state.volatile_server_state.commit_index);
+        }
 
         self.initialized = true;
     }
@@ -128,17 +128,13 @@ impl RaftLeaderStateDelegate {
             .send(LocalRaftResponseMessage {
                 payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok),
             })
-            .expect("sending append_entries callback failed");
+            .unwrap_or_else(|_| log::warn!("Failed to send append_entries callback: receiver dropped"));
 
         RaftMessageStateChange::Follower(Box::new(RaftFollowerStateDelegate::new()))
     }
 }
 
 impl RaftProtocol for RaftLeaderStateDelegate {
-    fn init(&self) {
-        todo!()
-    }
-
     fn get_node_type(&self) -> RaftNodeType {
         RaftNodeType::Leader
     }
@@ -174,7 +170,10 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         );
 
         // Queue persistence task (writes Cap'n Proto bytes directly)
-        write_batch::queue_persistence_task(message_id, &owned_entry, shared_state);
+        if !write_batch::queue_persistence_task(message_id, &owned_entry, shared_state) {
+            write_batch::send_error_response("Failed to queue persistence task", callback);
+            return;
+        }
 
         // Dispatch to quorum workers
         write_batch::dispatch_to_quorum(message_id, owned_entry, shared_state);
@@ -217,7 +216,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                     LocalAppendEntriesCallbackResponse::UnrecognizedLeader,
                 ),
             })
-            .expect("sending append_entries callback failed");
+            .unwrap_or_else(|_| log::warn!("Failed to send append_entries callback: receiver dropped"));
         RaftMessageStateChange::None
     }
 
@@ -245,6 +244,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
                 last_log_index,
             );
         }
+
+        // Retry deferred broadcasts
+        work_done += shared_state.retry_deferred_broadcast();
 
         (RaftMessageStateChange::None, work_done)
     }
@@ -281,7 +283,13 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             candidate_id: request_vote_request.candidate_id,
             parent_span: Span::current(),
         };
-        shared_state.persistence_work.send(persistence_task).unwrap();
+        if let Err(e) = shared_state.persistence_work.send(persistence_task) {
+            log::error!("Failed to send vote persistence task: {:?}", e);
+            let _ = callback.send(LocalRaftResponseMessage {
+                payload: LocalRaftResponsePayload::RequestVote(false),
+            });
+            return RaftMessageStateChange::None;
+        }
         shared_state.term_votes.insert(request_vote_request.term, request_vote_request.candidate_id);
         shared_state.next_message_id = message_id + 1;
 
@@ -338,6 +346,7 @@ mod tests {
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
+                has_deferred_broadcast: false,
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),
@@ -658,6 +667,7 @@ mod tests {
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
+                has_deferred_broadcast: false,
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),
@@ -806,5 +816,108 @@ mod tests {
         }
 
         assert!(matches!(result, RaftMessageStateChange::None));
+    }
+
+    // =========================================================================
+    // Regression test: Leader does NOT advance commit_index on initialization
+    // Fix: Per Raft Section 5.4.2, a leader cannot commit entries from previous
+    //      terms until it replicates an entry from its current term.
+    // =========================================================================
+    #[test]
+    fn test_leader_initialization_does_not_advance_commit_index() {
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state_with_quorum();
+
+        // Simulate scenario: previous leader left uncommitted entries
+        // Leader has log entries from previous terms
+        shared_state.volatile_server_state.last_log_index = 5;
+        shared_state.volatile_server_state.last_log_term = 2; // Previous term
+
+        // commit_index is behind last_log_index (uncommitted entries exist)
+        let initial_commit_index = 3;
+        shared_state.volatile_server_state.commit_index = initial_commit_index;
+        shared_state.volatile_server_state.commit_state.commit_index.store(
+            initial_commit_index,
+            std::sync::atomic::Ordering::Release,
+        );
+
+        // Current term is 3 (new leader election)
+        shared_state.server_state.current_term = 3;
+
+        // Add some log entries to simulate the uncommitted state
+        for i in 0..=5 {
+            shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(2); // All entries from previous term
+                builder.set_prev_log_index(if i > 0 { i - 1 } else { 0 });
+                builder.set_prev_log_term(2);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
+        }
+
+        // Initialize the leader (first time_step)
+        let (_result, _work_done) = delegate.time_step(&mut shared_state);
+
+        // CRITICAL: commit_index should NOT be advanced to last_log_index
+        // The old buggy behavior was: commit_index = last_log_index = 5
+        // The correct behavior is: commit_index remains at 3
+        assert_eq!(
+            shared_state.volatile_server_state.commit_index,
+            initial_commit_index,
+            "Leader should NOT advance commit_index on initialization. \
+             Entries from previous terms cannot be committed until a current-term entry is replicated."
+        );
+
+        // The atomic commit_index should also remain unchanged
+        assert_eq!(
+            shared_state.volatile_server_state.commit_state.commit_index.load(std::sync::atomic::Ordering::Acquire),
+            initial_commit_index,
+            "Atomic commit_index should also remain unchanged"
+        );
+    }
+
+    // =========================================================================
+    // Regression test: Heartbeats use correct (unchanged) commit_index
+    // Fix: Ensure heartbeats don't use inflated commit_index
+    // =========================================================================
+    #[test]
+    fn test_leader_heartbeats_use_correct_commit_index() {
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state_with_quorum();
+
+        // Set up state with uncommitted entries
+        shared_state.volatile_server_state.last_log_index = 10;
+        shared_state.volatile_server_state.commit_index = 5; // Only 5 are committed
+        shared_state.server_state.current_term = 3;
+
+        // Add log entries
+        for i in 0..=10 {
+            shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(2);
+                builder.set_prev_log_index(if i > 0 { i - 1 } else { 0 });
+                builder.set_prev_log_term(2);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
+        }
+
+        // Initialize leader
+        let (_result, _work_done) = delegate.time_step(&mut shared_state);
+
+        // Check heartbeat commit_index
+        for queue in &shared_state.quorum_worker_tasks {
+            let task = queue.pop().unwrap();
+            match task.task_type {
+                LocalQuorumWorkerTaskType::StartHeartbeats { commit_index, .. } => {
+                    assert_eq!(
+                        commit_index, 5,
+                        "Heartbeat commit_index should be the actual committed index (5), not last_log_index (10)"
+                    );
+                }
+                _ => panic!("Expected StartHeartbeats task"),
+            }
+        }
     }
 }

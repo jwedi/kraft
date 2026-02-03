@@ -48,6 +48,7 @@ pub fn create_volatile_state(
         replication_log_term_starts: recovered.term_start_index,
         commit_state,
         last_broadcast_index: None,
+        has_deferred_broadcast: false,
     }
 }
 

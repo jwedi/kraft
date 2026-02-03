@@ -79,7 +79,8 @@ pub fn create_and_append_log_entry(
 }
 
 /// Queues a persistence task for the log entry.
-pub fn queue_persistence_task(message_id: u64, entry: &Arc<OwnedLogEntry>, shared_state: &SharedState) {
+/// Returns true if the task was successfully queued, false otherwise.
+pub fn queue_persistence_task(message_id: u64, entry: &Arc<OwnedLogEntry>, shared_state: &SharedState) -> bool {
     let data = Arc::new(entry.as_bytes().to_vec());
     let persistence_task = PersistenceTaskType::AppendLog {
         id: message_id,
@@ -87,7 +88,11 @@ pub fn queue_persistence_task(message_id: u64, entry: &Arc<OwnedLogEntry>, share
         parent_span: Span::current(),
         request_id: message_id,
     };
-    shared_state.persistence_work.send(persistence_task).unwrap();
+    if let Err(e) = shared_state.persistence_work.send(persistence_task) {
+        log::error!("Failed to queue persistence task for message {}: {:?}", message_id, e);
+        return false;
+    }
+    true
 }
 
 /// Dispatches append entries tasks to all quorum workers.
@@ -197,6 +202,7 @@ mod tests {
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
+                has_deferred_broadcast: false,
             },
             next_message_id: 100,
             outstanding_messages: HashMap::new(),

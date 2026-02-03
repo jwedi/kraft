@@ -300,6 +300,7 @@ mod tests {
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
+                has_deferred_broadcast: false,
             },
             next_message_id: 100,
             outstanding_messages: HashMap::new(),

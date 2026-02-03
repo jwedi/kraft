@@ -56,8 +56,11 @@ impl CapnpStreamManager {
         let addr: SocketAddr = node.endpoint.parse()
             .map_err(|e| CapnpConnectError::InvalidEndpoint(format!("{}: {}", node.endpoint, e)))?;
 
-        // Create crossbeam channel for this connection
-        let (tx, rx) = crossbeam_channel::unbounded();
+        // Create bounded crossbeam channel for this connection.
+        // Bounded channels provide backpressure to prevent unbounded memory growth
+        // when the network is slow or the receiver is overwhelmed.
+        // 10,000 messages should be enough for burst handling while limiting memory.
+        let (tx, rx) = crossbeam_channel::bounded(10_000);
 
         // Create and spawn the sender task
         let sender = MessageSender::new(self.self_id, addr, rx);

@@ -58,7 +58,7 @@ pub fn handle_new_leader(
         .send(LocalRaftResponseMessage {
             payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok),
         })
-        .expect("sending append_entries response callback failed");
+        .unwrap_or_else(|_| log::warn!("Failed to send append_entries response: receiver dropped"));
 }
 
 /// Handles a heartbeat request (request_id == 0).
@@ -94,7 +94,7 @@ pub fn handle_heartbeat(
                     },
                 ),
             })
-            .expect("sending append_entries response callback failed");
+            .unwrap_or_else(|_| log::warn!("Failed to send append_entries response: receiver dropped"));
     } else {
         // Update commit index if needed
         if request.commit_index > shared_state.volatile_server_state.commit_index
@@ -122,7 +122,7 @@ pub fn handle_heartbeat(
             .send(LocalRaftResponseMessage {
                 payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok {}),
             })
-            .expect("sending append_entries response callback failed");
+            .unwrap_or_else(|_| log::warn!("Failed to send append_entries response: receiver dropped"));
     }
 }
 
@@ -159,7 +159,7 @@ pub fn handle_non_consecutive_request(
                 },
             ),
         })
-        .expect("sending append_entries response callback failed");
+        .unwrap_or_else(|_| log::warn!("Failed to send append_entries response: receiver dropped"));
 }
 
 /// Applies a log entry from the append entries request.
@@ -197,33 +197,61 @@ pub fn apply_log_entry(
         );
     }
 
+    // Wrap received bytes as OwnedLogEntry (Cap'n Proto format)
+    // If parsing fails, we reject the entry entirely to prevent corrupted log state.
+    let owned_entry = match OwnedLogEntry::from_bytes(data.to_vec()) {
+        Ok(entry) => entry,
+        Err(e) => {
+            log::error!(
+                "Failed to parse append_entries data from leader: {}, term: {}, index: {}, error: {:?}. Rejecting malformed entry.",
+                request.leader_id,
+                request.term,
+                request.prev_index,
+                e
+            );
+            // Send error response - do NOT persist or add malformed entry
+            callback
+                .send(LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::AppendEntries(
+                        LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
+                            last_term: shared_state.volatile_server_state.last_log_term,
+                            last_index: shared_state.volatile_server_state.last_log_index,
+                        },
+                    ),
+                })
+                .unwrap_or_else(|_| log::warn!("Failed to send append_entries response: receiver dropped"));
+            return;
+        }
+    };
+
+    // Only persist after successful validation
     let persistence_task = PersistenceTaskType::AppendLog {
         id: message_id,
         data: Arc::clone(&data),
         parent_span: Span::current(),
         request_id: request.request_id,
     };
-    shared_state.persistence_work.send(persistence_task).unwrap();
-
-    // Wrap received bytes as OwnedLogEntry (Cap'n Proto format)
-    match OwnedLogEntry::from_bytes(data.to_vec()) {
-        Ok(owned_entry) => {
-            shared_state
-                .volatile_server_state
-                .replication_log
-                .push(Arc::new(owned_entry));
-            // Note: Bus broadcast is deferred until commit_index advances (committed entries only)
-        }
-        Err(e) => {
-            log::error!(
-                "Failed to parse append_entries data from leader: {}, term: {}, index: {}, error: {:?}",
-                request.leader_id,
-                request.term,
-                request.prev_index,
-                e
-            );
-        }
+    if let Err(e) = shared_state.persistence_work.send(persistence_task) {
+        log::error!("Failed to send persistence task: {:?}", e);
+        callback
+            .send(LocalRaftResponseMessage {
+                payload: LocalRaftResponsePayload::AppendEntries(
+                    LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
+                        last_term: shared_state.volatile_server_state.last_log_term,
+                        last_index: shared_state.volatile_server_state.last_log_index,
+                    },
+                ),
+            })
+            .unwrap_or_else(|_| log::warn!("Failed to send append_entries response: receiver dropped"));
+        return;
     }
+
+    // Add validated entry to replication log
+    shared_state
+        .volatile_server_state
+        .replication_log
+        .push(Arc::new(owned_entry));
+    // Note: Bus broadcast is deferred until commit_index advances (committed entries only)
 
     if request.commit_index > shared_state.volatile_server_state.commit_index {
         update_commit_index(shared_state, request.commit_index);
@@ -267,7 +295,7 @@ pub fn send_unrecognized_leader_response(
                 LocalAppendEntriesCallbackResponse::UnrecognizedLeader,
             ),
         })
-        .expect("sending append_entries response callback failed");
+        .unwrap_or_else(|_| log::warn!("Failed to send append_entries response: receiver dropped"));
 }
 
 /// Updates the commit index and broadcasts committed entries.
@@ -322,6 +350,7 @@ mod tests {
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
+                has_deferred_broadcast: false,
             },
             next_message_id: 1,
             outstanding_messages: HashMap::new(),
@@ -558,5 +587,155 @@ mod tests {
             ) => {}
             _ => panic!("Expected UnrecognizedLeader response"),
         }
+    }
+    
+    #[tokio::test]
+    async fn test_malformed_entry_is_rejected_not_persisted() {
+        let mut shared_state = create_test_shared_state();
+        let (tx, rx) = oneshot::channel();
+
+        // Create a request with invalid/malformed Cap'n Proto data
+        let malformed_data = vec![0xFF, 0xFE, 0xFD, 0xFC]; // Invalid Cap'n Proto bytes
+
+        let request = LocalAppendEntries {
+            term: 1,
+            leader_id: 1,
+            prev_term: 0,
+            prev_index: 0,
+            commit_index: 0,
+            request_id: 1,
+            entry: Some(LogEntry {
+                term: 1,
+                index: 1,
+                data: malformed_data,
+                batch_index: 0,
+                message_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+            }),
+        };
+
+        let initial_log_len = shared_state.volatile_server_state.replication_log.len();
+
+        apply_log_entry(request, tx, &mut shared_state);
+
+        // CRITICAL: The malformed entry should NOT be added to replication log
+        assert_eq!(
+            shared_state.volatile_server_state.replication_log.len(),
+            initial_log_len,
+            "Malformed entry should NOT be added to replication log"
+        );
+
+        // Should receive an error response
+        let response = rx.await.unwrap();
+        match response.payload {
+            LocalRaftResponsePayload::AppendEntries(
+                LocalAppendEntriesCallbackResponse::WantedPreviousEntry { .. },
+            ) => {
+                // This is expected - we reject the entry and ask for retransmission
+            }
+            LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok) => {
+                panic!("Malformed entry should NOT be accepted with Ok response");
+            }
+            _ => {}
+        }
+    }
+
+    // =========================================================================
+    // Regression test: Valid entries are still accepted and persisted
+    // Ensures the fix didn't break normal operation
+    // =========================================================================
+    #[tokio::test]
+    async fn test_valid_entry_is_accepted_and_persisted() {
+        // Need to keep persistence receiver alive for this test
+        let (persistence_tx, _persistence_rx) = unbounded::<crate::persistence::worker::PersistenceTaskType>();
+        let mut shared_state = SharedState {
+            server_state: RaftServerState {
+                current_term: 1,
+                leader_id: 1,
+            },
+            volatile_server_state: RaftVolatileState {
+                next_term: 2,
+                last_log_term: 0,
+                last_log_index: 0,
+                commit_index: 0,
+                replication_log: vec![],
+                replication_log_term_starts: HashMap::new(),
+                last_applied: 0,
+                next_log_index: 1,
+                commit_state: Arc::new(CommitState {
+                    commit_index: AtomicU64::new(0),
+                    version: AtomicU64::new(0),
+                }),
+                last_broadcast_index: None,
+                has_deferred_broadcast: false,
+            },
+            next_message_id: 1,
+            outstanding_messages: HashMap::new(),
+            quorum_size: 3,
+            quorum_worker_tasks: vec![],
+            persistence_work: persistence_tx,
+            persistence_response: Arc::new(SegQueue::new()),
+            quorum_work: Arc::new(SegQueue::new()),
+            quorum_response: Arc::new(SegQueue::new()),
+            identity: 0,
+            term_votes: HashMap::new(),
+            state_machine_config: StateMachineConfig {
+                max_message_size_bytes: 2048,
+            },
+            log_entry_bus: Bus::new(5000),
+        };
+        let (tx, _callback_rx) = oneshot::channel();
+
+        // Create a valid Cap'n Proto OwnedLogEntry
+        use crate::transport::capnp::build_owned_log_entry;
+        let owned_entry = build_owned_log_entry(|mut builder| {
+            builder.set_index(1);
+            builder.set_term(1);
+            builder.set_prev_log_index(0);
+            builder.set_prev_log_term(0);
+            builder.set_message_id(100);
+            builder.set_timestamp(123456789);
+            let mut commands = builder.init_commands(1);
+            let mut cmd = commands.reborrow().get(0);
+            cmd.set_id("test_key");
+            cmd.set_payload(b"test_value");
+            cmd.set_node_id(1);
+        });
+        let valid_data = owned_entry.as_bytes().to_vec();
+
+        let request = LocalAppendEntries {
+            term: 1,
+            leader_id: 1,
+            prev_term: 0,
+            prev_index: 0,
+            commit_index: 0,
+            request_id: 1,
+            entry: Some(LogEntry {
+                term: 1,
+                index: 1,
+                data: valid_data,
+                batch_index: 0,
+                message_id: 100,
+                prev_log_index: 0,
+                prev_log_term: 0,
+            }),
+        };
+
+        let initial_log_len = shared_state.volatile_server_state.replication_log.len();
+
+        apply_log_entry(request, tx, &mut shared_state);
+
+        // Valid entry should be added to replication log
+        assert_eq!(
+            shared_state.volatile_server_state.replication_log.len(),
+            initial_log_len + 1,
+            "Valid entry should be added to replication log"
+        );
+
+        // Verify the entry was stored correctly
+        let stored_entry = &shared_state.volatile_server_state.replication_log[initial_log_len];
+        assert_eq!(stored_entry.index(), 1);
+        assert_eq!(stored_entry.term(), 1);
     }
 }
