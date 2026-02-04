@@ -44,16 +44,10 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         if append_entries_request.term >= shared_state.server_state.current_term {
             log::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
 
-            // New leader
+            // Step 1: Recognize the new leader
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
-            shared_state.volatile_server_state.next_term = append_entries_request.term +1;
-
-            if let Some(entry) = append_entries_request.entry {
-                shared_state.volatile_server_state.last_log_index = entry.index;
-                shared_state.volatile_server_state.last_log_term = entry.term;
-                log::debug!("updating last log term {} and index {}", entry.term, entry.index);
-            }
+            shared_state.volatile_server_state.next_term = append_entries_request.term + 1;
 
             // Update metrics when candidate recognizes new leader
             crate::transport::metrics::update_raft_state_metrics(
@@ -63,11 +57,38 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                 shared_state.volatile_server_state.replication_log.len()
             );
 
-            callback.send(
-                LocalRaftResponseMessage {
-                    payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok)
-                }
-            ).unwrap_or_else(|_| log::warn!("Failed to send channel message: receiver dropped"));
+            // Step 2: Check if request is consecutive with our log state
+            let last_log_index = shared_state.volatile_server_state.last_log_index;
+            let last_log_term = shared_state.volatile_server_state.last_log_term;
+
+            if append_entries_request.prev_index == last_log_index
+                && append_entries_request.prev_term == last_log_term
+            {
+                // Request is consecutive - acknowledge and transition to follower
+                callback.send(
+                    LocalRaftResponseMessage {
+                        payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok)
+                    }
+                ).unwrap_or_else(|_| log::warn!("Failed to send channel message: receiver dropped"));
+            } else {
+                // Request is not consecutive - request backfill (whether it has entry or not)
+                log::info!(
+                    "New leader request not consecutive: prev_term={}, prev_index={}, local_term={}, local_index={}, has_entry={}",
+                    append_entries_request.prev_term, append_entries_request.prev_index, last_log_term, last_log_index,
+                    append_entries_request.entry.is_some()
+                );
+                callback.send(
+                    LocalRaftResponseMessage {
+                        payload: LocalRaftResponsePayload::AppendEntries(
+                            LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
+                                last_term: last_log_term,
+                                last_index: last_log_index,
+                            }
+                        )
+                    }
+                ).unwrap_or_else(|_| log::warn!("Failed to send channel message: receiver dropped"));
+            }
+
             return RaftMessageStateChange::Follower(Box::new(RaftFollowerStateDelegate::new()));
 
         } else {

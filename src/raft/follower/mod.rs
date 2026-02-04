@@ -81,9 +81,8 @@ impl RaftProtocol for RaftFollowerStateDelegate {
         let request_term = append_entries_request.term;
 
         if append_entries_request.term > shared_state.server_state.current_term {
-            append_entries::handle_new_leader(&append_entries_request, callback, shared_state);
-            tracing::debug!("reset election timeout for term: {}", request_term);
-            self.election_timer.reset();
+            append_entries::handle_new_leader(append_entries_request, callback, shared_state, &mut self.election_timer);
+            // Timer reset is now done inside handle_new_leader
             return RaftMessageStateChange::None;
         }
 

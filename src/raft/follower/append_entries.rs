@@ -24,18 +24,23 @@ pub fn validate_append_entries(
 }
 
 /// Handles recognition of a new leader with a higher term.
+/// If the request contains an entry, processes it after recognizing the leader.
 pub fn handle_new_leader(
-    request: &LocalAppendEntries,
+    request: LocalAppendEntries,
     callback: oneshot::Sender<LocalRaftResponseMessage>,
     shared_state: &mut SharedState,
+    election_timer: &mut ElectionTimer,
 ) {
     log::info!(
         "recognising leader for new term: {}, leader id: {}",
         request.term,
         request.leader_id
     );
+
+    // Step 1: Recognize the new leader
     shared_state.server_state.current_term = request.term;
     shared_state.server_state.leader_id = request.leader_id;
+    shared_state.volatile_server_state.next_term = request.term + 1;
 
     // Update Raft state metrics for new leader
     crate::transport::metrics::update_raft_state_metrics(
@@ -44,21 +49,44 @@ pub fn handle_new_leader(
         shared_state.server_state.current_term,
         shared_state.volatile_server_state.replication_log.len(),
     );
-    shared_state.volatile_server_state.next_term = request.term + 1;
 
-    if let Some(entry) = &request.entry {
-        error!(
-            "Received append_entries request with entry when recognizing new leader, \
-             but follower should not have entries. Leader: {}, term: {}, index: {}",
-            request.leader_id, request.term, entry.index
+    // Reset election timer
+    election_timer.reset();
+
+    // Step 2: Check if request is consecutive with our log state
+    let last_log_index = shared_state.volatile_server_state.last_log_index;
+    let last_log_term = shared_state.volatile_server_state.last_log_term;
+
+    if validate_append_entries(&request, last_log_index, last_log_term) {
+        // Request is consecutive with our log
+        if request.entry.is_some() {
+            // Entry present - apply it
+            apply_log_entry(request, callback, shared_state);
+        } else {
+            // No entry (heartbeat) - just acknowledge
+            callback
+                .send(LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok),
+                })
+                .unwrap_or_else(|_| log::warn!("Failed to send append_entries response: receiver dropped"));
+        }
+    } else {
+        // Request is not consecutive - request backfill (whether it has entry or not)
+        log::warn!(
+            "New leader request not consecutive: prev_term={}, prev_index={}, local_term={}, local_index={}, has_entry={}",
+            request.prev_term, request.prev_index, last_log_term, last_log_index, request.entry.is_some()
         );
+        callback
+            .send(LocalRaftResponseMessage {
+                payload: LocalRaftResponsePayload::AppendEntries(
+                    LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
+                        last_term: last_log_term,
+                        last_index: last_log_index,
+                    },
+                ),
+            })
+            .unwrap_or_else(|_| log::warn!("Failed to send append_entries response: receiver dropped"));
     }
-
-    callback
-        .send(LocalRaftResponseMessage {
-            payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok),
-        })
-        .unwrap_or_else(|_| log::warn!("Failed to send append_entries response: receiver dropped"));
 }
 
 /// Handles a heartbeat request (request_id == 0).
@@ -163,7 +191,6 @@ pub fn handle_non_consecutive_request(
 }
 
 /// Applies a log entry from the append entries request.
-/// The entry.data is now expected to be Cap'n Proto serialized OwnedLogEntry bytes.
 pub fn apply_log_entry(
     request: LocalAppendEntries,
     callback: oneshot::Sender<LocalRaftResponseMessage>,
@@ -432,6 +459,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_new_leader_updates_state() {
         let mut shared_state = create_test_shared_state();
+        let mut election_timer = super::super::election::ElectionTimer::new();
         let (tx, rx) = oneshot::channel();
 
         let request = LocalAppendEntries {
@@ -444,7 +472,7 @@ mod tests {
             entry: None,
         };
 
-        handle_new_leader(&request, tx, &mut shared_state);
+        handle_new_leader(request, tx, &mut shared_state, &mut election_timer);
 
         // Verify state was updated
         assert_eq!(shared_state.server_state.current_term, 5);

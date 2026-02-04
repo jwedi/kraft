@@ -165,6 +165,61 @@ pub fn send_error_response(
     let _ = callback.send(response);
 }
 
+/// Creates a no-op log entry and appends it to the replication log.
+/// No-op entries have zero commands and are used for leader initialization
+/// per Raft Section 5.4.2.
+pub fn create_and_append_noop_entry(
+    idx: u64,
+    message_id: u64,
+    shared_state: &mut SharedState,
+) -> Arc<OwnedLogEntry> {
+    let current_term = shared_state.server_state.current_term;
+    let prev_log_index = shared_state.volatile_server_state.last_log_index;
+    let prev_log_term = shared_state.volatile_server_state.last_log_term;
+    let timestamp = now_millis() as u64;
+
+    let owned_entry = Arc::new(build_owned_log_entry(|mut builder| {
+        builder.set_index(idx);
+        builder.set_term(current_term);
+        builder.set_prev_log_index(prev_log_index);
+        builder.set_prev_log_term(prev_log_term);
+        builder.set_message_id(message_id);
+        builder.set_timestamp(timestamp);
+        builder.init_commands(0); // Zero commands = no-op
+    }));
+
+    // Track term start if first entry of new term
+    if prev_log_term != current_term {
+        shared_state.volatile_server_state.replication_log_term_starts.insert(
+            current_term,
+            shared_state.volatile_server_state.replication_log.len() as u64,
+        );
+    }
+
+    shared_state.volatile_server_state.replication_log.push(Arc::clone(&owned_entry));
+    owned_entry
+}
+
+/// Registers an outstanding message for tracking the no-op entry.
+pub fn register_noop_outstanding_message(
+    message_id: u64,
+    idx: u64,
+    shared_state: &mut SharedState,
+) {
+    let message_type = OutstandingMessageType::NoOp {
+        persistence_done: false,
+        quorum_acks: 0,
+        index: idx,
+    };
+    let outstanding_message = OutstandingMessage {
+        id: message_id,
+        outstanding_responses: 1 + shared_state.quorum_worker_tasks.len() as i32,
+        message_type,
+        span: Span::current(),
+    };
+    shared_state.outstanding_messages.insert(message_id, outstanding_message);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +462,60 @@ mod tests {
                 assert_eq!(r.err.unwrap(), "Test error message");
             }
             _ => panic!("Expected WriteBatch response"),
+        }
+    }
+
+    #[test]
+    fn test_create_and_append_noop_entry_zero_commands() {
+        let (mut shared_state, _persistence_rx) = create_test_shared_state();
+
+        let entry = create_and_append_noop_entry(6, 100, &mut shared_state);
+
+        // Entry should have zero commands (no-op)
+        assert_eq!(entry.command_count(), 0);
+
+        // Entry should have correct metadata
+        assert_eq!(entry.index(), 6);
+        assert_eq!(entry.term(), 2); // current_term
+        assert_eq!(entry.prev_log_index(), 5); // last_log_index
+        assert_eq!(entry.prev_log_term(), 1); // last_log_term
+        assert_eq!(entry.message_id(), 100);
+
+        // Should be added to replication log
+        assert_eq!(shared_state.volatile_server_state.replication_log.len(), 1);
+
+        // Term start should be recorded since prev_term (1) != term (2)
+        assert!(shared_state
+            .volatile_server_state
+            .replication_log_term_starts
+            .contains_key(&2));
+    }
+
+    #[test]
+    fn test_register_noop_outstanding_message() {
+        let (mut shared_state, _persistence_rx) = create_test_shared_state();
+
+        register_noop_outstanding_message(42, 10, &mut shared_state);
+
+        assert!(shared_state.outstanding_messages.contains_key(&42));
+
+        let msg = shared_state.outstanding_messages.get(&42).unwrap();
+        assert_eq!(msg.id, 42);
+        // outstanding_responses = 1 (persistence) + 2 (quorum workers) = 3
+        assert_eq!(msg.outstanding_responses, 3);
+
+        // Verify it's a NoOp message type
+        match &msg.message_type {
+            OutstandingMessageType::NoOp {
+                persistence_done,
+                quorum_acks,
+                index,
+            } => {
+                assert!(!persistence_done);
+                assert_eq!(*quorum_acks, 0);
+                assert_eq!(*index, 10);
+            }
+            _ => panic!("Expected NoOp message type"),
         }
     }
 }

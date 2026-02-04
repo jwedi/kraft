@@ -68,7 +68,7 @@ pub fn create_shared_state(
 
     let outstanding_messages: HashMap<u64, OutstandingMessage> = HashMap::new();
 
-    let mut log_entry_bus: Bus<Arc<OwnedLogEntry>> = Bus::new(5000);
+    let mut log_entry_bus: Bus<Arc<OwnedLogEntry>> = Bus::new(10000);
     let query_bus_reader = log_entry_bus.add_rx();
 
     let shared_state = SharedState {

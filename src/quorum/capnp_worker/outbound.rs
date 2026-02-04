@@ -202,12 +202,15 @@ pub fn send_backfill_entries(
     );
 
     for entry in entries {
+        // Use message_id as request_id to ensure it's non-zero.
+        // request_id = 0 is reserved for heartbeats, so using entry.index()
+        // would cause the first entry (index 0) to be treated as a heartbeat.
         let msg = build_append_entries_message(
             term,
             self_id,
             entry.prev_log_index(),
             entry.prev_log_term(),
-            entry.index(),
+            entry.message_id(),
             commit_index,
             Some(&entry),
         );

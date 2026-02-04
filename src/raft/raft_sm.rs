@@ -60,7 +60,10 @@ pub enum OutstandingMessageType {
     RequestVote{callback: oneshot::Sender<LocalRaftResponseMessage>}, // Request vote from someone else
     CandidateElection{persistence_done: bool, quorum_votes: u32}, // Candidate election by this node.
     AppendLog{callback: oneshot::Sender<LocalRaftResponseMessage>},
-    WriteBatch{persistence_done: bool, quorum_acks: u32, callback: oneshot::Sender<LocalRaftResponseMessage>, index: u64, start_time: Instant, batch_size: usize}
+    WriteBatch{persistence_done: bool, quorum_acks: u32, callback: oneshot::Sender<LocalRaftResponseMessage>, index: u64, start_time: Instant, batch_size: usize},
+    /// No-op entry for leader initialization per Raft Section 5.4.2.
+    /// Allows commit_index to advance without waiting for client traffic.
+    NoOp{persistence_done: bool, quorum_acks: u32, index: u64}
 }
 
 pub struct OutstandingMessage {
@@ -186,7 +189,7 @@ impl SharedState {
     }
 
     /// Maximum entries to broadcast per time_step to avoid blocking Raft operations.
-    const MAX_BROADCAST_PER_TIMESTEP: u64 = 1000;
+    const MAX_BROADCAST_PER_TIMESTEP: u64 = 5000;
 
     /// Retries broadcasting deferred entries. Called from time_step.
     /// Returns the number of entries successfully broadcast.

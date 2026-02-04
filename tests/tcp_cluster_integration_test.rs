@@ -250,7 +250,7 @@ impl NodeHandle {
             .current_dir(temp_dir.path())
             .env("RESOURCE_DIR", temp_dir.path())
             .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
+            //.stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file))
             .spawn()?;
 
@@ -529,7 +529,7 @@ async fn test_three_node_cluster_consensus_tcp() {
         .collect();
 
     // Verify all logs have the same length (identical entry count)
-    assert!(logs.windows(2).all(|w| w[0].len() == w[1].len()), "Transaction logs have different lengths");
+    assert!(logs.windows(2).all(|w| w[0].len() == w[1].len()), "Transaction logs have different lengths 1: {}, 2: {}, 3: {}", logs[0].len(), logs[1].len(), logs[2].len());
 
     // Verify all logs have the same indices and terms
     for (i, entry_pair) in logs.windows(2).enumerate() {
@@ -555,6 +555,40 @@ async fn test_three_node_cluster_consensus_tcp() {
     }
 
     println!("TCP Transport: Transaction log verification passed: {} entries across all nodes", logs[0].len());
+
+    // ===== GET Record API Verification =====
+    // Verify all written entries can be fetched via get_record API from all nodes
+    println!("Starting GET record verification for {} entries across {} nodes...", entry_count, cluster.nodes.len());
+
+    for i in 0..entry_count {
+        let key = format!("key-{}", i);
+        let expected_value = format!("value-{}", i);
+
+        // Verify the key is retrievable from all nodes
+        for node_idx in 0..cluster.nodes.len() {
+            let result = cluster
+                .get_record_tcp_with_retry(node_idx, &key, REQUEST_TIMEOUT, 3)
+                .await;
+
+            match result {
+                Ok(actual_value) => {
+                    assert_eq!(
+                        actual_value, expected_value,
+                        "Value mismatch for key {} on node {}: expected '{}', got '{}'",
+                        key, node_idx + 1, expected_value, actual_value
+                    );
+                }
+                Err(e) => {
+                    panic!(
+                        "Failed to get key {} from node {}: {:?}",
+                        key, node_idx + 1, e
+                    );
+                }
+            }
+        }
+    }
+
+    println!("TCP Transport: GET record verification passed: {} entries verified across all nodes", entry_count);
 
     cluster.close().await;
 }

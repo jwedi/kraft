@@ -87,6 +87,22 @@ impl RaftLeaderStateDelegate {
             shared_state.broadcast_committed_entries(shared_state.volatile_server_state.commit_index);
         }
 
+        // Append no-op entry per Raft Section 5.4.2
+        // This allows commit_index to advance without waiting for client traffic.
+        let noop_message_id = shared_state.next_message_id;
+        let noop_idx = shared_state.volatile_server_state.next_log_index;
+        shared_state.next_message_id += 1;
+
+        let noop_entry = write_batch::create_and_append_noop_entry(noop_idx, noop_message_id, shared_state);
+
+        if !write_batch::queue_persistence_task(noop_message_id, &noop_entry, shared_state) {
+            log::error!("Failed to queue persistence task for no-op entry");
+        }
+
+        write_batch::dispatch_to_quorum(noop_message_id, noop_entry, shared_state);
+        write_batch::register_noop_outstanding_message(noop_message_id, noop_idx, shared_state);
+        write_batch::update_volatile_state(noop_idx, shared_state);
+
         self.initialized = true;
     }
 
@@ -103,7 +119,7 @@ impl RaftLeaderStateDelegate {
             append_entries_request.leader_id
         );
 
-        // Update state for new leader
+        // Step 1: Recognize new leader
         shared_state.server_state.current_term = append_entries_request.term;
         shared_state.server_state.leader_id = append_entries_request.leader_id;
         shared_state.volatile_server_state.next_term = append_entries_request.term + 1;
@@ -117,18 +133,37 @@ impl RaftLeaderStateDelegate {
             task_queue.push(LocalQuorumWorkerTask { task_type: task });
         });
 
-        // Update log state if entry provided
-        if let Some(entry) = append_entries_request.entry {
-            shared_state.volatile_server_state.last_log_index = entry.index;
-            shared_state.volatile_server_state.last_log_term = entry.term;
-            log::debug!("updating last log term {} and index {}", entry.term, entry.index);
-        }
+        // Step 2: Check if request is consecutive with our log state
+        let last_log_index = shared_state.volatile_server_state.last_log_index;
+        let last_log_term = shared_state.volatile_server_state.last_log_term;
 
-        callback
-            .send(LocalRaftResponseMessage {
-                payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok),
-            })
-            .unwrap_or_else(|_| log::warn!("Failed to send append_entries callback: receiver dropped"));
+        if append_entries_request.prev_index == last_log_index
+            && append_entries_request.prev_term == last_log_term
+        {
+            // Request is consecutive - acknowledge and transition to follower
+            callback
+                .send(LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok),
+                })
+                .unwrap_or_else(|_| log::warn!("Failed to send append_entries callback: receiver dropped"));
+        } else {
+            // Request is not consecutive - request backfill (whether it has entry or not)
+            log::info!(
+                "New leader request not consecutive: prev_term={}, prev_index={}, local_term={}, local_index={}, has_entry={}",
+                append_entries_request.prev_term, append_entries_request.prev_index, last_log_term, last_log_index,
+                append_entries_request.entry.is_some()
+            );
+            callback
+                .send(LocalRaftResponseMessage {
+                    payload: LocalRaftResponsePayload::AppendEntries(
+                        LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
+                            last_term: last_log_term,
+                            last_index: last_log_index,
+                        },
+                    ),
+                })
+                .unwrap_or_else(|_| log::warn!("Failed to send append_entries callback: receiver dropped"));
+        }
 
         RaftMessageStateChange::Follower(Box::new(RaftFollowerStateDelegate::new()))
     }
@@ -917,6 +952,101 @@ mod tests {
                     );
                 }
                 _ => panic!("Expected StartHeartbeats task"),
+            }
+        }
+    }
+
+    // =========================================================================
+    // Test: Leader initialization creates a no-op entry per Raft Section 5.4.2
+    // =========================================================================
+    #[test]
+    fn test_leader_init_creates_noop_entry() {
+        let mut delegate = RaftLeaderStateDelegate::new();
+        let mut shared_state = create_shared_state_with_quorum();
+
+        // Set up initial state
+        shared_state.server_state.current_term = 3;
+        shared_state.volatile_server_state.last_log_term = 2;
+        shared_state.volatile_server_state.last_log_index = 5;
+        shared_state.volatile_server_state.next_log_index = 6;
+        shared_state.volatile_server_state.commit_index = 3;
+
+        // Add some existing log entries
+        for i in 0..=5 {
+            shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(2);
+                builder.set_prev_log_index(if i > 0 { i - 1 } else { 0 });
+                builder.set_prev_log_term(2);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
+        }
+
+        let initial_log_len = shared_state.volatile_server_state.replication_log.len();
+        let initial_message_id = shared_state.next_message_id;
+
+        // Initialize leader
+        let (_result, _work_done) = delegate.time_step(&mut shared_state);
+
+        // Verify no-op entry was created and appended
+        assert_eq!(
+            shared_state.volatile_server_state.replication_log.len(),
+            initial_log_len + 1,
+            "No-op entry should be appended to replication log"
+        );
+
+        // Get the no-op entry
+        let noop_entry = shared_state.volatile_server_state.replication_log.last().unwrap();
+
+        // Verify no-op entry properties
+        assert_eq!(noop_entry.term(), 3, "No-op entry should be in current term");
+        assert_eq!(noop_entry.index(), 6, "No-op entry should have correct index");
+        assert_eq!(noop_entry.command_count(), 0, "No-op entry should have zero commands");
+        assert_eq!(noop_entry.prev_log_index(), 5, "No-op entry should reference previous entry");
+        assert_eq!(noop_entry.prev_log_term(), 2, "No-op entry should reference previous term");
+
+        // Verify volatile state was updated
+        assert_eq!(shared_state.volatile_server_state.last_log_index, 6);
+        assert_eq!(shared_state.volatile_server_state.last_log_term, 3);
+        assert_eq!(shared_state.volatile_server_state.next_log_index, 7);
+
+        // Verify outstanding message was registered for the no-op
+        // The no-op message ID should be initial_message_id + 1 (after heartbeat message)
+        let noop_message_id = initial_message_id + 1;
+        assert!(
+            shared_state.outstanding_messages.contains_key(&noop_message_id),
+            "No-op outstanding message should be registered"
+        );
+
+        let outstanding = shared_state.outstanding_messages.get(&noop_message_id).unwrap();
+        match &outstanding.message_type {
+            OutstandingMessageType::NoOp { persistence_done, quorum_acks, index } => {
+                assert!(!persistence_done);
+                assert_eq!(*quorum_acks, 0);
+                assert_eq!(*index, 6);
+            }
+            _ => panic!("Expected NoOp outstanding message type"),
+        }
+
+        // Verify AppendEntries tasks were dispatched to quorum workers for the no-op
+        // After StartHeartbeats, there should be an AppendEntries for the no-op
+        for queue in &shared_state.quorum_worker_tasks {
+            // First task should be StartHeartbeats
+            let task1 = queue.pop().unwrap();
+            match task1.task_type {
+                LocalQuorumWorkerTaskType::StartHeartbeats { .. } => {}
+                _ => panic!("Expected StartHeartbeats task first"),
+            }
+
+            // Second task should be AppendEntries for the no-op
+            let task2 = queue.pop().unwrap();
+            match task2.task_type {
+                LocalQuorumWorkerTaskType::AppendEntries { id, entry, .. } => {
+                    assert_eq!(id, noop_message_id);
+                    assert_eq!(entry.command_count(), 0, "AppendEntries should contain no-op entry");
+                }
+                _ => panic!("Expected AppendEntries task for no-op"),
             }
         }
     }
