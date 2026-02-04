@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
+use dashmap::DashMap;
 use log::info;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -13,22 +13,22 @@ use super::raft_capnp::remote_quorum_message;
 /// TCP listener that accepts incoming connections and creates per-peer message queues.
 pub struct MessageReceiver {
     listen_addr: SocketAddr,
-    pub inbound_queues: Arc<RwLock<HashMap<u32, CrossbeamSender<OwnedQuorumMessage>>>>,
-    pub inbound_receivers: Arc<RwLock<HashMap<u32, CrossbeamReceiver<OwnedQuorumMessage>>>>,
+    pub inbound_queues: Arc<DashMap<u32, CrossbeamSender<OwnedQuorumMessage>>>,
+    pub inbound_receivers: Arc<DashMap<u32, CrossbeamReceiver<OwnedQuorumMessage>>>,
 }
 
 impl MessageReceiver {
     pub fn new(listen_addr: SocketAddr) -> Self {
         Self {
             listen_addr,
-            inbound_queues: Arc::new(RwLock::new(HashMap::new())),
-            inbound_receivers: Arc::new(RwLock::new(HashMap::new())),
+            inbound_queues: Arc::new(DashMap::new()),
+            inbound_receivers: Arc::new(DashMap::new()),
         }
     }
 
     /// Get the inbound queue receiver for a specific node
     pub fn get_queue(&self, node_id: u32) -> Option<CrossbeamReceiver<OwnedQuorumMessage>> {
-        self.inbound_receivers.read().unwrap().get(&node_id).cloned()
+        self.inbound_receivers.get(&node_id).map(|r| r.value().clone())
     }
 
     /// Start the TCP listener - accepts connections and spawns handlers
@@ -55,8 +55,8 @@ impl MessageReceiver {
 /// Handle an incoming TCP connection
 async fn handle_connection(
     stream: TcpStream,
-    inbound_queues: Arc<RwLock<HashMap<u32, CrossbeamSender<OwnedQuorumMessage>>>>,
-    inbound_receivers: Arc<RwLock<HashMap<u32, CrossbeamReceiver<OwnedQuorumMessage>>>>,
+    inbound_queues: Arc<DashMap<u32, CrossbeamSender<OwnedQuorumMessage>>>,
+    inbound_receivers: Arc<DashMap<u32, CrossbeamReceiver<OwnedQuorumMessage>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut reader, _writer) = tokio::io::split(stream);
 
@@ -75,16 +75,11 @@ async fn handle_connection(
 
     log::info!("Accepted Cap'n Proto connection from node {}", node_id);
 
-    // Create crossbeam queue for this peer
-    let (tx, rx) = crossbeam_channel::unbounded();
-    {
-        let mut queues = inbound_queues.write().unwrap();
-        queues.insert(node_id, tx.clone());
-    }
-    {
-        let mut receivers = inbound_receivers.write().unwrap();
-        receivers.insert(node_id, rx);
-    }
+    // Create bounded crossbeam channel for this peer.
+    // Bounded channels provide backpressure to prevent unbounded memory growth
+    let (tx, rx) = crossbeam_channel::bounded(10_000);
+    inbound_queues.insert(node_id, tx.clone());
+    inbound_receivers.insert(node_id, rx);
 
     loop {
         match read_message(&mut reader).await {
@@ -102,14 +97,8 @@ async fn handle_connection(
     }
 
     // Clean up queues on disconnect
-    {
-        let mut queues = inbound_queues.write().unwrap();
-        queues.remove(&node_id);
-    }
-    {
-        let mut receivers = inbound_receivers.write().unwrap();
-        receivers.remove(&node_id);
-    }
+    inbound_queues.remove(&node_id);
+    inbound_receivers.remove(&node_id);
 
     Ok(())
 }

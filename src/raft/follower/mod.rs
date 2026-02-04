@@ -60,10 +60,6 @@ impl RaftFollowerStateDelegate {
 }
 
 impl RaftProtocol for RaftFollowerStateDelegate {
-    fn init(&self) {
-        todo!()
-    }
-
     fn get_node_type(&self) -> RaftNodeType {
         RaftNodeType::Follower
     }
@@ -85,9 +81,8 @@ impl RaftProtocol for RaftFollowerStateDelegate {
         let request_term = append_entries_request.term;
 
         if append_entries_request.term > shared_state.server_state.current_term {
-            append_entries::handle_new_leader(&append_entries_request, callback, shared_state);
-            tracing::debug!("reset election timeout for term: {}", request_term);
-            self.election_timer.reset();
+            append_entries::handle_new_leader(append_entries_request, callback, shared_state, &mut self.election_timer);
+            // Timer reset is now done inside handle_new_leader
             return RaftMessageStateChange::None;
         }
 
@@ -211,6 +206,9 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 }
             }
         }
+
+        // Retry deferred broadcasts
+        work_done += shared_state.retry_deferred_broadcast();
 
         // Check election timeout
         if let Some(state_change) = self.election_timer.check_timeout() {
@@ -336,8 +334,7 @@ mod tests {
     use bus::Bus;
     use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
-    use crate::transport::raft::raftproto::{RemoteLogEntry, RemotePutRequest};
-    use crate::service_utils::storage_utils::{SerializationData, serialize_data};
+    use crate::transport::capnp::build_owned_log_entry;
     use crate::persistence::worker::PersistenceResponseType;
 
     fn create_shared_state() -> (SharedState, crossbeam_channel::Receiver<crate::persistence::worker::PersistenceTaskType>) {
@@ -361,6 +358,7 @@ mod tests {
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
+                has_deferred_broadcast: false,
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),
@@ -443,23 +441,22 @@ mod tests {
         let (mut shared_state, _persistence_rx) = create_shared_state();
         let (tx, rx) = oneshot::channel();
 
-        let put_request = RemotePutRequest {
-            id: "put_1".to_string(),
-            payload: "test_payload".to_string(),
-            node_id: 42,
-        };
-        let serialisation_data = SerializationData {
-            index: 1,
-            term: 1,
-            timestamp: 123456789,
-            prev_index: 0,
-            prev_term: 0,
-            message_id: 100,
-            requests: vec![put_request],
-        };
-        let buffer = vec![0u8; 2048];
-        let (size, mut serialised_data) = serialize_data(&serialisation_data, buffer, 0);
-        serialised_data.truncate(size);
+        // Build Cap'n Proto OwnedLogEntry with a command
+        let owned_entry = build_owned_log_entry(|mut builder| {
+            builder.set_index(1);
+            builder.set_term(1);
+            builder.set_prev_log_index(0);
+            builder.set_prev_log_term(0);
+            builder.set_message_id(100);
+            builder.set_timestamp(123456789);
+            let mut commands = builder.init_commands(1);
+            let mut cmd = commands.reborrow().get(0);
+            cmd.set_id("put_1");
+            cmd.set_payload(b"test_payload");
+            cmd.set_node_id(42);
+        });
+        let capnp_bytes = owned_entry.as_bytes().to_vec();
+
         let req = LocalAppendEntries {
             term: 1,
             leader_id: 1,
@@ -467,10 +464,10 @@ mod tests {
             prev_index: 0,
             commit_index: 1,
             request_id: 1,
-            entry: Some(RemoteLogEntry {
+            entry: Some(LogEntry {
                 term: 1,
                 index: 1,
-                data: serialised_data,
+                data: capnp_bytes,
                 batch_index: 0,
                 message_id: 1,
                 prev_log_index: 0,
@@ -516,14 +513,17 @@ mod tests {
             "result should be RaftMessageStateChange::None"
         );
         let log_entry = &shared_state.volatile_server_state.replication_log[0];
-        assert_eq!(log_entry.index, 1, "Log entry index should be 1");
-        assert_eq!(log_entry.term, 1, "Log entry term should be 1");
-        assert_eq!(log_entry.requests.len(), 1, "Log entry should contain one request");
-        assert_eq!(log_entry.requests[0].id, "put_1", "Request ID should match");
-        assert_eq!(
-            log_entry.requests[0].payload, "test_payload",
-            "Request payload should match"
-        );
+        assert_eq!(log_entry.index(), 1, "Log entry index should be 1");
+        assert_eq!(log_entry.term(), 1, "Log entry term should be 1");
+        assert_eq!(log_entry.command_count(), 1, "Log entry should contain one request");
+        // Verify command content via for_each_command
+        let mut found_command = false;
+        log_entry.for_each_command(|id, payload, _node_id| {
+            assert_eq!(id, "put_1", "Request ID should match");
+            assert_eq!(payload, b"test_payload", "Request payload should match");
+            found_command = true;
+        }).unwrap();
+        assert!(found_command, "Should have found the command");
     }
 
     #[tokio::test]
@@ -582,18 +582,20 @@ mod tests {
 
         // Add log entries for terms 1, 2, and 3 with absolute indexes
         for i in 0..12u64 {
+            let term = if i < 3 { 1 } else if i < 8 { 2 } else { 3 };
+            let prev_index = if i > 0 { i - 1 } else { 0 };
+            let prev_term = if i < 3 { 1 } else if i < 8 { 2 } else { 3 };
             shared_state
                 .volatile_server_state
                 .replication_log
-                .push(Arc::new(SerializationData {
-                    requests: vec![],
-                    term: if i < 3 { 1 } else if i < 8 { 2 } else { 3 },
-                    timestamp: 0,
-                    prev_index: if i > 0 { i - 1 } else { 0 },
-                    prev_term: if i < 3 { 1 } else if i < 8 { 2 } else { 3 },
-                    index: i, // Absolute index
-                    message_id: i,
-                }));
+                .push(Arc::new(build_owned_log_entry(|mut builder| {
+                    builder.set_index(i);
+                    builder.set_term(term);
+                    builder.set_prev_log_index(prev_index);
+                    builder.set_prev_log_term(prev_term);
+                    builder.set_message_id(i);
+                    builder.set_timestamp(0);
+                })));
         }
 
         shared_state.volatile_server_state.last_log_term = 3;
@@ -639,19 +641,19 @@ mod tests {
             .replication_log_term_starts
             .insert(2, 5);
 
-        for i in 0..10 {
+        for i in 0..10u64 {
+            let term = if i < 5 { 1 } else { 2 };
             shared_state
                 .volatile_server_state
                 .replication_log
-                .push(Arc::new(SerializationData {
-                    requests: vec![],
-                    term: if i < 5 { 1 } else { 2 },
-                    timestamp: 0,
-                    prev_index: 0,
-                    prev_term: 0,
-                    index: i % 5,
-                    message_id: i,
-                }));
+                .push(Arc::new(build_owned_log_entry(|mut builder| {
+                    builder.set_index(i % 5);
+                    builder.set_term(term);
+                    builder.set_prev_log_index(0);
+                    builder.set_prev_log_term(0);
+                    builder.set_message_id(i);
+                    builder.set_timestamp(0);
+                })));
         }
 
         shared_state.volatile_server_state.last_log_term = 2;
@@ -687,18 +689,18 @@ mod tests {
             .replication_log_term_starts
             .insert(3, 0);
         for i in 0..5u64 {
+            let prev_index = if i > 0 { i - 1 } else { 0 };
             shared_state
                 .volatile_server_state
                 .replication_log
-                .push(Arc::new(SerializationData {
-                    requests: vec![],
-                    term: 3,
-                    timestamp: 0,
-                    prev_index: if i > 0 { i - 1 } else { 0 },
-                    prev_term: 3,
-                    index: i,
-                    message_id: i,
-                }));
+                .push(Arc::new(build_owned_log_entry(|mut builder| {
+                    builder.set_index(i);
+                    builder.set_term(3);
+                    builder.set_prev_log_index(prev_index);
+                    builder.set_prev_log_term(3);
+                    builder.set_message_id(i);
+                    builder.set_timestamp(0);
+                })));
         }
 
         shared_state.volatile_server_state.last_log_term = 3;
@@ -723,19 +725,18 @@ mod tests {
             .volatile_server_state
             .replication_log_term_starts
             .insert(2, 0);
-        for i in 0..5 {
+        for i in 0..5u64 {
             shared_state
                 .volatile_server_state
                 .replication_log
-                .push(Arc::new(SerializationData {
-                    requests: vec![],
-                    term: 2,
-                    timestamp: 0,
-                    prev_index: 0,
-                    prev_term: 0,
-                    index: i,
-                    message_id: i,
-                }));
+                .push(Arc::new(build_owned_log_entry(|mut builder| {
+                    builder.set_index(i);
+                    builder.set_term(2);
+                    builder.set_prev_log_index(0);
+                    builder.set_prev_log_term(0);
+                    builder.set_message_id(i);
+                    builder.set_timestamp(0);
+                })));
         }
 
         shared_state.volatile_server_state.last_log_term = 2;
@@ -765,19 +766,19 @@ mod tests {
             .replication_log_term_starts
             .insert(3, 5);
 
-        for i in 0..10 {
+        for i in 0..10u64 {
+            let term = if i < 5 { 2 } else { 3 };
             shared_state
                 .volatile_server_state
                 .replication_log
-                .push(Arc::new(SerializationData {
-                    requests: vec![],
-                    term: if i < 5 { 2 } else { 3 },
-                    timestamp: 0,
-                    prev_index: 0,
-                    prev_term: 0,
-                    index: i,
-                    message_id: i,
-                }));
+                .push(Arc::new(build_owned_log_entry(|mut builder| {
+                    builder.set_index(i);
+                    builder.set_term(term);
+                    builder.set_prev_log_index(0);
+                    builder.set_prev_log_term(0);
+                    builder.set_message_id(i);
+                    builder.set_timestamp(0);
+                })));
         }
 
         shared_state.volatile_server_state.last_log_term = 3;

@@ -36,9 +36,6 @@ impl RaftCandidateStateDelegate {
 }
 
 impl RaftProtocol for RaftCandidateStateDelegate {
-    fn init(&self) {
-        todo!()
-    }
     fn get_node_type(&self) -> RaftNodeType {
         RaftNodeType::Candidate
     }
@@ -47,16 +44,10 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         if append_entries_request.term >= shared_state.server_state.current_term {
             log::info!("recognising leader for new term: {}, leader id: {}", append_entries_request.term, append_entries_request.leader_id);
 
-            // New leader
+            // Step 1: Recognize the new leader
             shared_state.server_state.current_term = append_entries_request.term;
             shared_state.server_state.leader_id = append_entries_request.leader_id;
-            shared_state.volatile_server_state.next_term = append_entries_request.term +1;
-
-            if let Some(entry) = append_entries_request.entry {
-                shared_state.volatile_server_state.last_log_index = entry.index;
-                shared_state.volatile_server_state.last_log_term = entry.term;
-                log::debug!("updating last log term {} and index {}", entry.term, entry.index);
-            }
+            shared_state.volatile_server_state.next_term = append_entries_request.term + 1;
 
             // Update metrics when candidate recognizes new leader
             crate::transport::metrics::update_raft_state_metrics(
@@ -66,11 +57,38 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                 shared_state.volatile_server_state.replication_log.len()
             );
 
-            callback.send(
-                LocalRaftResponseMessage {
-                    payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok)
-                }
-            ).expect("Sending channel message failed");
+            // Step 2: Check if request is consecutive with our log state
+            let last_log_index = shared_state.volatile_server_state.last_log_index;
+            let last_log_term = shared_state.volatile_server_state.last_log_term;
+
+            if append_entries_request.prev_index == last_log_index
+                && append_entries_request.prev_term == last_log_term
+            {
+                // Request is consecutive - acknowledge and transition to follower
+                callback.send(
+                    LocalRaftResponseMessage {
+                        payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok)
+                    }
+                ).unwrap_or_else(|_| log::warn!("Failed to send channel message: receiver dropped"));
+            } else {
+                // Request is not consecutive - request backfill (whether it has entry or not)
+                log::info!(
+                    "New leader request not consecutive: prev_term={}, prev_index={}, local_term={}, local_index={}, has_entry={}",
+                    append_entries_request.prev_term, append_entries_request.prev_index, last_log_term, last_log_index,
+                    append_entries_request.entry.is_some()
+                );
+                callback.send(
+                    LocalRaftResponseMessage {
+                        payload: LocalRaftResponsePayload::AppendEntries(
+                            LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
+                                last_term: last_log_term,
+                                last_index: last_log_index,
+                            }
+                        )
+                    }
+                ).unwrap_or_else(|_| log::warn!("Failed to send channel message: receiver dropped"));
+            }
+
             return RaftMessageStateChange::Follower(Box::new(RaftFollowerStateDelegate::new()));
 
         } else {
@@ -78,7 +96,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                 LocalRaftResponseMessage {
                     payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::UnrecognizedLeader)
                 }
-            ).expect("Sending channel message failed");
+            ).unwrap_or_else(|_| log::warn!("Failed to send channel message: receiver dropped"));
         }
         RaftMessageStateChange::None
     }
@@ -233,7 +251,30 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         }
 
         let now = now_millis();
-        if self.initiate_election_timeout < now {
+        // Check if election timeout has expired.
+        // We use a signed comparison to handle potential clock anomalies (NTP adjustments, etc.)
+        // If the timeout is more than 1 hour in the future (indicating a potential clock rollback),
+        // we reset the timeout to trigger an election immediately.
+        let timeout_expired = if self.initiate_election_timeout > now {
+            // Timeout is in the future - check if it's suspiciously far in the future
+            let time_until_timeout = self.initiate_election_timeout - now;
+            if time_until_timeout > 3_600_000 {
+                // More than 1 hour in the future - likely a clock rollback, reset timeout
+                log::warn!(
+                    "Election timeout {} is suspiciously far in the future ({}ms), resetting due to potential clock rollback",
+                    self.initiate_election_timeout,
+                    time_until_timeout
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            // Timeout is in the past or now
+            true
+        };
+
+        if timeout_expired {
             work_done += 1;
             // Initiate ProposeVote procedure.
             let message_id = shared_state.next_message_id;
@@ -259,7 +300,10 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             });
             let persistence_span = Span::current();
             let persistence_task = PersistenceTaskType::AppendVote{id: message_id, term: next_term, candidate_id: shared_state.identity, parent_span: persistence_span};
-            shared_state.persistence_work.send(persistence_task).unwrap();
+            if let Err(e) = shared_state.persistence_work.send(persistence_task) {
+                log::error!("Failed to send persistence task during election: {:?}", e);
+                // Continue anyway - election can proceed, persistence failure will be detected later
+            }
             shared_state.term_votes.insert(next_term, shared_state.identity); // TODO can this be inserted before persisted? Probably yes
             let message_type = OutstandingMessageType::CandidateElection{ persistence_done: false, quorum_votes: 1}; // Vote for self
             let response_span = tracing::span!(Level::INFO, "append_entries_outstanding_message_processing");
@@ -275,6 +319,9 @@ impl RaftProtocol for RaftCandidateStateDelegate {
 
             self.initiate_election_timeout = now_plus_duration_millis(Duration::from_millis(self.rng.gen_range(500..3000) as u64));
         }
+
+        // Retry deferred broadcasts
+        work_done += shared_state.retry_deferred_broadcast();
 
         (RaftMessageStateChange::None, work_done)
     }
@@ -299,7 +346,14 @@ impl RaftProtocol for RaftCandidateStateDelegate {
 
         let message_id = shared_state.next_message_id;
         let persistence_task = PersistenceTaskType::AppendVote{id: message_id, term: request_vote_request.term, candidate_id: request_vote_request.candidate_id, parent_span: Span::current()};
-        shared_state.persistence_work.send(persistence_task).unwrap();
+        if let Err(e) = shared_state.persistence_work.send(persistence_task) {
+            log::error!("Failed to send vote persistence task: {:?}", e);
+            // Can't properly handle this vote without persistence
+            let _ = callback.send(LocalRaftResponseMessage {
+                payload: LocalRaftResponsePayload::RequestVote(false)
+            });
+            return RaftMessageStateChange::None;
+        }
         shared_state.term_votes.insert(request_vote_request.term, request_vote_request.candidate_id);
         shared_state.next_message_id = message_id+1;
         let response_span = tracing::span!(Level::INFO, "request_vote_outstanding_message_processing");

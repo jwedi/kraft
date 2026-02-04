@@ -4,18 +4,13 @@ pub mod remote;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use crossbeam_queue::SegQueue;
-use log::error;
 use opentelemetry::Context;
-use opentelemetry_zipkin::Propagator;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::{Receiver, Sender};
 use tokio::task::JoinSet;
-use tonic::codegen::http::StatusCode;
-use tonic::transport::Channel;
 use tracing::{Instrument, Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::client::cluster_node_client::SharedGrpcChannel;
 use crate::config::config::ClusterNode;
 use crate::quorum::types::LocalQuorumWorkerTask;
 use crate::raft::raft_sm::{
@@ -24,65 +19,35 @@ use crate::raft::raft_sm::{
 };
 use crate::service_utils::app_time::now_millis;
 use crate::transport::capnp::{build_owned_write_batch_response, OwnedWriteBatch, OwnedWriteBatchResponse};
-use crate::transport::raft::raftproto::RemotePutResponse;
-use crate::transport::raft::raftproto::raft_client::RaftClient;
+
+/// Status codes for write operations.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WriteStatus {
+    Ok,
+    InternalServerError,
+}
 
 /// Response from a write batch operation.
 /// Contains Cap'n Proto response for zero-copy internal handling.
 #[derive(Debug)]
 pub struct WriteResponse {
     pub message: OwnedWriteBatchResponse,
-    pub status_code: StatusCode,
+    pub status: WriteStatus,
 }
 
 impl WriteResponse {
     /// Create an empty error response
-    pub fn error(status_code: StatusCode) -> Self {
+    pub fn error() -> Self {
         let message = build_owned_write_batch_response(|_| {});
-        Self { message, status_code }
+        Self { message, status: WriteStatus::InternalServerError }
     }
 
     /// Create a successful response from Cap'n Proto message
     pub fn success(message: OwnedWriteBatchResponse) -> Self {
         Self {
             message,
-            status_code: StatusCode::OK,
+            status: WriteStatus::Ok,
         }
-    }
-
-    /// Convert responses to protobuf for external API boundary
-    pub fn to_protobuf_responses(&self) -> Vec<RemotePutResponse> {
-        self.message
-            .with_message(|r| {
-                r.get_responses()
-                    .map(|resps| {
-                        resps
-                            .iter()
-                            .map(|resp| RemotePutResponse {
-                                id: resp
-                                    .get_id()
-                                    .map(|s| s.to_string().unwrap_or_default())
-                                    .unwrap_or_default(),
-                                response_type: match resp.get_response_type() {
-                                    Ok(crate::transport::capnp::raft_capnp::RemoteResponseType::Ok) => 1,
-                                    Ok(crate::transport::capnp::raft_capnp::RemoteResponseType::Invalid) => 2,
-                                    _ => 0,
-                                },
-                                message: resp
-                                    .get_message()
-                                    .map(|s| s.to_string().unwrap_or_default())
-                                    .unwrap_or_default(),
-                                node_id: resp.get_node_id(),
-                                batch_id: resp
-                                    .get_batch_id()
-                                    .map(|s| s.to_string().unwrap_or_default())
-                                    .unwrap_or_default(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default()
     }
 }
 
@@ -158,12 +123,8 @@ pub struct WriteProxy {
     max_batch_size: u64,
     task_queue: Arc<SegQueue<LocalRaftMessage>>,
     self_id: u32,
-    cluster_nodes: Vec<ClusterNode>,
-    current_leader_connection: SharedGrpcChannel,
-    propagator: Propagator,
     min_batch_interval: u128,
     quorum_worker_tasks: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>>,
-    use_quorum_for_writes: bool,
 }
 
 impl WriteProxy {
@@ -172,7 +133,7 @@ impl WriteProxy {
         max_batch_size: u64,
         task_queue: Arc<SegQueue<LocalRaftMessage>>,
         self_id: u32,
-        cluster_nodes: Vec<ClusterNode>,
+        _cluster_nodes: Vec<ClusterNode>,
         min_batch_interval: u64,
         quorum_worker_tasks: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>>,
     ) -> Self {
@@ -180,30 +141,13 @@ impl WriteProxy {
             work_queue,
             shelved_batch: None,
         };
-        let default_leader_connection = SharedGrpcChannel::new("placeholder", 0);
         Self {
             write_queue,
             max_batch_size,
             task_queue,
             self_id,
-            cluster_nodes,
-            current_leader_connection: default_leader_connection,
-            propagator: opentelemetry_zipkin::Propagator::new(),
             min_batch_interval: min_batch_interval as u128,
             quorum_worker_tasks,
-            use_quorum_for_writes: true,
-        }
-    }
-
-    async fn get_client(&mut self, node_id: u32) -> Result<RaftClient<Channel>, String> {
-        if node_id == self.current_leader_connection.node_id {
-            self.current_leader_connection.get_client().await
-        } else {
-            // New leader
-            tracing::info!("Establishing write proxy connection to new leader {}", node_id);
-            let cn = self.cluster_nodes.iter().find(|node| node.node_id == node_id).unwrap();
-            self.current_leader_connection = SharedGrpcChannel::new(cn.endpoint.as_str(), cn.node_id);
-            self.current_leader_connection.get_client().await
         }
     }
 
@@ -271,7 +215,7 @@ impl WriteProxy {
         });
     }
 
-    fn process_remote_batch_via_quorum(
+    fn process_remote_batch(
         &self,
         batch_id: String,
         combined_batch: OwnedWriteBatch,
@@ -309,51 +253,6 @@ impl WriteProxy {
             .instrument(p)
             .await
         });
-    }
-
-    async fn process_remote_batch_via_grpc(
-        &mut self,
-        batch_id: String,
-        combined_batch: OwnedWriteBatch,
-        batch_callbacks: std::collections::HashMap<String, Sender<WriteResponse>>,
-        num_requests: u64,
-        request_size: u64,
-        current_leader_id: u32,
-        parent_span: &Span,
-        join_set: &mut JoinSet<()>,
-    ) {
-        match self.get_client(current_leader_id).instrument(parent_span.clone()).await {
-            Ok(client) => {
-                let put_batch_span = tracing::span!(
-                    Level::INFO,
-                    "write_proxy_remote_put_batch",
-                    num_requests = num_requests,
-                    request_size = request_size
-                );
-                put_batch_span.set_parent(parent_span.context());
-                let _enter = put_batch_span.enter();
-                let request = remote::prepare_put_batch_request(
-                    &batch_id,
-                    &combined_batch,
-                    put_batch_span.clone(),
-                    &self.propagator,
-                );
-
-                let p = put_batch_span.clone();
-                join_set.spawn(async move {
-                    remote::send_remote_put_batch_and_handle_response(client, batch_id, request, batch_callbacks, p.clone())
-                        .instrument(p)
-                        .await
-                });
-            }
-            Err(e) => {
-                tracing::error!("Setting up remote client failed with error: {}", e);
-                for (_, callback) in batch_callbacks {
-                    let msg = WriteResponse::error(StatusCode::INTERNAL_SERVER_ERROR);
-                    let _ = callback.send(msg);
-                }
-            }
-        }
     }
 
     pub async fn run(&mut self) {
@@ -411,8 +310,9 @@ impl WriteProxy {
                 if self.self_id == current_leader_id {
                     // Node is the leader
                     self.process_local_batch(combined_batch, batch_callbacks, num_requests, request_size, &mut join_set);
-                } else if self.use_quorum_for_writes {
-                    self.process_remote_batch_via_quorum(
+                } else {
+                    // Forward to leader via quorum worker
+                    self.process_remote_batch(
                         batch_id,
                         combined_batch,
                         batch_callbacks,
@@ -422,18 +322,6 @@ impl WriteProxy {
                         &new_root,
                         &mut join_set,
                     );
-                } else {
-                    self.process_remote_batch_via_grpc(
-                        batch_id,
-                        combined_batch,
-                        batch_callbacks,
-                        num_requests,
-                        request_size,
-                        current_leader_id,
-                        &new_root,
-                        &mut join_set,
-                    )
-                    .await;
                 }
 
                 let delta = now_millis() - start_time;

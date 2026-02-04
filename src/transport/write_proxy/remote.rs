@@ -1,51 +1,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use crossbeam_queue::SegQueue;
-use log::{error, warn};
-use opentelemetry::propagation::TextMapPropagator;
+use log::warn;
 use opentelemetry::trace::TraceContextExt;
-use opentelemetry_zipkin::Propagator;
 use tokio::sync::oneshot::{Receiver, Sender};
 use tokio::sync::oneshot;
-use tonic::codegen::http::StatusCode;
-use tonic::Request;
-use tonic::transport::Channel;
 use tracing::{Instrument, Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::quorum::types::{LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
 use crate::raft::raft_sm::{LocalRaftResponseMessage, LocalRaftResponsePayload};
 use crate::transport::capnp::OwnedWriteBatch;
-use crate::transport::raft::raftproto::RemotePutBatchRequest;
-use crate::transport::raft::raftproto::raft_client::RaftClient;
 
-use super::batch::{owned_batch_to_protobuf, protobuf_responses_to_owned, respond_to_batch_callbacks};
+use super::batch::respond_to_batch_callbacks;
 use super::{WriteBatch, WriteResponse};
-
-/// Prepares a gRPC request with tracing context.
-pub fn prepare_put_batch_request(
-    batch_id: &str,
-    batch: &OwnedWriteBatch,
-    span_parent: Span,
-    propagator: &Propagator,
-) -> Request<RemotePutBatchRequest> {
-    let req = owned_batch_to_protobuf(batch_id, batch);
-    let mut request = tonic::Request::new(req);
-
-    // Tracing stuff
-    let mut carrier = std::collections::HashMap::new();
-    let ctx = span_parent.context();
-    propagator.inject_context(&ctx, &mut carrier);
-
-    // Add tracing metadata to the request
-    let metadata = request.metadata_mut();
-    for (key, value) in carrier {
-        if let Ok(key) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes()) {
-            metadata.insert(key, value.parse().unwrap());
-        }
-    }
-    request
-}
 
 /// Sends a write batch via quorum worker and handles the response.
 pub async fn send_quorum_put_batch_and_handle_response(
@@ -78,43 +46,12 @@ pub async fn send_quorum_put_batch_and_handle_response(
         }
         Err(e) => {
             tracing::error!("Remote PutBatch request failed with error: {}", e);
-            error!("Remote PutBatch request failed with error: {}", e);
+            log::error!("Remote PutBatch request failed with error: {}", e);
             for (_, callback) in batch_callbacks {
-                let msg = WriteResponse::error(StatusCode::INTERNAL_SERVER_ERROR);
+                let msg = WriteResponse::error();
                 if callback.send(msg).is_err() {
                     warn!("Failed to send write batch response on channel, receiver dropped")
                 }
-            }
-        }
-    }
-}
-
-/// Sends a write batch via gRPC and handles the response.
-pub async fn send_remote_put_batch_and_handle_response(
-    mut client: RaftClient<Channel>,
-    batch_id: String,
-    request: Request<RemotePutBatchRequest>,
-    batch_callbacks: HashMap<String, Sender<WriteResponse>>,
-    span: Span,
-) {
-    let s = span.clone();
-    let resp = client.put_batch(request).instrument(s).await;
-    match resp {
-        Ok(put_response) => {
-            let write_callback_span = tracing::span!(Level::INFO, "write_proxy_remote_success_callbacks");
-            write_callback_span.set_parent(span.context());
-            write_callback_span.in_scope(|| {
-                tracing::event!(Level::INFO, "sending successful callback");
-                let owned_response =
-                    protobuf_responses_to_owned(&batch_id, put_response.into_inner().responses);
-                respond_to_batch_callbacks(owned_response, batch_callbacks)
-            })
-        }
-        Err(e) => {
-            tracing::error!("Remote PutBatch request failed with error: {}", e);
-            for (_, callback) in batch_callbacks {
-                let msg = WriteResponse::error(StatusCode::INTERNAL_SERVER_ERROR);
-                let _ = callback.send(msg);
             }
         }
     }
@@ -151,7 +88,7 @@ fn handle_insert_completed(
         }
         _ => {
             batch_callbacks.into_iter().for_each(|callback| {
-                let msg = WriteResponse::error(StatusCode::INTERNAL_SERVER_ERROR);
+                let msg = WriteResponse::error();
                 if callback.1.send(msg).is_err() {
                     log::warn!("Sending write response callback failed because the receiver dropped");
                 }

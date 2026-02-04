@@ -5,11 +5,10 @@ use crate::transport::capnp::{
     build_owned_write_batch, build_owned_write_batch_response,
     OwnedWriteBatch, OwnedWriteBatchResponse,
 };
-use crate::transport::raft::raftproto::{RemotePutBatchRequest, RemotePutRequest, RemotePutResponse};
 
 use super::{WriteBatch, WriteResponse};
 
-/// Combines multiple WriteBatches into a single OwnedWriteBatch for processing.
+/// Combines multiple WriteBatches into a single OwnedWriteBatch for processing to amortize cost.
 /// This involves extracting data from each batch and building a new combined message.
 /// The callbacks are collected for later response routing.
 pub fn prepare_batch_and_callbacks(
@@ -18,90 +17,60 @@ pub fn prepare_batch_and_callbacks(
 ) -> (OwnedWriteBatch, HashMap<String, Sender<WriteResponse>>) {
     let mut batch_callbacks: HashMap<String, Sender<WriteResponse>> = HashMap::new();
 
-    // First, collect all request data from all batches
-    struct RequestData {
-        id: String,
-        payload: Vec<u8>,
-        node_id: u32,
-    }
-    let mut all_requests: Vec<RequestData> = vec![];
-
-    for b in batches.into_iter() {
-        batch_callbacks.insert(b.batch_id.clone(), b.callback);
-
-        // Extract requests from this batch's OwnedWriteBatch
-        let _ = b.message.with_message(|reader| {
+    // First pass: count total requests and collect callbacks
+    let mut total_requests: u32 = 0;
+    for b in batches.iter() {
+        match b.message.with_message(|reader| {
             if let Ok(reqs) = reader.get_requests() {
-                for req in reqs.iter() {
-                    all_requests.push(RequestData {
-                        id: req.get_id().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default(),
-                        payload: req.get_payload().map(|p| p.to_vec()).unwrap_or_default(),
-                        node_id: req.get_node_id(),
-                    });
-                }
+                total_requests += reqs.len();
             }
-        });
+        }) {
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!("Failed to parse batch message during request counting: {:?}", e);
+                // Continue with other batches - the malformed one will be skipped
+            }
+        }
     }
 
-    // Build combined OwnedWriteBatch
+    // Collect callbacks - we need to move these out of batches
+    let batches_with_callbacks: Vec<_> = batches.into_iter().map(|b| {
+        batch_callbacks.insert(b.batch_id.clone(), b.callback);
+        b.message
+    }).collect();
+
     let combined = build_owned_write_batch(|mut builder| {
         builder.set_batch_id(batch_id);
-        let mut reqs = builder.init_requests(all_requests.len() as u32);
-        for (i, req_data) in all_requests.iter().enumerate() {
-            let mut req = reqs.reborrow().get(i as u32);
-            req.set_id(&req_data.id);
-            req.set_payload(&req_data.payload);
-            req.set_node_id(req_data.node_id);
+        let mut reqs = builder.init_requests(total_requests);
+        let mut req_idx: u32 = 0;
+
+        for message in batches_with_callbacks.iter() {
+            match message.with_message(|reader| {
+                if let Ok(source_reqs) = reader.get_requests() {
+                    for source_req in source_reqs.iter() {
+                        let mut target_req = reqs.reborrow().get(req_idx);
+                        // Copy directly from reader to builder, avoiding intermediate allocation
+                        if let Ok(id) = source_req.get_id() {
+                            target_req.set_id(id);
+                        }
+                        if let Ok(payload) = source_req.get_payload() {
+                            target_req.set_payload(payload);
+                        }
+                        target_req.set_node_id(source_req.get_node_id());
+                        req_idx += 1;
+                    }
+                }
+            }) {
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("Failed to parse batch message during combination: {:?}", e);
+                    // Continue with other batches - errors are logged but don't stop processing
+                }
+            }
         }
     });
 
     (combined, batch_callbacks)
-}
-
-/// Convert OwnedWriteBatch to protobuf RemotePutBatchRequest for gRPC fallback.
-pub fn owned_batch_to_protobuf(batch_id: &str, batch: &OwnedWriteBatch) -> RemotePutBatchRequest {
-    let put_requests = batch
-        .with_message(|r| {
-            r.get_requests().map(|reqs| {
-                reqs.iter()
-                    .map(|req| RemotePutRequest {
-                        id: req.get_id().map(|s| s.to_string().unwrap_or_default()).unwrap_or_default(),
-                        payload: req
-                            .get_payload()
-                            .map(|p| String::from_utf8_lossy(p).to_string())
-                            .unwrap_or_default(),
-                        node_id: req.get_node_id(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-
-    RemotePutBatchRequest {
-        batch_id: batch_id.to_string(),
-        put_request: put_requests,
-    }
-}
-
-/// Convert protobuf responses to OwnedWriteBatchResponse.
-pub fn protobuf_responses_to_owned(batch_id: &str, responses: Vec<RemotePutResponse>) -> OwnedWriteBatchResponse {
-    build_owned_write_batch_response(|mut builder| {
-        builder.set_batch_id(batch_id);
-        let mut out_resps = builder.init_responses(responses.len() as u32);
-        for (i, resp) in responses.iter().enumerate() {
-            let mut out = out_resps.reborrow().get(i as u32);
-            out.set_id(&resp.id);
-            out.set_response_type(match resp.response_type {
-                1 => crate::transport::capnp::raft_capnp::RemoteResponseType::Ok,
-                2 => crate::transport::capnp::raft_capnp::RemoteResponseType::Invalid,
-                _ => crate::transport::capnp::raft_capnp::RemoteResponseType::Unspecified,
-            });
-            out.set_message(&resp.message);
-            out.set_node_id(resp.node_id);
-            out.set_batch_id(&resp.batch_id);
-        }
-    })
 }
 
 /// Sends responses to all batch callbacks.
@@ -145,8 +114,8 @@ pub fn respond_to_batch_callbacks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::write_proxy::WriteStatus;
     use tokio::sync::oneshot;
-    use tracing::Span;
 
     fn create_test_write_batch(batch_id: &str, requests: Vec<(&str, &[u8], u32)>) -> WriteBatch {
         let (tx, _rx) = oneshot::channel();
@@ -228,83 +197,6 @@ mod tests {
         assert_eq!(request_count, 0);
     }
 
-    #[test]
-    fn test_owned_batch_to_protobuf_conversion() {
-        let batch = build_owned_write_batch(|mut builder| {
-            builder.set_batch_id("test-batch");
-            let mut reqs = builder.init_requests(2);
-            {
-                let mut req = reqs.reborrow().get(0);
-                req.set_id("req1");
-                req.set_payload(b"hello");
-                req.set_node_id(1);
-            }
-            {
-                let mut req = reqs.reborrow().get(1);
-                req.set_id("req2");
-                req.set_payload(b"world");
-                req.set_node_id(2);
-            }
-        });
-
-        let proto = owned_batch_to_protobuf("proto-batch", &batch);
-
-        assert_eq!(proto.batch_id, "proto-batch");
-        assert_eq!(proto.put_request.len(), 2);
-        assert_eq!(proto.put_request[0].id, "req1");
-        assert_eq!(proto.put_request[0].payload, "hello");
-        assert_eq!(proto.put_request[0].node_id, 1);
-        assert_eq!(proto.put_request[1].id, "req2");
-        assert_eq!(proto.put_request[1].payload, "world");
-        assert_eq!(proto.put_request[1].node_id, 2);
-    }
-
-    #[test]
-    fn test_protobuf_responses_to_owned_conversion() {
-        let responses = vec![
-            RemotePutResponse {
-                id: "resp1".to_string(),
-                response_type: 1, // Ok
-                message: "success".to_string(),
-                node_id: 1,
-                batch_id: "batch-1".to_string(),
-            },
-            RemotePutResponse {
-                id: "resp2".to_string(),
-                response_type: 2, // Invalid
-                message: "error".to_string(),
-                node_id: 2,
-                batch_id: "batch-1".to_string(),
-            },
-        ];
-
-        let owned = protobuf_responses_to_owned("response-batch", responses);
-
-        owned
-            .with_message(|r| {
-                let batch_id = r.get_batch_id().unwrap().to_str().unwrap();
-                assert_eq!(batch_id, "response-batch");
-
-                let resps = r.get_responses().unwrap();
-                assert_eq!(resps.len(), 2);
-
-                let resp1 = resps.get(0);
-                assert_eq!(resp1.get_id().unwrap().to_str().unwrap(), "resp1");
-                assert_eq!(
-                    resp1.get_response_type().unwrap(),
-                    crate::transport::capnp::raft_capnp::RemoteResponseType::Ok
-                );
-
-                let resp2 = resps.get(1);
-                assert_eq!(resp2.get_id().unwrap().to_str().unwrap(), "resp2");
-                assert_eq!(
-                    resp2.get_response_type().unwrap(),
-                    crate::transport::capnp::raft_capnp::RemoteResponseType::Invalid
-                );
-            })
-            .unwrap();
-    }
-
     #[tokio::test]
     async fn test_respond_to_batch_callbacks_sends_responses() {
         let (tx1, rx1) = oneshot::channel();
@@ -329,26 +221,10 @@ mod tests {
         // Both callbacks should receive responses
         let result1 = rx1.await;
         assert!(result1.is_ok());
-        assert_eq!(result1.unwrap().status_code, tonic::codegen::http::StatusCode::OK);
+        assert_eq!(result1.unwrap().status, WriteStatus::Ok);
 
         let result2 = rx2.await;
         assert!(result2.is_ok());
-        assert_eq!(result2.unwrap().status_code, tonic::codegen::http::StatusCode::OK);
-    }
-
-    #[test]
-    fn test_owned_batch_to_protobuf_handles_unicode() {
-        let batch = build_owned_write_batch(|mut builder| {
-            builder.set_batch_id("unicode-batch");
-            let mut reqs = builder.init_requests(1);
-            let mut req = reqs.reborrow().get(0);
-            req.set_id("req-unicode");
-            req.set_payload("日本語テスト".as_bytes());
-            req.set_node_id(1);
-        });
-
-        let proto = owned_batch_to_protobuf("proto-unicode", &batch);
-
-        assert_eq!(proto.put_request[0].payload, "日本語テスト");
+        assert_eq!(result2.unwrap().status, WriteStatus::Ok);
     }
 }

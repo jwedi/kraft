@@ -24,18 +24,8 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
-use tonic::transport::Channel;
 
-use kraft_lib::service_utils::storage_utils::{deserialize_all_data, SerializationData};
-use kraft_lib::transport::capnp::raft_capnp;
-
-// Include generated proto code for ping health check
-pub mod ping {
-    tonic::include_proto!("ping");
-}
-
-use ping::ping_pong_client::PingPongClient;
-use ping::PingRequest;
+use kraft_lib::transport::capnp::{raft_capnp, OwnedLogEntry};
 
 // ============================================================================
 // TCP Codec (inline implementation)
@@ -94,8 +84,7 @@ const RPC_PUT_RECORD: u8 = 1;
 const RPC_GET_RECORD: u8 = 2;
 
 /// Port configuration for test nodes
-const BASE_GRPC_PORT: u32 = 60051;
-const BASE_CAPNP_PORT: u32 = 61151;
+const BASE_CLUSTER_PORT: u32 = 61151;
 const BASE_METRICS_PORT: u32 = 62051;
 const BASE_TCP_DATASTORE_PORT: u32 = 63051;
 
@@ -235,7 +224,6 @@ impl TcpConnection {
 struct NodeHandle {
     process: Child,
     temp_dir: TempDir,
-    grpc_endpoint: String,
     tcp_endpoint: SocketAddr,
     node_id: u32,
 }
@@ -262,38 +250,23 @@ impl NodeHandle {
             .current_dir(temp_dir.path())
             .env("RESOURCE_DIR", temp_dir.path())
             .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
+            //.stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file))
             .spawn()?;
 
-        let grpc_endpoint = format!("http://[::1]:{}", BASE_GRPC_PORT + node_id - 1);
         let tcp_port = BASE_TCP_DATASTORE_PORT + node_id - 1;
         let tcp_endpoint: SocketAddr = format!("[::1]:{}", tcp_port).parse()?;
 
         Ok(NodeHandle {
             process,
             temp_dir,
-            grpc_endpoint,
             tcp_endpoint,
             node_id,
         })
     }
 
+    /// Check if node is ready by attempting TCP datastore connection
     async fn is_ready(&self) -> bool {
-        let Ok(channel) = Channel::from_shared(self.grpc_endpoint.clone())
-            .and_then(|c| Ok(c.connect_timeout(Duration::from_secs(1))))
-        else {
-            return false;
-        };
-
-        let Ok(channel) = channel.connect().await else {
-            return false;
-        };
-
-        PingPongClient::new(channel).ping(PingRequest {}).await.is_ok()
-    }
-
-    async fn is_tcp_ready(&self) -> bool {
         TcpStream::connect(self.tcp_endpoint).await.is_ok()
     }
 
@@ -303,39 +276,34 @@ impl NodeHandle {
     }
 
     fn log_file_path(&self) -> std::path::PathBuf {
-        self.temp_dir.path().join("data").join("log.sbe")
+        self.temp_dir.path().join("data").join("log.capnp")
     }
 }
 
 fn generate_config(node_id: u32, cluster_size: u32, temp_dir: &str) -> String {
-    let grpc_port = BASE_GRPC_PORT + node_id - 1;
-    let capnp_port = BASE_CAPNP_PORT + node_id - 1;
+    let cluster_port = BASE_CLUSTER_PORT + node_id - 1;
     let metrics_port = BASE_METRICS_PORT + node_id - 1;
     let tcp_datastore_port = BASE_TCP_DATASTORE_PORT + node_id - 1;
 
     let mut config = format!(
-        r#"port = {grpc_port}
-node_id = {node_id}
+        r#"node_id = {node_id}
 persistence_dir = "{temp_dir}/data/"
 max_message_size_bytes = 4096
 max_batch_size = 512
 min_batch_interval_ms = 2
 metrics_port = {metrics_port}
 enable_otel_tracing = false
-use_capnp_transport = true
-capnp_port = {capnp_port}
+cluster_port = {cluster_port}
 tcp_datastore_port = {tcp_datastore_port}
 "#
     );
 
     for i in 1..=cluster_size {
-        let node_grpc_port = BASE_GRPC_PORT + i - 1;
-        let node_capnp_port = BASE_CAPNP_PORT + i - 1;
+        let node_cluster_port = BASE_CLUSTER_PORT + i - 1;
         config.push_str(&format!(
             r#"
 [[cluster_nodes]]
-endpoint = "http://[::1]:{node_grpc_port}"
-capnp_endpoint = "[::1]:{node_capnp_port}"
+endpoint = "[::1]:{node_cluster_port}"
 node_id = {i}
 "#
         ));
@@ -363,7 +331,7 @@ impl TestCluster {
     }
 
     async fn wait_for_ready(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Wait for all nodes to respond to ping
+        // Wait for all nodes TCP endpoints to be ready
         let deadline = tokio::time::Instant::now() + NODE_STARTUP_TIMEOUT;
         for node in &self.nodes {
             while tokio::time::Instant::now() < deadline {
@@ -374,19 +342,6 @@ impl TestCluster {
             }
             if !node.is_ready().await {
                 eprintln!("Node {} stderr:\n{}", node.node_id, node.read_stderr());
-                return Err(format!("Node {} failed to start", node.node_id).into());
-            }
-        }
-
-        // Wait for TCP endpoints to be ready
-        for node in &self.nodes {
-            while tokio::time::Instant::now() < deadline {
-                if node.is_tcp_ready().await {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            if !node.is_tcp_ready().await {
                 return Err(format!("Node {} TCP endpoint not ready", node.node_id).into());
             }
         }
@@ -484,7 +439,7 @@ impl TestCluster {
         Err(last_error.unwrap_or_else(|| "No attempts made".into()))
     }
 
-    fn read_transaction_log(&self, node_idx: usize) -> Vec<SerializationData> {
+    fn read_transaction_log(&self, node_idx: usize) -> Vec<OwnedLogEntry> {
         let log_path = self.nodes[node_idx].log_file_path();
         let log_bytes = fs::read(&log_path)
             .expect(&format!("Failed to read log file for node {}", node_idx + 1));
@@ -493,8 +448,25 @@ impl TestCluster {
             return Vec::new();
         }
 
-        deserialize_all_data(&log_bytes)
-            .expect(&format!("Failed to deserialize log for node {}", node_idx + 1))
+        // Parse concatenated Cap'n Proto messages
+        let mut entries = Vec::new();
+        let mut offset = 0;
+        while offset < log_bytes.len() {
+            let mut slice = &log_bytes[offset..];
+            match capnp::serialize::read_message_from_flat_slice(&mut slice, Default::default()) {
+                Ok(_) => {
+                    let bytes_consumed = log_bytes.len() - offset - slice.len();
+                    let entry_bytes = log_bytes[offset..offset + bytes_consumed].to_vec();
+                    match OwnedLogEntry::from_bytes(entry_bytes) {
+                        Ok(entry) => entries.push(entry),
+                        Err(e) => panic!("Failed to parse log entry at offset {}: {:?}", offset, e),
+                    }
+                    offset += bytes_consumed;
+                }
+                Err(e) => panic!("Failed to read capnp message at offset {}: {:?}", offset, e),
+            }
+        }
+        entries
     }
 
     async fn wait_for_replication_tcp(&self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -552,26 +524,71 @@ async fn test_three_node_cluster_consensus_tcp() {
 
     // Verify all entries via transaction log (more reliable than parsing responses)
     // ===== Transaction Log Verification =====
-    let logs: Vec<Vec<SerializationData>> = (0..3)
+    let logs: Vec<Vec<OwnedLogEntry>> = (0..3)
         .map(|i| cluster.read_transaction_log(i))
         .collect();
 
-    // Verify all logs are identical across nodes
-    assert!(logs.windows(2).all(|w| w[0] == w[1]), "Transaction logs differ between nodes");
+    // Verify all logs have the same length (identical entry count)
+    assert!(logs.windows(2).all(|w| w[0].len() == w[1].len()), "Transaction logs have different lengths 1: {}, 2: {}, 3: {}", logs[0].len(), logs[1].len(), logs[2].len());
+
+    // Verify all logs have the same indices and terms
+    for (i, entry_pair) in logs.windows(2).enumerate() {
+        for (j, (e1, e2)) in entry_pair[0].iter().zip(entry_pair[1].iter()).enumerate() {
+            assert_eq!(e1.index(), e2.index(), "Index mismatch at position {} between nodes {} and {}", j, i, i+1);
+            assert_eq!(e1.term(), e2.term(), "Term mismatch at position {} between nodes {} and {}", j, i, i+1);
+        }
+    }
 
     // Verify all written entries appear in the log with correct values
-    let log_entries: std::collections::HashMap<_, _> = logs[0]
-        .iter()
-        .flat_map(|e| e.requests.iter().map(|r| (r.id.clone(), r.payload.clone())))
-        .collect();
+    let mut log_entries: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for entry in &logs[0] {
+        let _ = entry.for_each_command(|id, payload, _node_id| {
+            log_entries.insert(id.to_string(), payload.to_vec());
+        });
+    }
 
     for i in 0..entry_count {
         let key = format!("key-{}", i);
         let expected = format!("value-{}", i);
-        assert_eq!(log_entries.get(&key), Some(&expected), "Key {} mismatch in log", key);
+        let actual = log_entries.get(&key).map(|v| String::from_utf8_lossy(v).to_string());
+        assert_eq!(actual.as_deref(), Some(expected.as_str()), "Key {} mismatch in log", key);
     }
 
     println!("TCP Transport: Transaction log verification passed: {} entries across all nodes", logs[0].len());
+
+    // ===== GET Record API Verification =====
+    // Verify all written entries can be fetched via get_record API from all nodes
+    println!("Starting GET record verification for {} entries across {} nodes...", entry_count, cluster.nodes.len());
+
+    for i in 0..entry_count {
+        let key = format!("key-{}", i);
+        let expected_value = format!("value-{}", i);
+
+        // Verify the key is retrievable from all nodes
+        for node_idx in 0..cluster.nodes.len() {
+            let result = cluster
+                .get_record_tcp_with_retry(node_idx, &key, REQUEST_TIMEOUT, 3)
+                .await;
+
+            match result {
+                Ok(actual_value) => {
+                    assert_eq!(
+                        actual_value, expected_value,
+                        "Value mismatch for key {} on node {}: expected '{}', got '{}'",
+                        key, node_idx + 1, expected_value, actual_value
+                    );
+                }
+                Err(e) => {
+                    panic!(
+                        "Failed to get key {} from node {}: {:?}",
+                        key, node_idx + 1, e
+                    );
+                }
+            }
+        }
+    }
+
+    println!("TCP Transport: GET record verification passed: {} entries verified across all nodes", entry_count);
 
     cluster.close().await;
 }

@@ -73,6 +73,26 @@ fn handle_log_persisted(id: u64, shared_state: &mut SharedState) {
                 let response = LocalRaftResponseMessage { payload };
                 let _ = callback.send(response);
             }
+            OutstandingMessageType::NoOp {
+                persistence_done: _,
+                quorum_acks,
+                index,
+            } => {
+                if quorum_acks >= shared_state.quorum_size {
+                    // Persistence done and replicated to quorum of nodes
+                    complete_noop(id, index, shared_state);
+                } else {
+                    // Still waiting for quorum acks
+                    msg.outstanding_responses = new_outstanding_resp;
+                    let new_state = OutstandingMessageType::NoOp {
+                        persistence_done: true,
+                        quorum_acks,
+                        index,
+                    };
+                    msg.message_type = new_state;
+                    shared_state.outstanding_messages.insert(id, msg);
+                }
+            }
             _ => {
                 log::error!(
                     "Received unexpected outstanding_messages type for PersistenceResponseType.LogPersisted {}",
@@ -187,6 +207,28 @@ fn handle_append_entries_response(id: u64, shared_state: &mut SharedState) {
                     log::info!("All nodes have acked write batch {}", id);
                 }
             }
+            OutstandingMessageType::NoOp {
+                persistence_done,
+                quorum_acks,
+                index,
+            } => {
+                let new_acks = quorum_acks + 1;
+                if new_acks >= shared_state.quorum_size && persistence_done {
+                    // No-op replication done
+                    complete_noop(id, index, shared_state);
+                } else if new_outstanding_resp > 0 {
+                    msg.outstanding_responses = new_outstanding_resp;
+                    let new_state = OutstandingMessageType::NoOp {
+                        persistence_done,
+                        quorum_acks: new_acks,
+                        index,
+                    };
+                    msg.message_type = new_state;
+                    shared_state.outstanding_messages.insert(id, msg);
+                } else {
+                    log::info!("All nodes have acked no-op entry {}", id);
+                }
+            }
             _ => {
                 log::error!("Received invalid outstanding quorum message in current state {}", id);
             }
@@ -262,6 +304,43 @@ fn complete_write_batch(
     let _ = callback.send(response);
 }
 
+/// Completes a no-op entry by updating commit state.
+/// No callback is needed since no-op entries are internal to the leader.
+fn complete_noop(id: u64, index: u64, shared_state: &mut SharedState) {
+    log::debug!("No-op entry with message id {} has been persisted on quorum of nodes", id);
+
+    if index > shared_state.volatile_server_state.commit_index {
+        shared_state.volatile_server_state.commit_index = index;
+        shared_state
+            .volatile_server_state
+            .commit_state
+            .commit_index
+            .store(index, Ordering::Release);
+        shared_state
+            .volatile_server_state
+            .commit_state
+            .version
+            .fetch_add(1, Ordering::Release);
+
+        // Broadcast newly committed entries to query workers
+        shared_state.broadcast_committed_entries(index);
+
+        // Notify quorum workers to send immediate heartbeat with updated commit_index
+        shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
+            let task = LocalQuorumWorkerTaskType::UpdateCommitIndex { commit_index: index };
+            task_queue.push(LocalQuorumWorkerTask { task_type: task });
+        });
+    }
+
+    // Update Raft state metrics
+    crate::transport::metrics::update_raft_state_metrics(
+        shared_state.volatile_server_state.commit_index,
+        shared_state.server_state.leader_id,
+        shared_state.server_state.current_term,
+        shared_state.volatile_server_state.replication_log.len(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +379,7 @@ mod tests {
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
+                has_deferred_broadcast: false,
             },
             next_message_id: 100,
             outstanding_messages: HashMap::new(),
@@ -609,6 +689,134 @@ mod tests {
         // Verify no UpdateCommitIndex was dispatched (since commit_index didn't advance)
         for queue in &shared_state.quorum_worker_tasks {
             assert!(queue.pop().is_none(), "Should not dispatch UpdateCommitIndex when commit_index doesn't advance");
+        }
+    }
+
+    fn add_noop_outstanding_message(
+        shared_state: &mut SharedState,
+        id: u64,
+        index: u64,
+        persistence_done: bool,
+        quorum_acks: u32,
+    ) {
+        let msg = OutstandingMessage {
+            id,
+            outstanding_responses: 3,
+            message_type: OutstandingMessageType::NoOp {
+                persistence_done,
+                quorum_acks,
+                index,
+            },
+            span: tracing::Span::current(),
+        };
+        shared_state.outstanding_messages.insert(id, msg);
+    }
+
+    #[test]
+    fn test_noop_completion_advances_commit_index() {
+        let mut shared_state = create_test_shared_state();
+        let initial_commit = shared_state.volatile_server_state.commit_index;
+
+        // Add no-op with index higher than commit, persistence done, enough quorum acks
+        add_noop_outstanding_message(&mut shared_state, 42, 10, true, 2);
+
+        // Add persistence response to trigger completion
+        shared_state
+            .persistence_response
+            .push(PersistenceResponseType::LogPersisted { id: 42 });
+
+        process_persistence_responses(&mut shared_state);
+
+        // Commit index should be updated to the no-op index
+        assert_eq!(shared_state.volatile_server_state.commit_index, 10);
+        assert!(shared_state.volatile_server_state.commit_index > initial_commit);
+
+        // Outstanding message should be removed
+        assert!(!shared_state.outstanding_messages.contains_key(&42));
+    }
+
+    #[test]
+    fn test_noop_waits_for_quorum_after_persistence() {
+        let mut shared_state = create_test_shared_state();
+
+        // Add no-op with insufficient quorum acks
+        add_noop_outstanding_message(&mut shared_state, 42, 10, false, 0);
+
+        // Add persistence response
+        shared_state
+            .persistence_response
+            .push(PersistenceResponseType::LogPersisted { id: 42 });
+
+        process_persistence_responses(&mut shared_state);
+
+        // Should still be waiting (commit_index unchanged)
+        assert_eq!(shared_state.volatile_server_state.commit_index, 3);
+
+        // Outstanding message should still exist with persistence_done = true
+        assert!(shared_state.outstanding_messages.contains_key(&42));
+
+        let msg = shared_state.outstanding_messages.get(&42).unwrap();
+        match &msg.message_type {
+            OutstandingMessageType::NoOp {
+                persistence_done, ..
+            } => {
+                assert!(*persistence_done);
+            }
+            _ => panic!("Expected NoOp"),
+        }
+    }
+
+    #[test]
+    fn test_noop_quorum_ack_advances_commit_when_persisted() {
+        let mut shared_state = create_test_shared_state();
+        let initial_commit = shared_state.volatile_server_state.commit_index;
+
+        // Add no-op with persistence done, but one quorum ack away
+        add_noop_outstanding_message(&mut shared_state, 42, 10, true, 1);
+
+        // Add quorum response (quorum_size is 2, so this should complete)
+        shared_state.quorum_response.push(LocalQuorumResponse {
+            response_type: LocalQuorumTaskResponseType::AppendEntries { id: 42, ok: true },
+        });
+
+        let (backfill_requests, _) = process_quorum_responses(&mut shared_state);
+
+        assert!(backfill_requests.is_empty());
+
+        // Commit index should be updated to the no-op index
+        assert_eq!(shared_state.volatile_server_state.commit_index, 10);
+        assert!(shared_state.volatile_server_state.commit_index > initial_commit);
+
+        // Outstanding message should be removed
+        assert!(!shared_state.outstanding_messages.contains_key(&42));
+    }
+
+    #[test]
+    fn test_noop_update_commit_index_dispatched_to_quorum_workers() {
+        let mut shared_state = create_test_shared_state();
+
+        // Add no-op with index higher than current commit (3)
+        add_noop_outstanding_message(&mut shared_state, 42, 10, true, 2);
+
+        // Verify quorum worker task queues exist
+        assert_eq!(shared_state.quorum_worker_tasks.len(), 2);
+
+        // Add persistence response to complete the no-op
+        shared_state
+            .persistence_response
+            .push(PersistenceResponseType::LogPersisted { id: 42 });
+
+        process_persistence_responses(&mut shared_state);
+
+        // Verify UpdateCommitIndex was dispatched to both quorum workers
+        for queue in &shared_state.quorum_worker_tasks {
+            let task = queue.pop().expect("Expected UpdateCommitIndex task");
+            match task.task_type {
+                LocalQuorumWorkerTaskType::UpdateCommitIndex { commit_index } => {
+                    assert_eq!(commit_index, 10);
+                }
+                _ => panic!("Expected UpdateCommitIndex task"),
+            }
         }
     }
 }

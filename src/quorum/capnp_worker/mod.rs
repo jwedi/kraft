@@ -15,7 +15,6 @@ use crate::quorum::types::{
     LocalQuorumResponse,
 };
 use crate::raft::raft_sm::{LocalRaftMessage, LocalRaftResponseMessage};
-use crate::service_utils::storage_utils::SerializationData;
 use crate::transport::capnp::owned_message::OwnedQuorumMessage;
 use crate::transport::capnp_stream_manager::CapnpStreamManager;
 use crate::transport::write_proxy::{WriteBatch, WriteResponse};

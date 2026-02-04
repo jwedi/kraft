@@ -1,25 +1,20 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::thread;
 use tokio::sync::oneshot;
 use crossbeam_channel::Sender;
 use crossbeam_queue::SegQueue;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
 use crate::quorum::types::{LocalQuorumResponse, LocalQuorumWorkerTask};
 use crate::raft::follower::RaftFollowerStateDelegate;
-use crate::transport::raft::raftproto::{RemoteLogEntry, RemotePutRequest, RemotePutResponse};
-use crate::transport::capnp::{OwnedWriteBatch, OwnedWriteBatchResponse, build_owned_write_batch_response};
-use crate::transport::raft::raftproto::raft_server::Raft;
-use crate::service_utils::app_time::now_millis;
-use crate::service_utils::storage_utils::SerializationData;
+use crate::transport::capnp::{OwnedWriteBatch, OwnedWriteBatchResponse, OwnedLogEntry, build_owned_write_batch_response};
 use crate::transport::write_proxy::{WriteBatch, WriteResponse};
 use std::time::{Duration, Instant};
 use bus::Bus;
-use log::kv::Source;
 use log::{info, warn};
 
 #[derive(Copy, Clone)]
@@ -44,13 +39,16 @@ pub struct RaftVolatileState {
     pub last_log_term: u64,
     pub next_term: u64,// 1 more than the largest term value seen.
     pub next_log_index: u64,
-    pub replication_log: Vec<Arc<SerializationData>>,
+    pub replication_log: Vec<Arc<OwnedLogEntry>>,
     pub replication_log_term_starts: HashMap<u64, u64>,
     pub commit_state: Arc<CommitState>,
     /// Tracks the highest log index that has been broadcast to the bus.
     /// None means no entries have been broadcast yet.
     /// Only committed entries are broadcast to ensure query workers never see truncated data.
     pub last_broadcast_index: Option<u64>,
+    /// Indicates that there are deferred broadcasts pending due to bus full condition.
+    /// When true, time_step will retry broadcasting remaining entries.
+    pub has_deferred_broadcast: bool,
 }
 
 pub struct CommitState {
@@ -62,7 +60,10 @@ pub enum OutstandingMessageType {
     RequestVote{callback: oneshot::Sender<LocalRaftResponseMessage>}, // Request vote from someone else
     CandidateElection{persistence_done: bool, quorum_votes: u32}, // Candidate election by this node.
     AppendLog{callback: oneshot::Sender<LocalRaftResponseMessage>},
-    WriteBatch{persistence_done: bool, quorum_acks: u32, callback: oneshot::Sender<LocalRaftResponseMessage>, index: u64, start_time: Instant, batch_size: usize}
+    WriteBatch{persistence_done: bool, quorum_acks: u32, callback: oneshot::Sender<LocalRaftResponseMessage>, index: u64, start_time: Instant, batch_size: usize},
+    /// No-op entry for leader initialization per Raft Section 5.4.2.
+    /// Allows commit_index to advance without waiting for client traffic.
+    NoOp{persistence_done: bool, quorum_acks: u32, index: u64}
 }
 
 pub struct OutstandingMessage {
@@ -90,7 +91,7 @@ pub struct SharedState {
     pub quorum_size: u32,
     pub quorum_worker_tasks: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>>,
     pub state_machine_config: StateMachineConfig,
-    pub log_entry_bus: Bus<Arc<SerializationData>>
+    pub log_entry_bus: Bus<Arc<OwnedLogEntry>>
 }
 
 impl SharedState {
@@ -115,7 +116,7 @@ impl SharedState {
                         last_broadcast_index = i;
                     }
                     Err(_) => {
-                        last_broadcast_index = self.broadcast_commited_entries_when_bus_full(new_commit_index as usize, idx) as u64;
+                        last_broadcast_index = self.broadcast_committed_entries_when_bus_full(new_commit_index as usize, idx) as u64;
                         break;
                     }
                 }
@@ -130,30 +131,110 @@ impl SharedState {
             log::info!("Broadcasted {} entries in {} ms", entries_broadcasted, elapsed_millis)
         }
         self.volatile_server_state.last_broadcast_index = Some(last_broadcast_index);
+        self.volatile_server_state.has_deferred_broadcast = last_broadcast_index < new_commit_index;
         self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
     }
 
-    fn broadcast_commited_entries_when_bus_full(&mut self, new_absolute_commit_index: usize, start_index: usize) -> usize {
+    /// Broadcasts committed entries when the bus is full.
+    ///
+    /// 1. Attempts to broadcast with a limited number of retries per entry
+    /// 2. Returns early if the bus remains full after max retries
+    /// 3. The caller will retry on the next time_step, allowing other Raft operations to proceed
+    ///
+    /// This prevents blocking elections and heartbeats when consumers are slow.
+    fn broadcast_committed_entries_when_bus_full(&mut self, new_absolute_commit_index: usize, start_index: usize) -> usize {
+        const MAX_RETRIES_PER_ENTRY: u32 = 100;
+        const YIELD_INTERVAL: u32 = 10; // Yield every N retries
+
         self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
         let mut idx = start_index;
+
         while idx <= new_absolute_commit_index {
             if let Some(entry) = self.volatile_server_state.replication_log.get(idx) {
                 let e = Arc::clone(entry);
-                match self.log_entry_bus.try_broadcast(e) {
-                    Ok(_) => {
-                        idx += 1;
-                    }
-                    Err(_) => {
-                        self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
-                        thread::yield_now();
+                let mut retries = 0u32;
+
+                loop {
+                    match self.log_entry_bus.try_broadcast(e.clone()) {
+                        Ok(_) => {
+                            idx += 1;
+                            break;
+                        }
+                        Err(_) => {
+                            retries += 1;
+                            if retries >= MAX_RETRIES_PER_ENTRY {
+                                // Bus is persistently full - return early to allow other operations
+                                // The next call to broadcast_committed_entries will resume from here
+                                log::warn!(
+                                    "Bus full after {} retries at index {}, deferring remaining {} entries",
+                                    retries,
+                                    idx,
+                                    new_absolute_commit_index - idx
+                                );
+                                return if idx > start_index { idx - 1 } else { start_index };
+                            }
+                            if retries % YIELD_INTERVAL == 0 {
+                                self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+                                thread::yield_now();
+                            }
+                        }
                     }
                 }
             } else {
                 log::warn!("No replication log entry at index: {}, returning", idx);
-                return idx;
+                return if idx > start_index { idx - 1 } else { start_index };
             }
         }
-        return new_absolute_commit_index;
+        new_absolute_commit_index
+    }
+
+    /// Maximum entries to broadcast per time_step to avoid blocking Raft operations.
+    const MAX_BROADCAST_PER_TIMESTEP: u64 = 5000;
+
+    /// Retries broadcasting deferred entries. Called from time_step.
+    /// Returns the number of entries successfully broadcast.
+    pub fn retry_deferred_broadcast(&mut self) -> u64 {
+        if !self.volatile_server_state.has_deferred_broadcast {
+            return 0;
+        }
+
+        let commit_index = self.volatile_server_state.commit_index;
+        let start_index = self.volatile_server_state.last_broadcast_index
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        if start_index > commit_index {
+            self.volatile_server_state.has_deferred_broadcast = false;
+            return 0;
+        }
+
+        let mut count = 0u64;
+        let end_index = std::cmp::min(commit_index, start_index + Self::MAX_BROADCAST_PER_TIMESTEP - 1);
+
+        for i in start_index..=end_index {
+            if let Some(entry) = self.volatile_server_state.replication_log.get(i as usize) {
+                match self.log_entry_bus.try_broadcast(Arc::clone(entry)) {
+                    Ok(_) => {
+                        self.volatile_server_state.last_broadcast_index = Some(i);
+                        count += 1;
+                    }
+                    Err(_) => {
+                        // Bus still full, will retry next time_step
+                        return count;
+                    }
+                }
+            }
+        }
+
+        // Check if done
+        if self.volatile_server_state.last_broadcast_index == Some(commit_index) {
+            self.volatile_server_state.has_deferred_broadcast = false;
+        }
+
+        if count > 0 {
+            self.volatile_server_state.commit_state.version.fetch_add(1, Ordering::Release);
+        }
+        count
     }
 }
 
@@ -251,7 +332,7 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                     let resp = LocalRaftResponseMessage {
                         payload: resp_payload
                     };
-                    raft_message.callback.send(resp).expect("Sending raft callback should not fail")
+                    raft_message.callback.send(resp).unwrap_or_else(|_| log::warn!("Failed to send raft callback: receiver dropped"))
                 })
             }
             LocalRaftMessagePayload::WriteBatch(batch) => {
@@ -269,7 +350,7 @@ impl RaftStateMachineExecutor for StateMachineExecutorImpl {
                         err: Some("Received write batch as non-leader".to_string())
                     };
                     let msg = LocalRaftResponsePayload::WriteBatch(resp);
-                    raft_message.callback.send(LocalRaftResponseMessage {payload: msg}).expect("Sending raft callback should not fail")
+                    raft_message.callback.send(LocalRaftResponseMessage {payload: msg}).unwrap_or_else(|_| log::warn!("Failed to send raft callback: receiver dropped"))
                 }
 
             }
@@ -286,8 +367,7 @@ pub trait RaftStateMachineExecutor {
 
 // Per-state implementation of the Raft protocol. Handles requests, returns responses through callbacks and notifies about state changes.
 pub trait RaftProtocol {
-
-    fn init(&self);
+    fn init(&self) {}
 
     fn get_node_type(&self) -> RaftNodeType;
     fn request_vote(&mut self, request_vote_request: LocalRequestVoteRequest, callback: oneshot::Sender<LocalRaftResponseMessage>, shared_state: &mut SharedState) -> RaftMessageStateChange;
@@ -340,13 +420,25 @@ pub struct LocalRequestVoteRequest {
     pub last_log_term: u64
 }
 
+/// Log entry for replication - replaces the protobuf RemoteLogEntry
+#[derive(Clone, Debug)]
+pub struct LogEntry {
+    pub index: u64,
+    pub data: Vec<u8>,
+    pub batch_index: u64,
+    pub term: u64,
+    pub prev_log_term: u64,
+    pub prev_log_index: u64,
+    pub message_id: u64,
+}
+
 pub struct LocalAppendEntries {
     pub term: u64,
     pub leader_id: u32,
     pub prev_index: u64,
     pub prev_term: u64,
     pub request_id: u64,
-    pub entry: Option<RemoteLogEntry>,
+    pub entry: Option<LogEntry>,
     pub commit_index: u64
 }
 
@@ -429,19 +521,19 @@ struct RaftState {
 pub struct FollowerState {
     pub current_term: u64,
     pub voted_for: Option<u64>,
-    pub log: Vec<RemoteLogEntry>
+    pub log: Vec<LogEntry>
 }
 
 pub struct LeaderState {
     pub current_term: u64,
-    pub log : Vec<RemoteLogEntry>,
+    pub log : Vec<LogEntry>,
     pub max_heartbeat_cadence: u64,
 }
 
 pub struct RaftSM {
     pub current_term: u64,
     pub voted_for: Option<u64>,
-    pub log: Vec<RemoteLogEntry>
+    pub log: Vec<LogEntry>
 }
 
 #[cfg(test)]
@@ -450,7 +542,7 @@ mod integration_tests {
     use crate::raft::leader::RaftLeaderStateDelegate;
     use crate::raft::follower::RaftFollowerStateDelegate;
     use crate::quorum::types::{LocalQuorumResponse, LocalQuorumTaskResponseType, LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
-    use crate::service_utils::storage_utils::SerializationData;
+    use crate::transport::capnp::build_owned_log_entry;
     use std::collections::HashMap;
     use std::sync::Arc;
     use crossbeam_channel::unbounded;
@@ -477,6 +569,7 @@ mod integration_tests {
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
+                has_deferred_broadcast: false,
             },
             next_message_id: 1,
             outstanding_messages: std::collections::HashMap::new(),
@@ -520,15 +613,15 @@ mod integration_tests {
         for i in 0u64..7 {
             let term = if i < 4 { 2 } else { 3 };
             let prev_term = if i == 0 { 0 } else if i <= 4 { 2 } else { 3 };
-            leader_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-                requests: vec![],
-                term,
-                timestamp: 0,
-                prev_index: if i == 0 { 0 } else { i - 1 },
-                prev_term,
-                index: i, // Absolute index
-                message_id: i,
-            }));
+            let prev_index = if i == 0 { 0 } else { i - 1 };
+            leader_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(term);
+                builder.set_prev_log_index(prev_index);
+                builder.set_prev_log_term(prev_term);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
         }
         leader_state.volatile_server_state.last_log_index = 6;
         leader_state.volatile_server_state.last_log_term = 3;
@@ -569,15 +662,16 @@ mod integration_tests {
         // Follower has 6 entries (indexes 0-5), all term 2
         follower_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
         for i in 0u64..6 {
-            follower_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-                requests: vec![],
-                term: 2,
-                timestamp: 0,
-                prev_index: if i == 0 { 0 } else { i - 1 },
-                prev_term: if i == 0 { 0 } else { 2 },
-                index: i, // Absolute index
-                message_id: i,
-            }));
+            let prev_index = if i == 0 { 0 } else { i - 1 };
+            let prev_term = if i == 0 { 0 } else { 2 };
+            follower_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(2);
+                builder.set_prev_log_index(prev_index);
+                builder.set_prev_log_term(prev_term);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
         }
         follower_state.volatile_server_state.last_log_term = 2;
         follower_state.volatile_server_state.last_log_index = 5;
@@ -649,15 +743,15 @@ mod integration_tests {
         for i in 0u64..10 {
             let term = if i < 3 { 2 } else if i < 6 { 3 } else { 4 };
             let prev_term = if i == 0 { 0 } else if i <= 3 { 2 } else if i <= 6 { 3 } else { 4 };
-            leader_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-                requests: vec![],
-                term,
-                timestamp: 0,
-                prev_index: if i == 0 { 0 } else { i - 1 },
-                prev_term,
-                index: i, // Absolute index
-                message_id: i,
-            }));
+            let prev_index = if i == 0 { 0 } else { i - 1 };
+            leader_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(term);
+                builder.set_prev_log_index(prev_index);
+                builder.set_prev_log_term(prev_term);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
         }
         leader_state.volatile_server_state.last_log_index = 9;
         leader_state.volatile_server_state.last_log_term = 4;
@@ -710,15 +804,15 @@ mod integration_tests {
         for i in 0u64..7 {
             let term = if i < 5 { 2 } else { 3 };
             let prev_term = if i == 0 { 0 } else if i <= 5 { 2 } else { 3 };
-            leader_state.volatile_server_state.replication_log.push(Arc::new(SerializationData {
-                requests: vec![],
-                term,
-                timestamp: 0,
-                prev_index: if i == 0 { 0 } else { i - 1 },
-                prev_term,
-                index: i, // Absolute index
-                message_id: i,
-            }));
+            let prev_index = if i == 0 { 0 } else { i - 1 };
+            leader_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(i);
+                builder.set_term(term);
+                builder.set_prev_log_index(prev_index);
+                builder.set_prev_log_term(prev_term);
+                builder.set_message_id(i);
+                builder.set_timestamp(0);
+            })));
         }
         leader_state.volatile_server_state.last_log_index = 6;
         leader_state.volatile_server_state.last_log_term = 3;

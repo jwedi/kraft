@@ -5,12 +5,12 @@ use std::sync::Arc;
 
 use crate::persistence::worker::VoteRow;
 use crate::service_utils::app_time::now_millis;
-use crate::service_utils::storage_utils::{self, SerializationData};
+use crate::transport::capnp::OwnedLogEntry;
 
 /// Recovered data from persistence storage.
 pub struct RecoveredData {
     /// Deserialized replication log entries.
-    pub replication_log: Vec<Arc<SerializationData>>,
+    pub replication_log: Vec<Arc<OwnedLogEntry>>,
     /// Map of term to the index where that term starts in the log.
     pub term_start_index: HashMap<u64, u64>,
     /// The index of the last log entry.
@@ -23,12 +23,12 @@ pub struct RecoveredData {
     pub next_term: u64,
 }
 
-/// Deserializes the replication log from raw bytes.
+/// Deserializes the replication log from raw bytes (Cap'n Proto format).
 ///
 /// Returns a tuple of (log entries, term start indices, last index, last term).
 pub fn deserialize_replication_log(
     log_bytes: &[u8],
-) -> (Vec<Arc<SerializationData>>, HashMap<u64, u64>, u64, u64) {
+) -> (Vec<Arc<OwnedLogEntry>>, HashMap<u64, u64>, u64, u64) {
     let start_time = now_millis();
 
     if log_bytes.is_empty() {
@@ -38,22 +38,47 @@ pub fn deserialize_replication_log(
 
     log::info!("Recovered replication log with {} bytes", log_bytes.len());
 
-    let replication_log = storage_utils::deserialize_all_data_as_arc(log_bytes).unwrap_or_else(|e| {
-        log::warn!("Failed to deserialize replication log: {:?}, starting with empty log", e);
-        vec![]
-    });
+    // Parse concatenated Cap'n Proto messages
+    let mut replication_log = Vec::new();
+    let mut offset = 0;
+
+    while offset < log_bytes.len() {
+        let mut slice = &log_bytes[offset..];
+        match capnp::serialize::read_message_from_flat_slice(&mut slice, Default::default()) {
+            Ok(_) => {
+                let bytes_consumed = log_bytes.len() - offset - slice.len();
+                let entry_bytes = log_bytes[offset..offset + bytes_consumed].to_vec();
+                match OwnedLogEntry::from_bytes(entry_bytes) {
+                    Ok(entry) => {
+                        replication_log.push(Arc::new(entry));
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to parse log entry at offset {}: {:?}", offset, e);
+                    }
+                }
+                offset += bytes_consumed;
+            }
+            Err(e) => {
+                log::warn!("Failed to read message at offset {}: {:?}, stopping recovery", offset, e);
+                break;
+            }
+        }
+    }
 
     // Build term start index map
     let mut term_start_index: HashMap<u64, u64> = HashMap::new();
+    let mut prev_term: u64 = 0;
     for (i, entry) in replication_log.iter().enumerate() {
-        if entry.index == 0 {
-            term_start_index.insert(entry.term, i as u64);
+        let entry_term = entry.term();
+        if entry_term != prev_term {
+            term_start_index.insert(entry_term, i as u64);
+            prev_term = entry_term;
         }
     }
 
     let last_entry = replication_log.last();
-    let last_log_index = last_entry.map_or(0, |e| e.index);
-    let last_log_term = last_entry.map_or(0, |e| e.term);
+    let last_log_index = last_entry.map_or(0, |e| e.index());
+    let last_log_term = last_entry.map_or(0, |e| e.term());
 
     let elapsed = now_millis() - start_time;
     log::info!(

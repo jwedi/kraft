@@ -1,16 +1,14 @@
 use std::sync::Arc;
-use std::ops::Deref;
 use crossbeam_channel::Sender;
 use log::error;
 use tracing::Span;
 
 use crate::service_utils::app_time::now_millis;
-use crate::service_utils::storage_utils::{serialize_data, SerializationData};
 use crate::transport::capnp::owned_message::OwnedQuorumMessage;
 use crate::transport::capnp::{
     build_heartbeat_message, build_vote_request_message,
-    build_truncate_log_request_message, build_owned_log_entry,
-    build_append_entries_message,
+    build_truncate_log_request_message,
+    build_append_entries_message, OwnedLogEntry,
 };
 use crate::transport::write_proxy::WriteBatch;
 use super::PendingWriteBatch;
@@ -177,6 +175,7 @@ pub fn send_truncate_log(
 }
 
 /// Sends backfill entries to the remote member.
+/// Now uses OwnedLogEntry directly (already Cap'n Proto format).
 pub fn send_backfill_entries(
     outbound_tx: &Option<Sender<OwnedQuorumMessage>>,
     member_id: u64,
@@ -185,8 +184,8 @@ pub fn send_backfill_entries(
     commit_index: u64,
     last_heartbeat: &mut u128,
     ongoing_backfill: &mut Option<super::OngoingBackfill>,
-    max_message_size_bytes: usize,
-    entries: Vec<Arc<SerializationData>>,
+    _max_message_size_bytes: usize,
+    entries: Vec<Arc<OwnedLogEntry>>,
 ) {
     if entries.is_empty() {
         return;
@@ -198,44 +197,22 @@ pub fn send_backfill_entries(
         entries.len(),
         first.map_or("None".to_string(), |e| format!(
             "prev_term: {}, prev_index: {}",
-            e.prev_term, e.prev_index
+            e.prev_log_term(), e.prev_log_index()
         ))
     );
 
     for entry in entries {
-        // Serialize the entry data to SBE format
-        let buffer = vec![0u8; max_message_size_bytes];
-        let (limit, mut serialized) = serialize_data(&entry, buffer, 0);
-        serialized.truncate(limit);
-
-        let entry_data = entry.deref();
-
-        // Build OwnedLogEntry from SerializationData
-        let owned_entry = Arc::new(build_owned_log_entry(|mut builder| {
-            builder.set_index(entry_data.index);
-            builder.set_term(entry_data.term);
-            builder.set_prev_log_index(entry_data.prev_index);
-            builder.set_prev_log_term(entry_data.prev_term);
-            builder.set_message_id(entry_data.index);
-            builder.set_timestamp(entry_data.timestamp);
-            builder.set_data(&serialized);
-            let mut commands = builder.init_commands(entry_data.requests.len() as u32);
-            for (i, req) in entry_data.requests.iter().enumerate() {
-                let mut cmd = commands.reborrow().get(i as u32);
-                cmd.set_id(&req.id);
-                cmd.set_payload(req.payload.as_bytes());
-                cmd.set_node_id(req.node_id);
-            }
-        }));
-
+        // Use message_id as request_id to ensure it's non-zero.
+        // request_id = 0 is reserved for heartbeats, so using entry.index()
+        // would cause the first entry (index 0) to be treated as a heartbeat.
         let msg = build_append_entries_message(
             term,
             self_id,
-            entry_data.prev_index,
-            entry_data.prev_term,
-            entry_data.index,
+            entry.prev_log_index(),
+            entry.prev_log_term(),
+            entry.message_id(),
             commit_index,
-            Some(&owned_entry),
+            Some(&entry),
         );
 
         if !send_message(outbound_tx, msg, member_id) {

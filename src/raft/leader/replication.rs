@@ -4,7 +4,6 @@ use tracing::Span;
 
 use crate::quorum::types::{LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
 use crate::raft::raft_sm::SharedState;
-use crate::service_utils::storage_utils::SerializationData;
 
 /// Clones a subset of Arc elements from a slice.
 pub fn clone_subset<T>(data: &[Arc<T>], start: usize, end: usize) -> Vec<Arc<T>> {
@@ -82,7 +81,7 @@ pub fn handle_backfill_request(
 
     // Verify the term matches at the requested index
     if let Some(entry_at_index) = shared_state.volatile_server_state.replication_log.get(last_log_index as usize) {
-        if entry_at_index.term != last_log_term && last_log_term != 0 {
+        if entry_at_index.term() != last_log_term && last_log_term != 0 {
             // Terms start from 1, log term of 0 means empty
             handle_term_mismatch(shared_state, quorum_node_id, last_log_term, last_log_index);
             return;
@@ -104,7 +103,7 @@ fn handle_follower_ahead(
         .volatile_server_state
         .replication_log
         .last()
-        .map(|entry| entry.term)
+        .map(|entry| entry.term())
         .unwrap_or(0);
 
     log::info!(
@@ -128,15 +127,15 @@ fn handle_term_mismatch(
     while truncate_to > 0 {
         truncate_to -= 1;
         if let Some(entry) = shared_state.volatile_server_state.replication_log.get(truncate_to as usize) {
-            if entry.term == last_log_term {
+            if entry.term() == last_log_term {
                 // Found entry with matching term
                 log::info!(
                     "Term mismatch at index {}, truncating follower to index {} term {}",
                     last_log_index,
                     truncate_to,
-                    entry.term
+                    entry.term()
                 );
-                send_truncate_signal(shared_state, quorum_node_id, entry.term, truncate_to);
+                send_truncate_signal(shared_state, quorum_node_id, entry.term(), truncate_to);
                 found_match = true;
                 break;
             }
@@ -179,26 +178,23 @@ mod tests {
     use crate::raft::raft_sm::{
         CommitState, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig,
     };
-    use crate::service_utils::storage_utils::SerializationData;
+    use crate::transport::capnp::{build_owned_log_entry, OwnedLogEntry};
     use bus::Bus;
     use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
 
-    fn create_test_shared_state_with_log(log_entries: Vec<SerializationData>) -> SharedState {
+    fn create_test_shared_state_with_log(log_entries: Vec<Arc<OwnedLogEntry>>) -> SharedState {
         let quorum_tasks: Vec<Arc<SegQueue<LocalQuorumWorkerTask>>> =
             vec![Arc::new(SegQueue::new()), Arc::new(SegQueue::new())];
 
-        let replication_log: Vec<Arc<SerializationData>> =
-            log_entries.into_iter().map(Arc::new).collect();
-
-        let last_log_index = if replication_log.is_empty() {
+        let last_log_index = if log_entries.is_empty() {
             0
         } else {
-            replication_log.len() as u64 - 1
+            log_entries.len() as u64 - 1
         };
-        let last_log_term = replication_log.last().map(|e| e.term).unwrap_or(0);
+        let last_log_term = log_entries.last().map(|e| e.term()).unwrap_or(0);
         let (persistence_tx, _persistence_rx) = unbounded();
 
         SharedState {
@@ -211,7 +207,7 @@ mod tests {
                 last_log_term,
                 last_log_index,
                 commit_index: 0,
-                replication_log,
+                replication_log: log_entries,
                 replication_log_term_starts: HashMap::new(),
                 last_applied: 0,
                 next_log_index: last_log_index + 1,
@@ -220,6 +216,7 @@ mod tests {
                     version: AtomicU64::new(0),
                 }),
                 last_broadcast_index: None,
+                has_deferred_broadcast: false,
             },
             next_message_id: 1,
             outstanding_messages: HashMap::new(),
@@ -238,16 +235,16 @@ mod tests {
         }
     }
 
-    fn create_log_entry(index: u64, term: u64) -> SerializationData {
-        SerializationData {
-            index,
-            term,
-            timestamp: 0,
-            prev_index: if index > 0 { index - 1 } else { 0 },
-            prev_term: term,
-            message_id: index,
-            requests: vec![],
-        }
+    fn create_log_entry(index: u64, term: u64) -> Arc<OwnedLogEntry> {
+        let prev_index = if index > 0 { index - 1 } else { 0 };
+        Arc::new(build_owned_log_entry(|mut builder| {
+            builder.set_index(index);
+            builder.set_term(term);
+            builder.set_prev_log_index(prev_index);
+            builder.set_prev_log_term(term);
+            builder.set_message_id(index);
+            builder.set_timestamp(0);
+        }))
     }
 
     #[test]
@@ -350,8 +347,8 @@ mod tests {
         match task.unwrap().task_type {
             LocalQuorumWorkerTaskType::BackfillLog { data } => {
                 assert_eq!(data.len(), 2);
-                assert_eq!(data[0].index, 2);
-                assert_eq!(data[1].index, 3);
+                assert_eq!(data[0].index(), 2);
+                assert_eq!(data[1].index(), 3);
             }
             _ => panic!("Expected BackfillLog task"),
         }

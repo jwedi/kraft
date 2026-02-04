@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use tracing::Span;
-use crate::service_utils::storage_utils::SerializationData;
 use crate::transport::capnp::OwnedLogEntry;
 use crate::transport::write_proxy::WriteBatch;
 
@@ -10,8 +9,7 @@ pub struct LocalQuorumWorkerTask {
 }
 
 /// Task types for quorum worker
-/// Uses OwnedLogEntry (Cap'n Proto) for AppendEntries.
-/// BackfillLog still uses SerializationData for compatibility with persistence layer.
+/// Uses OwnedLogEntry (Cap'n Proto) for all log entries.
 pub enum LocalQuorumWorkerTaskType {
     /// Start sending heartbeats to this quorum member
     StartHeartbeats { id: u64, term: u64, prev_term: u64, prev_log_index: u64, commit_index: u64 },
@@ -21,11 +19,8 @@ pub enum LocalQuorumWorkerTaskType {
     RequestVote { id: u64, term: u64, last_term: u64, last_index: u64, parent_span: Span },
     /// Append a log entry to this quorum member (uses OwnedLogEntry)
     AppendEntries { id: u64, entry: Arc<OwnedLogEntry>, commit_index: u64, parent_span: Span },
-    /// Backfill log entries to this quorum member
-    /// Still uses Vec<Arc<SerializationData>> because:
-    /// 1. The replication log stores SerializationData
-    /// 2. We convert to network format at the boundary in capnp_worker
-    BackfillLog { data: Vec<Arc<SerializationData>> },
+    /// Backfill log entries to this quorum member (uses OwnedLogEntry)
+    BackfillLog { data: Vec<Arc<OwnedLogEntry>> },
     /// Write a batch of requests (uses OwnedWriteBatch internally via WriteBatch)
     WriteBatch { write_batch: WriteBatch },
     /// Truncate log to this term/index on quorum member
