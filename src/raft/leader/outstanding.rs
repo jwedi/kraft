@@ -1,5 +1,5 @@
 use std::sync::atomic::Ordering;
-use tracing::{Level, Span};
+use tracing::Level;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::persistence::worker::PersistenceResponseType;

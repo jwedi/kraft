@@ -1,7 +1,6 @@
 use prometheus::{Encoder, TextEncoder};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use crate::transport::metrics::METRICS_REGISTRY;

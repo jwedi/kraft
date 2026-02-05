@@ -3,7 +3,7 @@ pub mod election;
 
 use std::sync::atomic::Ordering;
 use tokio::sync::oneshot;
-use tracing::{Level, Span};
+use tracing::Level;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::persistence::worker::PersistenceResponseType;
@@ -13,7 +13,6 @@ use crate::raft::raft_sm::{
     LocalRaftResponsePayload, LocalRequestVoteRequest, OutstandingMessage,
     OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, SharedState,
 };
-use crate::service_utils::app_time::now_millis;
 
 use election::ElectionTimer;
 
@@ -151,7 +150,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 PersistenceResponseType::LogPersisted { id } => {
                     self.handle_log_persisted(id, shared_state);
                 }
-                PersistenceResponseType::VotePersisted { id, term, candidate_id } => {
+                PersistenceResponseType::VotePersisted { id, term: _, candidate_id: _ } => {
                     self.handle_vote_persisted(id, shared_state);
                 }
                 _ => {
@@ -165,7 +164,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             work_done += 1;
             match task.response_type {
                 LocalQuorumTaskResponseType::TruncateLog {
-                    quorum_node_id,
+                    quorum_node_id: _,
                     prev_term,
                     prev_index,
                 } => {

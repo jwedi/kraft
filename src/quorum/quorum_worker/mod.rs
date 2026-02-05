@@ -7,8 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_queue::SegQueue;
-use log::info;
-use tracing::Span;
 
 use crate::quorum::types::{
     LocalQuorumWorkerTask, LocalQuorumWorkerTaskType,
@@ -17,7 +15,7 @@ use crate::quorum::types::{
 use crate::raft::raft_sm::{LocalRaftMessage, LocalRaftResponseMessage};
 use crate::transport::capnp::owned_message::OwnedQuorumMessage;
 use crate::transport::cluster_stream_manager::ClusterStreamManager;
-use crate::transport::write_proxy::{WriteBatch, WriteResponse};
+use crate::transport::write_proxy::WriteResponse;
 use tokio::sync::oneshot;
 use tokio::task::yield_now;
 use tokio::time::Instant;

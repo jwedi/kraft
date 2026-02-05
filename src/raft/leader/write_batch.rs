@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{Level, Span};
+use tracing::Span;
 
 use crate::persistence::worker::PersistenceTaskType;
 use crate::quorum::types::{LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};

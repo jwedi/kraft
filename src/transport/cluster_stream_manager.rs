@@ -3,7 +3,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::{oneshot, RwLock};
-use tokio::sync::oneshot::error::RecvError;
 use crate::config::config::ClusterNode;
 use crate::transport::capnp::owned_message::OwnedQuorumMessage;
 use crate::transport::capnp::message_sender::MessageSender;

@@ -1,14 +1,12 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use log::error;
 use tokio::sync::oneshot;
-use tracing::{Level, Span};
+use tracing::Span;
 
 use crate::persistence::worker::PersistenceTaskType;
 use crate::raft::raft_sm::{
     LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftResponseMessage,
-    LocalRaftResponsePayload, OutstandingMessage, OutstandingMessageType,
-    RaftMessageStateChange, SharedState,
+    LocalRaftResponsePayload, OutstandingMessage, OutstandingMessageType, SharedState,
 };
 use crate::transport::capnp::OwnedLogEntry;
 
@@ -97,7 +95,6 @@ pub fn handle_heartbeat(
     shared_state: &mut SharedState,
     election_timer: &mut ElectionTimer,
 ) {
-    // Reset election timeout on heartbeat
     election_timer.reset();
 
     let last_log_term = shared_state.volatile_server_state.last_log_term;

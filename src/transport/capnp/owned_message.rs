@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use log::info;
 use super::raft_capnp::remote_quorum_message;
 use super::internal_message::{OwnedWriteBatch, OwnedWriteBatchResponse, OwnedLogEntry};
 

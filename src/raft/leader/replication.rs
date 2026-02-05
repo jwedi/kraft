@@ -114,7 +114,11 @@ fn handle_follower_ahead(
     send_truncate_signal(shared_state, quorum_node_id, our_last_term, our_last_index);
 }
 
-/// Handles term mismatch by finding the last matching entry and sending truncate signal.
+/// Handles a term mismatch between leader and follower logs.
+///
+/// Walks backwards through the log to find the last entry with a matching term,
+/// then sends a truncate signal to the follower. This implements the Raft log
+/// consistency check - if terms don't match, we need to find where they diverged.
 fn handle_term_mismatch(
     shared_state: &mut SharedState,
     quorum_node_id: u64,

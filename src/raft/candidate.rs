@@ -1,7 +1,4 @@
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
-use crossbeam_queue::SegQueue;
 use log::{error, info};
 use rand::Rng;
 use rand::rngs::ThreadRng;
@@ -9,10 +6,10 @@ use tokio::sync::oneshot;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
-use crate::quorum::types::{LocalQuorumResponse, LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
+use crate::quorum::types::{LocalQuorumWorkerTask, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::raft::leader::RaftLeaderStateDelegate;
-use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, RaftServerState, RaftVolatileState, LocalRequestVoteRequest, SharedState, TermVote};
+use crate::raft::raft_sm::{LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, LocalRaftResponseMessage, LocalRaftResponsePayload, LocalRequestVoteRequest, SharedState};
 use crate::service_utils::app_time::{now_millis, now_plus_duration_millis};
 
 struct OngoingElection {
@@ -109,7 +106,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         while let Some(task) = shared_state.persistence_response.pop() {
             work_done += 1;
             match task {
-                PersistenceResponseType::VotePersisted { id, term, candidate_id } => {
+                PersistenceResponseType::VotePersisted { id, term, candidate_id: _ } => {
                     if let Some(mut msg) = shared_state.outstanding_messages.remove(&id) {
                         let span_clone = msg.span.clone();
                         let _entered = span_clone.enter();
@@ -123,7 +120,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
                                 }
                             }
 
-                            OutstandingMessageType::CandidateElection{persistence_done, quorum_votes} => {
+                            OutstandingMessageType::CandidateElection{persistence_done: _, quorum_votes} => {
 
                                 if quorum_votes >= shared_state.quorum_size {
                                     // Candidate election done, Transition to leader.
@@ -181,7 +178,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
         while let Some(task) = shared_state.quorum_response.pop() {
             work_done += 1;
             match task.response_type {
-                LocalQuorumTaskResponseType::TruncateLog { quorum_node_id, prev_term, prev_index } => {
+                LocalQuorumTaskResponseType::TruncateLog { .. } => {
                     log::info!("Received truncate log request while candidate, ignoring");
                 }
                 LocalQuorumTaskResponseType::RequestVoteResponse { id, term, received_vote } => {
@@ -281,7 +278,7 @@ impl RaftProtocol for RaftCandidateStateDelegate {
             log::warn!("Initiating election due to timeout {}, now {}, id {}", self.initiate_election_timeout, now, message_id);
             shared_state.next_message_id += 1;
             let next_term = shared_state.volatile_server_state.next_term; // TODO should be larger than any term previously proposed.
-            if let Some(already_voted) = shared_state.term_votes.get(&next_term) {
+            if shared_state.term_votes.get(&next_term).is_some() {
                 log::error!("trying to start an election for a term it has already voted {}", next_term)
             }
             shared_state.volatile_server_state.next_term = next_term+1;

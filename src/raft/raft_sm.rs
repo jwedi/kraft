@@ -12,8 +12,7 @@ use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
 use crate::quorum::types::{LocalQuorumResponse, LocalQuorumWorkerTask};
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::transport::capnp::{OwnedWriteBatch, OwnedWriteBatchResponse, OwnedLogEntry, build_owned_write_batch_response};
-use crate::transport::write_proxy::{WriteBatch, WriteResponse};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use bus::Bus;
 use log::{info, warn};
 
@@ -541,7 +540,7 @@ mod integration_tests {
     use super::*;
     use crate::raft::leader::RaftLeaderStateDelegate;
     use crate::raft::follower::RaftFollowerStateDelegate;
-    use crate::quorum::types::{LocalQuorumResponse, LocalQuorumTaskResponseType, LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
+    use crate::quorum::types::{LocalQuorumResponse, LocalQuorumTaskResponseType, LocalQuorumWorkerTaskType};
     use crate::transport::capnp::build_owned_log_entry;
     use std::collections::HashMap;
     use std::sync::Arc;

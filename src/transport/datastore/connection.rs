@@ -125,7 +125,7 @@ async fn handle_put_record(payload: Bytes, queues: &Queues) -> Bytes {
     // Build Cap'n Proto write batch
     let write_batch_message = build_owned_write_batch(|mut builder| {
         builder.set_batch_id(&batch_id);
-        let mut requests = builder.init_requests(1);
+        let requests = builder.init_requests(1);
         let mut put_req = requests.get(0);
         put_req.set_id(&key);
         put_req.set_payload(&value);

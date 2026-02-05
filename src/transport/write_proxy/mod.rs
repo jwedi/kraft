@@ -165,7 +165,7 @@ impl WriteProxy {
         match resp {
             Ok(m) => match &m.payload {
                 LocalRaftResponsePayload::RaftState { leader_id } => {
-                    if *leader_id <= 0 {
+                    if *leader_id == 0 {
                         None
                     } else {
                         Some(*leader_id)
@@ -262,8 +262,7 @@ impl WriteProxy {
         let mut leader_resync = Instant::now();
 
         loop {
-            // Check leader periodically
-            if current_leader_id <= 0 || leader_resync.elapsed().as_millis() > 1 {
+            if current_leader_id == 0 || leader_resync.elapsed().as_millis() > 1 {
                 match self.get_current_leader().await {
                     Some(leader_id) => {
                         if leader_id != current_leader_id {

@@ -1,8 +1,6 @@
 use std::sync;
 use std::sync::atomic::Ordering;
-use tokio::runtime::Runtime;
-use tokio::sync::oneshot;
-use crate::service_utils::errors::{ServiceError};
+use crate::service_utils::errors::ServiceError;
 use crate::service_utils::errors::ServiceError::{RaceConditionError, ThrottlingError};
 use crate::runtime_core::types::{RuntimeTask};
 

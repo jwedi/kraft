@@ -9,26 +9,22 @@ pub struct LocalQuorumWorkerTask {
 }
 
 /// Task types for quorum worker
-/// Uses OwnedLogEntry (Cap'n Proto) for all log entries.
 pub enum LocalQuorumWorkerTaskType {
-    /// Start sending heartbeats to this quorum member
+    /// Start sending heartbeats to this quorum member.
     StartHeartbeats { id: u64, term: u64, prev_term: u64, prev_log_index: u64, commit_index: u64 },
-    /// Stop sending heartbeats to this quorum member
+    /// Stop sending heartbeats to this quorum member.
     StopHeartbeats { id: u64 },
-    /// Request a vote from this quorum member
+    /// Request a vote from this quorum member.
     RequestVote { id: u64, term: u64, last_term: u64, last_index: u64, parent_span: Span },
-    /// Append a log entry to this quorum member (uses OwnedLogEntry)
+    /// Append a log entry to this quorum member.
     AppendEntries { id: u64, entry: Arc<OwnedLogEntry>, commit_index: u64, parent_span: Span },
-    /// Backfill log entries to this quorum member (uses OwnedLogEntry)
+    /// Backfill log entries to this quorum member.
     BackfillLog { data: Vec<Arc<OwnedLogEntry>> },
-    /// Write a batch of requests (uses OwnedWriteBatch internally via WriteBatch)
+    /// Write a batch of requests.
     WriteBatch { write_batch: WriteBatch },
-    /// Truncate log to this term/index on quorum member
+    /// Truncate log to specified term/index on the quorum member.
     TruncateLog { id: u64, prev_term: u64, prev_index: u64, parent_span: Span },
-    /// Update commit index and send immediate heartbeat to follower
-    /// This is sent after a write batch is committed to ensure followers
-    /// learn about the new commit_index promptly (without waiting for the
-    /// next periodic heartbeat).
+    /// Notify follower of new commit index via immediate heartbeat.
     UpdateCommitIndex { commit_index: u64 },
 }
 

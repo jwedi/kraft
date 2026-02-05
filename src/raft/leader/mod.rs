@@ -9,8 +9,6 @@ mod write_batch;
 mod outstanding;
 mod replication;
 
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use log::info;
 use rand::rngs::ThreadRng;
 use rand::Rng;

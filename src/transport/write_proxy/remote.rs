@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use crossbeam_queue::SegQueue;
 use log::warn;
-use opentelemetry::trace::TraceContextExt;
 use tokio::sync::oneshot::{Receiver, Sender};
 use tokio::sync::oneshot;
 use tracing::{Instrument, Level, Span};

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use dashmap::DashMap;
 use log::info;
-use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 
 use super::owned_message::OwnedQuorumMessage;
