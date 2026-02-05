@@ -8,7 +8,7 @@ use tokio::join;
 use tracing_subscriber::{Layer, layer::SubscriberExt, Registry};
 
 use kraft_lib::config::config::{read_config, ClusterNode};
-use kraft_lib::transport::capnp_stream_manager::CapnpStreamManager;
+use kraft_lib::transport::cluster_stream_manager::ClusterStreamManager;
 use kraft_lib::{startup, transport};
 
 /// Initialize OpenTelemetry tracing if enabled.
@@ -50,16 +50,16 @@ fn init_tracing(node_id: u32, enable_otel: bool) -> Option<SDKTracer> {
 }
 
 /// Creates the Cap'n Proto stream manager for cluster communication.
-fn create_capnp_stream_manager(
+fn create_cluster_stream_manager(
     node_id: u32,
     cluster_nodes: &[ClusterNode],
     cluster_port: u32,
-) -> Arc<CapnpStreamManager> {
+) -> Arc<ClusterStreamManager> {
     let capnp_addr: std::net::SocketAddr = format!("[::1]:{}", cluster_port)
         .parse()
         .expect("Invalid cluster_port");
 
-    Arc::new(CapnpStreamManager::new(
+    Arc::new(ClusterStreamManager::new(
         node_id,
         cluster_nodes.to_vec(),
         capnp_addr,
@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     // Create Cap'n Proto stream manager for cluster communication
-    let capnp_stream_manager = create_capnp_stream_manager(
+    let cluster_stream_manager = create_cluster_stream_manager(
         node_id,
         &cluster_nodes_without_self,
         cfg.cluster_port,
@@ -120,11 +120,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create quorum workers
     log::info!("Using Cap'n Proto transport for cluster communication");
 
-    let (cluster_workers, quorum_send_channels) = startup::create_capnp_quorum_workers(
+    let (cluster_workers, quorum_send_channels) = startup::create_quorum_workers(
         &queues,
         &cluster_nodes_without_self,
         node_id,
-        Arc::clone(&capnp_stream_manager),
+        Arc::clone(&cluster_stream_manager),
         cfg.max_message_size_bytes,
     );
 
@@ -165,10 +165,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let persistence_handle = startup::spawn_persistence_worker(persistence_worker);
 
     // Start Cap'n Proto listener
-    let capnp_listener_handle = startup::spawn_capnp_listener(Arc::clone(&capnp_stream_manager));
+    let capnp_listener_handle = startup::spawn_capnp_listener(Arc::clone(&cluster_stream_manager));
 
     // Spawn cluster workers
-    let cluster_worker_handles = startup::spawn_capnp_quorum_workers(cluster_workers);
+    let cluster_worker_handles = startup::spawn_quorum_workers(cluster_workers);
 
     // Start metrics server
     let metrics_handle = startup::spawn_metrics_server(cfg.metrics_port);

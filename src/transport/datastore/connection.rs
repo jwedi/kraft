@@ -18,9 +18,9 @@ use uuid::Uuid;
 use crate::query::worker::{QueryRequest, QueryResponse};
 use crate::transport::capnp::raft_capnp;
 use crate::transport::capnp::{build_owned_write_batch, build_owned_write_batch_response};
-use crate::transport::tcp_datastore::codec::{read_frame, write_frame};
-use crate::transport::tcp_datastore::rpc::{RPC_GET_RECORD, RPC_PUT_RECORD};
-use crate::transport::tcp_datastore::server::Queues;
+use crate::transport::datastore::codec::{read_frame, write_frame};
+use crate::transport::datastore::rpc::{RPC_GET_RECORD, RPC_PUT_RECORD};
+use crate::transport::datastore::server::Queues;
 use crate::transport::write_proxy::{WriteBatch, WriteResponse};
 
 /// Response message to be written back to the client.

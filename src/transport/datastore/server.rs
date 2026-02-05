@@ -9,7 +9,7 @@ use tokio::net::TcpListener;
 
 use crate::query::worker::QueryRequest;
 use crate::raft::raft_sm::CommitState;
-use crate::transport::tcp_datastore::connection;
+use crate::transport::datastore::connection;
 use crate::transport::write_proxy::WriteBatch;
 
 /// Shared queues for all connections.
@@ -21,12 +21,12 @@ pub struct Queues {
 }
 
 /// TCP-based datastore server using length-prefixed framing and Cap'n Proto serialization.
-pub struct TcpDatastoreServer {
+pub struct DatastoreServer {
     listen_addr: SocketAddr,
     queues: Queues,
 }
 
-impl TcpDatastoreServer {
+impl DatastoreServer {
     /// Create a new TCP datastore server.
     pub fn new(
         listen_addr: SocketAddr,

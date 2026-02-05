@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 
 mod transport {
-    pub mod tcp_datastore {
+    pub mod datastore {
         pub mod codec;
         #[allow(dead_code)]
         pub mod rpc {
@@ -42,8 +42,8 @@ mod transport {
 }
 
 use transport::capnp::raft_capnp;
-use transport::tcp_datastore::codec::{read_frame, write_frame};
-use transport::tcp_datastore::rpc::{RPC_GET_RECORD, RPC_PUT_RECORD};
+use transport::datastore::codec::{read_frame, write_frame};
+use transport::datastore::rpc::{RPC_GET_RECORD, RPC_PUT_RECORD};
 
 // ============================================================================
 // Configuration
@@ -711,10 +711,10 @@ async fn main() -> io::Result<()> {
     info!("Endpoints: {:?}", config.endpoints);
 
     // Run write load test
-    do_write_batch_async(&config).await?;
+    //do_write_batch_async(&config).await?;
 
     // Uncomment to run other tests:
-    //do_get_record_async(&config).await?;
+    do_get_record_async(&config).await?;
     // do_mixed_operations_async(&config, 0.2).await?;
 
     info!("Load test complete");

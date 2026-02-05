@@ -16,7 +16,7 @@ use crate::quorum::types::{
 };
 use crate::raft::raft_sm::{LocalRaftMessage, LocalRaftResponseMessage};
 use crate::transport::capnp::owned_message::OwnedQuorumMessage;
-use crate::transport::capnp_stream_manager::CapnpStreamManager;
+use crate::transport::cluster_stream_manager::ClusterStreamManager;
 use crate::transport::write_proxy::{WriteBatch, WriteResponse};
 use tokio::sync::oneshot;
 use tokio::task::yield_now;
@@ -47,16 +47,16 @@ pub(crate) struct PendingQuorumTask {
     pub start_time: std::time::Instant,
 }
 
-/// Cap'n Proto version of QuorumWorker with zero-copy message handling.
+/// Quorum worker with zero-copy message handling.
 /// Handles communication with a single remote cluster node.
-pub struct CapnpQuorumWorker {
+pub struct QuorumWorker {
     // Queues for inter-process communication
     work_queue: Arc<SegQueue<LocalQuorumWorkerTask>>,
     response_queue: Arc<SegQueue<LocalQuorumResponse>>,
     task_queue: Arc<SegQueue<LocalRaftMessage>>,
 
     // Cap'n Proto transport
-    stream_manager: Arc<CapnpStreamManager>,
+    stream_manager: Arc<ClusterStreamManager>,
     outbound_tx: Option<Sender<OwnedQuorumMessage>>,
     inbound_rx: Option<Receiver<OwnedQuorumMessage>>,
 
@@ -85,7 +85,7 @@ pub struct CapnpQuorumWorker {
     max_message_size_bytes: usize,
 }
 
-impl CapnpQuorumWorker {
+impl QuorumWorker {
     pub fn new(
         work_queue: Arc<SegQueue<LocalQuorumWorkerTask>>,
         response_queue: Arc<SegQueue<LocalQuorumResponse>>,
@@ -93,7 +93,7 @@ impl CapnpQuorumWorker {
         next_index: u64,
         member_id: u64,
         member_endpoint: String,
-        stream_manager: Arc<CapnpStreamManager>,
+        stream_manager: Arc<ClusterStreamManager>,
         task_queue: Arc<SegQueue<LocalRaftMessage>>,
         max_message_size_bytes: usize,
     ) -> Self {
@@ -126,7 +126,7 @@ impl CapnpQuorumWorker {
     // =========================================================================
 
     pub async fn run(&mut self) {
-        log::info!("Running Cap'n Proto quorum worker for member {}", self.member_id);
+        log::info!("Running quorum worker for member {}", self.member_id);
         let mut pending_tasks: Vec<PendingQuorumTask> = vec![];
 
         let desired_cadence_micros = 25;
