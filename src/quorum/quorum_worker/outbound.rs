@@ -1,27 +1,22 @@
-use std::sync::Arc;
 use crossbeam_channel::Sender;
 use log::error;
+use std::sync::Arc;
 use tracing::Span;
 
+use super::PendingWriteBatch;
 use crate::service_utils::app_time::now_millis;
 use crate::transport::capnp::owned_message::OwnedQuorumMessage;
 use crate::transport::capnp::{
-    build_heartbeat_message, build_vote_request_message,
-    build_truncate_log_request_message,
-    build_append_entries_message, OwnedLogEntry,
+    build_append_entries_message, build_heartbeat_message, build_truncate_log_request_message,
+    build_vote_request_message, OwnedLogEntry,
 };
 use crate::transport::write_proxy::WriteBatch;
-use super::PendingWriteBatch;
 
 const HEARTBEAT_INTERVAL_MS: u128 = 100;
 
 /// Sends a message through the outbound channel.
 /// Returns true if the message was sent successfully.
-pub fn send_message(
-    outbound_tx: &Option<Sender<OwnedQuorumMessage>>,
-    msg: OwnedQuorumMessage,
-    member_id: u64,
-) -> bool {
+pub fn send_message(outbound_tx: &Option<Sender<OwnedQuorumMessage>>, msg: OwnedQuorumMessage, member_id: u64) -> bool {
     if let Some(ref tx) = outbound_tx {
         if tx.send(msg).is_err() {
             log::warn!("Failed to send message to member {}", member_id);
@@ -30,10 +25,7 @@ pub fn send_message(
             true
         }
     } else {
-        log::warn!(
-            "failed to send message to member {}, outbound_tx is empty",
-            member_id
-        );
+        log::warn!("failed to send message to member {}, outbound_tx is empty", member_id);
         false
     }
 }
@@ -197,7 +189,8 @@ pub fn send_backfill_entries(
         entries.len(),
         first.map_or("None".to_string(), |e| format!(
             "prev_term: {}, prev_index: {}",
-            e.prev_log_term(), e.prev_log_index()
+            e.prev_log_term(),
+            e.prev_log_index()
         ))
     );
 
@@ -238,17 +231,20 @@ mod tests {
         send_heartbeat_if_needed(
             true, // send_heartbeats enabled
             &mut last_heartbeat,
-            1,    // term
-            1,    // self_id
-            0,    // prev_log_index
-            0,    // prev_log_term
-            5,    // commit_index
+            1, // term
+            1, // self_id
+            0, // prev_log_index
+            0, // prev_log_term
+            5, // commit_index
             &outbound_tx,
-            2,    // member_id
+            2, // member_id
         );
 
         // Heartbeat should have been sent
-        assert!(rx.try_recv().is_ok(), "Expected heartbeat to be sent when last_heartbeat is 0");
+        assert!(
+            rx.try_recv().is_ok(),
+            "Expected heartbeat to be sent when last_heartbeat is 0"
+        );
         // last_heartbeat should be updated to current time
         assert!(last_heartbeat > 0, "Expected last_heartbeat to be updated");
     }
@@ -260,13 +256,7 @@ mod tests {
         let outbound_tx = Some(tx);
         let mut last_heartbeat = now_millis(); // Just sent
 
-        send_heartbeat_if_needed(
-            true,
-            &mut last_heartbeat,
-            1, 1, 0, 0, 5,
-            &outbound_tx,
-            2,
-        );
+        send_heartbeat_if_needed(true, &mut last_heartbeat, 1, 1, 0, 0, 5, &outbound_tx, 2);
 
         // No heartbeat should have been sent
         assert!(rx.try_recv().is_err(), "Expected no heartbeat when recently sent");
@@ -282,7 +272,11 @@ mod tests {
         send_heartbeat_if_needed(
             false, // send_heartbeats disabled
             &mut last_heartbeat,
-            1, 1, 0, 0, 5,
+            1,
+            1,
+            0,
+            0,
+            5,
             &outbound_tx,
             2,
         );
@@ -301,16 +295,13 @@ mod tests {
         // Set last_heartbeat to well in the past
         let mut last_heartbeat = now_millis().saturating_sub(HEARTBEAT_INTERVAL_MS + 10);
 
-        send_heartbeat_if_needed(
-            true,
-            &mut last_heartbeat,
-            1, 1, 0, 0, 5,
-            &outbound_tx,
-            2,
-        );
+        send_heartbeat_if_needed(true, &mut last_heartbeat, 1, 1, 0, 0, 5, &outbound_tx, 2);
 
         // Heartbeat should have been sent
-        assert!(rx.try_recv().is_ok(), "Expected heartbeat to be sent after interval elapsed");
+        assert!(
+            rx.try_recv().is_ok(),
+            "Expected heartbeat to be sent after interval elapsed"
+        );
     }
 
     #[test]
@@ -330,13 +321,19 @@ mod tests {
         // Verify no immediate second heartbeat
         let saved_heartbeat = last_heartbeat;
         send_heartbeat_if_needed(true, &mut last_heartbeat, 1, 1, 0, 0, 5, &outbound_tx, 2);
-        assert!(rx.try_recv().is_err(), "Second heartbeat should not be sent immediately");
+        assert!(
+            rx.try_recv().is_err(),
+            "Second heartbeat should not be sent immediately"
+        );
 
         // Reset last_heartbeat to 0 (simulating UpdateCommitIndex)
         last_heartbeat = 0;
 
         // Now heartbeat should be sent immediately with updated commit_index
         send_heartbeat_if_needed(true, &mut last_heartbeat, 1, 1, 0, 0, 10, &outbound_tx, 2);
-        assert!(rx.try_recv().is_ok(), "Heartbeat should be sent after last_heartbeat reset");
+        assert!(
+            rx.try_recv().is_ok(),
+            "Heartbeat should be sent after last_heartbeat reset"
+        );
     }
 }

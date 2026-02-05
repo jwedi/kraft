@@ -1,12 +1,12 @@
 use std::sync::atomic::Ordering;
-use tracing::{Level, Span};
+use tracing::Level;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::persistence::worker::PersistenceResponseType;
 use crate::quorum::types::{LocalQuorumTaskResponseType, LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
 use crate::raft::raft_sm::{
-    LocalRaftResponseMessage, LocalRaftResponsePayload, LocalRaftWriteBatchResponse,
-    OutstandingMessageType, SharedState,
+    LocalRaftResponseMessage, LocalRaftResponsePayload, LocalRaftWriteBatchResponse, OutstandingMessageType,
+    SharedState,
 };
 use crate::transport::capnp::build_owned_write_batch_response;
 
@@ -20,11 +20,12 @@ pub fn process_persistence_responses(shared_state: &mut SharedState) -> u64 {
             PersistenceResponseType::LogPersisted { id } => {
                 handle_log_persisted(id, shared_state);
             }
-            PersistenceResponseType::VotePersisted { id, term: _, candidate_id: _ } => {
+            PersistenceResponseType::VotePersisted {
+                id,
+                term: _,
+                candidate_id: _,
+            } => {
                 handle_vote_persisted(id, shared_state);
-            }
-            _ => {
-                log::error!("Persistence event not valid in current state");
             }
         }
     }
@@ -123,15 +124,16 @@ fn handle_vote_persisted(id: u64, shared_state: &mut SharedState) {
             }
         }
     } else {
-        tracing::error!("Received persistence event with no outstanding message registered {}", id);
+        tracing::error!(
+            "Received persistence event with no outstanding message registered {}",
+            id
+        );
     }
 }
 
 /// Processes quorum responses from quorum workers.
 /// Returns (backfill_requests, work_done_count).
-pub fn process_quorum_responses(
-    shared_state: &mut SharedState,
-) -> (Vec<(u64, u64, u64)>, u64) {
+pub fn process_quorum_responses(shared_state: &mut SharedState) -> (Vec<(u64, u64, u64)>, u64) {
     let mut backfill_requests = Vec::new();
     let mut count: u64 = 0;
 
@@ -148,7 +150,11 @@ pub fn process_quorum_responses(
             } => {
                 backfill_requests.push((quorum_node_id, last_log_term, last_log_index));
             }
-            LocalQuorumTaskResponseType::RequestVoteResponse { id: _, term, received_vote } => {
+            LocalQuorumTaskResponseType::RequestVoteResponse {
+                id: _,
+                term,
+                received_vote,
+            } => {
                 log::info!(
                     "Received vote response for term: {} while already leader for term: {} received_vote: {}",
                     term,
@@ -307,7 +313,10 @@ fn complete_write_batch(
 /// Completes a no-op entry by updating commit state.
 /// No callback is needed since no-op entries are internal to the leader.
 fn complete_noop(id: u64, index: u64, shared_state: &mut SharedState) {
-    log::debug!("No-op entry with message id {} has been persisted on quorum of nodes", id);
+    log::debug!(
+        "No-op entry with message id {} has been persisted on quorum of nodes",
+        id
+    );
 
     if index > shared_state.volatile_server_state.commit_index {
         shared_state.volatile_server_state.commit_index = index;
@@ -347,8 +356,7 @@ mod tests {
     use crate::persistence::worker::PersistenceResponseType;
     use crate::quorum::types::{LocalQuorumResponse, LocalQuorumTaskResponseType};
     use crate::raft::raft_sm::{
-        CommitState, OutstandingMessage, RaftServerState, RaftVolatileState, SharedState,
-        StateMachineConfig,
+        CommitState, OutstandingMessage, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig,
     };
     use bus::Bus;
     use crossbeam_channel::unbounded;
@@ -476,9 +484,7 @@ mod tests {
 
         let msg = shared_state.outstanding_messages.get(&42).unwrap();
         match &msg.message_type {
-            OutstandingMessageType::WriteBatch {
-                persistence_done, ..
-            } => {
+            OutstandingMessageType::WriteBatch { persistence_done, .. } => {
                 assert!(*persistence_done);
             }
             _ => panic!("Expected WriteBatch"),
@@ -688,7 +694,10 @@ mod tests {
 
         // Verify no UpdateCommitIndex was dispatched (since commit_index didn't advance)
         for queue in &shared_state.quorum_worker_tasks {
-            assert!(queue.pop().is_none(), "Should not dispatch UpdateCommitIndex when commit_index doesn't advance");
+            assert!(
+                queue.pop().is_none(),
+                "Should not dispatch UpdateCommitIndex when commit_index doesn't advance"
+            );
         }
     }
 
@@ -757,9 +766,7 @@ mod tests {
 
         let msg = shared_state.outstanding_messages.get(&42).unwrap();
         match &msg.message_type {
-            OutstandingMessageType::NoOp {
-                persistence_done, ..
-            } => {
+            OutstandingMessageType::NoOp { persistence_done, .. } => {
                 assert!(*persistence_done);
             }
             _ => panic!("Expected NoOp"),

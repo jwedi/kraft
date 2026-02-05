@@ -1,7 +1,6 @@
-use std::sync::Arc;
-use log::info;
+use super::internal_message::{OwnedLogEntry, OwnedWriteBatch, OwnedWriteBatchResponse};
 use super::raft_capnp::remote_quorum_message;
-use super::internal_message::{OwnedWriteBatch, OwnedWriteBatchResponse, OwnedLogEntry};
+use std::sync::Arc;
 
 /// Zero-copy message wrapper - owns the serialized bytes via Arc.
 /// Can be cloned and sent to multiple crossbeam queues without copying the data.
@@ -16,10 +15,7 @@ impl OwnedQuorumMessage {
     pub fn from_bytes(bytes: Vec<u8>) -> capnp::Result<Self> {
         // Validate by parsing once
         let mut slice: &[u8] = &bytes;
-        let _ = capnp::serialize::read_message_from_flat_slice(
-            &mut slice,
-            capnp::message::ReaderOptions::default(),
-        )?;
+        let _ = capnp::serialize::read_message_from_flat_slice(&mut slice, capnp::message::ReaderOptions::default())?;
         Ok(Self { bytes: bytes.into() })
     }
 
@@ -109,11 +105,7 @@ pub fn build_vote_request_message(
 }
 
 /// Build a vote response message
-pub fn build_vote_response_message(
-    vote_granted: bool,
-    request_id: u64,
-    term: u64,
-) -> OwnedQuorumMessage {
+pub fn build_vote_response_message(vote_granted: bool, request_id: u64, term: u64) -> OwnedQuorumMessage {
     build_owned_message(|mut msg| {
         let mut resp = msg.init_message_payload().init_vote_response();
         resp.set_vote_granted(vote_granted);
@@ -151,8 +143,8 @@ pub fn build_append_entries_message(
                 entry_builder.set_prev_log_term(reader.get_prev_log_term());
                 entry_builder.set_message_id(reader.get_message_id());
                 entry_builder.set_batch_index(reader.get_index()); // batch_index = index
-                // Set data to full Cap'n Proto bytes for network transmission
-                // Followers will parse this with OwnedLogEntry::from_bytes()
+                                                                   // Set data to full Cap'n Proto bytes for network transmission
+                                                                   // Followers will parse this with OwnedLogEntry::from_bytes()
                 entry_builder.set_data(log_entry.as_bytes());
             }) {
                 Ok(_) => {}
@@ -226,8 +218,12 @@ pub fn build_put_batch_response_message(response: &OwnedWriteBatchResponse, batc
                     if let Ok(response_type) = r.get_response_type() {
                         out.set_response_type(match response_type {
                             super::raft_capnp::RemoteResponseType::Ok => super::raft_capnp::RemoteResponseType::Ok,
-                            super::raft_capnp::RemoteResponseType::Invalid => super::raft_capnp::RemoteResponseType::Invalid,
-                            super::raft_capnp::RemoteResponseType::Unspecified => super::raft_capnp::RemoteResponseType::Unspecified,
+                            super::raft_capnp::RemoteResponseType::Invalid => {
+                                super::raft_capnp::RemoteResponseType::Invalid
+                            }
+                            super::raft_capnp::RemoteResponseType::Unspecified => {
+                                super::raft_capnp::RemoteResponseType::Unspecified
+                            }
                         });
                     }
                     if let Ok(message) = r.get_message() {
@@ -262,10 +258,7 @@ pub fn build_truncate_log_request_message(
 }
 
 /// Build a truncate log response message
-pub fn build_truncate_log_response_message(
-    request_id: u64,
-    ok: bool,
-) -> OwnedQuorumMessage {
+pub fn build_truncate_log_response_message(request_id: u64, ok: bool) -> OwnedQuorumMessage {
     build_owned_message(|mut msg| {
         let mut resp = msg.init_message_payload().init_truncate_log_response();
         resp.set_request_id(request_id);

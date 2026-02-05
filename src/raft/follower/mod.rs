@@ -3,17 +3,16 @@ pub mod election;
 
 use std::sync::atomic::Ordering;
 use tokio::sync::oneshot;
-use tracing::{Level, Span};
+use tracing::Level;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::persistence::worker::PersistenceResponseType;
 use crate::quorum::types::LocalQuorumTaskResponseType;
 use crate::raft::raft_sm::{
-    LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftResponseMessage,
-    LocalRaftResponsePayload, LocalRequestVoteRequest, OutstandingMessage,
-    OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol, SharedState,
+    LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftResponseMessage, LocalRaftResponsePayload,
+    LocalRequestVoteRequest, OutstandingMessage, OutstandingMessageType, RaftMessageStateChange, RaftNodeType,
+    RaftProtocol, SharedState,
 };
-use crate::service_utils::app_time::now_millis;
 
 use election::ElectionTimer;
 
@@ -35,7 +34,10 @@ impl RaftFollowerStateDelegate {
 
         // Truncate the replication log to the specified point
         if target_length < shared_state.volatile_server_state.replication_log.len() {
-            shared_state.volatile_server_state.replication_log.truncate(target_length);
+            shared_state
+                .volatile_server_state
+                .replication_log
+                .truncate(target_length);
             log::info!("Truncated replication log to length {}", target_length);
 
             // Update the volatile state to reflect the new log end
@@ -129,11 +131,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
 
             append_entries::apply_log_entry(append_entries_request, callback, shared_state);
         } else {
-            append_entries::send_unrecognized_leader_response(
-                &append_entries_request,
-                callback,
-                shared_state,
-            );
+            append_entries::send_unrecognized_leader_response(&append_entries_request, callback, shared_state);
         }
 
         tracing::debug!("reset election timeout for term: {}", request_term);
@@ -151,11 +149,12 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 PersistenceResponseType::LogPersisted { id } => {
                     self.handle_log_persisted(id, shared_state);
                 }
-                PersistenceResponseType::VotePersisted { id, term, candidate_id } => {
+                PersistenceResponseType::VotePersisted {
+                    id,
+                    term: _,
+                    candidate_id: _,
+                } => {
                     self.handle_vote_persisted(id, shared_state);
-                }
-                _ => {
-                    tracing::error!("Persistence event not valid in current state");
                 }
             }
         }
@@ -165,7 +164,7 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             work_done += 1;
             match task.response_type {
                 LocalQuorumTaskResponseType::TruncateLog {
-                    quorum_node_id,
+                    quorum_node_id: _,
                     prev_term,
                     prev_index,
                 } => {
@@ -200,9 +199,6 @@ impl RaftProtocol for RaftFollowerStateDelegate {
                 }
                 LocalQuorumTaskResponseType::TruncateLogResponse { .. } => {
                     log::warn!("Received invalid quorum response message in current state: TruncateLogResponse");
-                }
-                _ => {
-                    log::error!("Received invalid quorum response message in current state");
                 }
             }
         }
@@ -256,7 +252,9 @@ impl RaftProtocol for RaftFollowerStateDelegate {
             message_type,
             span: response_span,
         };
-        shared_state.outstanding_messages.insert(message_id, outstanding_message);
+        shared_state
+            .outstanding_messages
+            .insert(message_id, outstanding_message);
         RaftMessageStateChange::None
     }
 }
@@ -271,18 +269,16 @@ impl RaftFollowerStateDelegate {
 
             match msg.message_type {
                 OutstandingMessageType::AppendLog { callback } => {
-                    let payload =
-                        LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok);
+                    let payload = LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok);
                     let response = LocalRaftResponseMessage { payload };
                     if callback.send(response).is_err() {
-                        tracing::error!(
-                            "Writing log persisted callback failed because reader closed channel"
-                        );
+                        tracing::error!("Writing log persisted callback failed because reader closed channel");
                     }
                 }
                 _ => {
                     tracing::error!(
-                        message = "Received unexpected outstanding_messages type for PersistenceResponseType.LogPersisted",
+                        message =
+                            "Received unexpected outstanding_messages type for PersistenceResponseType.LogPersisted",
                         id
                     );
                     log::error!(
@@ -292,7 +288,10 @@ impl RaftFollowerStateDelegate {
                 }
             }
         } else {
-            tracing::error!(message = "LogPersisted event with no outstanding message registered", id);
+            tracing::error!(
+                message = "LogPersisted event with no outstanding message registered",
+                id
+            );
         }
     }
 
@@ -308,7 +307,8 @@ impl RaftFollowerStateDelegate {
                 }
                 _ => {
                     tracing::error!(
-                        message = "Received unexpected outstanding_messages type for PersistenceResponseType.VotePersisted",
+                        message =
+                            "Received unexpected outstanding_messages type for PersistenceResponseType.VotePersisted",
                         id
                     );
                 }
@@ -324,55 +324,63 @@ impl RaftFollowerStateDelegate {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use super::*;
-    use crate::raft::raft_sm::*;
+    use crate::persistence::worker::PersistenceResponseType;
     use crate::quorum::types::{LocalQuorumResponse, LocalQuorumTaskResponseType};
-    use tokio::sync::oneshot;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
+    use crate::raft::raft_sm::*;
+    use crate::transport::capnp::build_owned_log_entry;
     use bus::Bus;
     use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
-    use crate::transport::capnp::build_owned_log_entry;
-    use crate::persistence::worker::PersistenceResponseType;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
 
-    fn create_shared_state() -> (SharedState, crossbeam_channel::Receiver<crate::persistence::worker::PersistenceTaskType>) {
+    fn create_shared_state() -> (
+        SharedState,
+        crossbeam_channel::Receiver<crate::persistence::worker::PersistenceTaskType>,
+    ) {
         let (persistence_tx, persistence_rx) = unbounded();
-        (SharedState {
-            server_state: RaftServerState {
-                current_term: 1,
-                leader_id: 1,
+        (
+            SharedState {
+                server_state: RaftServerState {
+                    current_term: 1,
+                    leader_id: 1,
+                },
+                volatile_server_state: RaftVolatileState {
+                    next_term: 2,
+                    last_log_term: 1,
+                    last_log_index: 0,
+                    commit_index: 0,
+                    replication_log: vec![],
+                    replication_log_term_starts: std::collections::HashMap::new(),
+                    last_applied: 0,
+                    next_log_index: 1,
+                    commit_state: Arc::new(CommitState {
+                        commit_index: AtomicU64::new(0),
+                        version: AtomicU64::new(0),
+                    }),
+                    last_broadcast_index: None,
+                    has_deferred_broadcast: false,
+                },
+                next_message_id: 1,
+                outstanding_messages: std::collections::HashMap::new(),
+                quorum_size: 3,
+                quorum_worker_tasks: vec![],
+                persistence_work: persistence_tx,
+                persistence_response: Arc::new(SegQueue::new()),
+                quorum_work: Arc::new(SegQueue::new()),
+                quorum_response: Arc::new(SegQueue::new()),
+                identity: 0,
+                term_votes: HashMap::new(),
+                state_machine_config: StateMachineConfig {
+                    max_message_size_bytes: 2048,
+                },
+                log_entry_bus: Bus::new(5000),
             },
-            volatile_server_state: RaftVolatileState {
-                next_term: 2,
-                last_log_term: 1,
-                last_log_index: 0,
-                commit_index: 0,
-                replication_log: vec![],
-                replication_log_term_starts: std::collections::HashMap::new(),
-                last_applied: 0,
-                next_log_index: 1,
-                commit_state: Arc::new(CommitState {
-                    commit_index: AtomicU64::new(0),
-                    version: AtomicU64::new(0),
-                }),
-                last_broadcast_index: None,
-                has_deferred_broadcast: false,
-            },
-            next_message_id: 1,
-            outstanding_messages: std::collections::HashMap::new(),
-            quorum_size: 3,
-            quorum_worker_tasks: vec![],
-            persistence_work: persistence_tx,
-            persistence_response: Arc::new(SegQueue::new()),
-            quorum_work: Arc::new(SegQueue::new()),
-            quorum_response: Arc::new(SegQueue::new()),
-            identity: 0,
-            term_votes: HashMap::new(),
-            state_machine_config: StateMachineConfig { max_message_size_bytes: 2048 },
-            log_entry_bus: Bus::new(5000),
-        }, persistence_rx)
+            persistence_rx,
+        )
     }
 
     #[test]
@@ -518,11 +526,13 @@ mod tests {
         assert_eq!(log_entry.command_count(), 1, "Log entry should contain one request");
         // Verify command content via for_each_command
         let mut found_command = false;
-        log_entry.for_each_command(|id, payload, _node_id| {
-            assert_eq!(id, "put_1", "Request ID should match");
-            assert_eq!(payload, b"test_payload", "Request payload should match");
-            found_command = true;
-        }).unwrap();
+        log_entry
+            .for_each_command(|id, payload, _node_id| {
+                assert_eq!(id, "put_1", "Request ID should match");
+                assert_eq!(payload, b"test_payload", "Request payload should match");
+                found_command = true;
+            })
+            .unwrap();
         assert!(found_command, "Should have found the command");
     }
 
@@ -582,9 +592,21 @@ mod tests {
 
         // Add log entries for terms 1, 2, and 3 with absolute indexes
         for i in 0..12u64 {
-            let term = if i < 3 { 1 } else if i < 8 { 2 } else { 3 };
+            let term = if i < 3 {
+                1
+            } else if i < 8 {
+                2
+            } else {
+                3
+            };
             let prev_index = if i > 0 { i - 1 } else { 0 };
-            let prev_term = if i < 3 { 1 } else if i < 8 { 2 } else { 3 };
+            let prev_term = if i < 3 {
+                1
+            } else if i < 8 {
+                2
+            } else {
+                3
+            };
             shared_state
                 .volatile_server_state
                 .replication_log

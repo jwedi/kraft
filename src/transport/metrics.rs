@@ -1,10 +1,8 @@
 use std::time::Instant;
 
-use minstant::Instant as FastInstant;
 use lazy_static::lazy_static;
-use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
-};
+use minstant::Instant as FastInstant;
+use prometheus::{Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry};
 
 lazy_static! {
     pub static ref METRICS_REGISTRY: Registry = Registry::new();
@@ -236,9 +234,7 @@ pub struct WriteBatchTimingGuard {
 
 impl WriteBatchTimingGuard {
     pub fn new() -> Self {
-        Self {
-            start: Instant::now(),
-        }
+        Self { start: Instant::now() }
     }
 
     pub fn observe_and_drop(self) {
@@ -282,7 +278,6 @@ pub fn record_get_record_fast() -> FastRpcTimingGuard {
     RPC_GET_RECORD_TOTAL.inc();
     FastRpcTimingGuard::new(&RPC_GET_RECORD_LATENCY)
 }
-
 
 /// Record write batch
 pub fn record_write_batch(batch_size: usize) -> WriteBatchTimingGuard {

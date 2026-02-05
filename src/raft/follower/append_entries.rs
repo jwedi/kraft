@@ -1,25 +1,19 @@
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use log::error;
+use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{Level, Span};
+use tracing::Span;
 
 use crate::persistence::worker::PersistenceTaskType;
 use crate::raft::raft_sm::{
-    LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftResponseMessage,
-    LocalRaftResponsePayload, OutstandingMessage, OutstandingMessageType,
-    RaftMessageStateChange, SharedState,
+    LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftResponseMessage, LocalRaftResponsePayload,
+    OutstandingMessage, OutstandingMessageType, SharedState,
 };
 use crate::transport::capnp::OwnedLogEntry;
 
 use super::election::ElectionTimer;
 
 /// Validates that append entries request is consecutive with current log state.
-pub fn validate_append_entries(
-    request: &LocalAppendEntries,
-    last_log_index: u64,
-    last_log_term: u64,
-) -> bool {
+pub fn validate_append_entries(request: &LocalAppendEntries, last_log_index: u64, last_log_term: u64) -> bool {
     request.prev_index == last_log_index && request.prev_term == last_log_term
 }
 
@@ -97,7 +91,6 @@ pub fn handle_heartbeat(
     shared_state: &mut SharedState,
     election_timer: &mut ElectionTimer,
 ) {
-    // Reset election timeout on heartbeat
     election_timer.reset();
 
     let last_log_term = shared_state.volatile_server_state.last_log_term;
@@ -180,12 +173,10 @@ pub fn handle_non_consecutive_request(
 
     callback
         .send(LocalRaftResponseMessage {
-            payload: LocalRaftResponsePayload::AppendEntries(
-                LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
-                    last_term: last_log_term,
-                    last_index: last_log_index,
-                },
-            ),
+            payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
+                last_term: last_log_term,
+                last_index: last_log_index,
+            }),
         })
         .unwrap_or_else(|_| log::warn!("Failed to send append_entries response: receiver dropped"));
 }
@@ -204,10 +195,10 @@ pub fn apply_log_entry(
         shared_state.volatile_server_state.last_log_term = entry.term;
         if entry.prev_log_term != entry.term {
             // First entry for new term
-            shared_state
-                .volatile_server_state
-                .replication_log_term_starts
-                .insert(entry.term, shared_state.volatile_server_state.replication_log.len() as u64);
+            shared_state.volatile_server_state.replication_log_term_starts.insert(
+                entry.term,
+                shared_state.volatile_server_state.replication_log.len() as u64,
+            );
         }
         log::debug!("updating last log term {} and index {}", entry.term, entry.index);
         Arc::new(entry.data)
@@ -299,7 +290,9 @@ pub fn apply_log_entry(
         message_type,
         span: Span::current(),
     };
-    shared_state.outstanding_messages.insert(message_id, outstanding_message);
+    shared_state
+        .outstanding_messages
+        .insert(message_id, outstanding_message);
 }
 
 /// Sends an unrecognized leader response.
@@ -318,9 +311,7 @@ pub fn send_unrecognized_leader_response(
     );
     callback
         .send(LocalRaftResponseMessage {
-            payload: LocalRaftResponsePayload::AppendEntries(
-                LocalAppendEntriesCallbackResponse::UnrecognizedLeader,
-            ),
+            payload: LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::UnrecognizedLeader),
         })
         .unwrap_or_else(|_| log::warn!("Failed to send append_entries response: receiver dropped"));
 }
@@ -537,12 +528,10 @@ mod tests {
         // Verify callback was sent with WantedPreviousEntry
         let response = rx.await.unwrap();
         match response.payload {
-            LocalRaftResponsePayload::AppendEntries(
-                LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
-                    last_term,
-                    last_index,
-                },
-            ) => {
+            LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
+                last_term,
+                last_index,
+            }) => {
                 assert_eq!(last_term, 1);
                 assert_eq!(last_index, 5);
             }
@@ -578,12 +567,10 @@ mod tests {
 
         let response = rx.await.unwrap();
         match response.payload {
-            LocalRaftResponsePayload::AppendEntries(
-                LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
-                    last_term,
-                    last_index,
-                },
-            ) => {
+            LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
+                last_term,
+                last_index,
+            }) => {
                 assert_eq!(last_term, 1);
                 assert_eq!(last_index, 5);
             }
@@ -610,13 +597,11 @@ mod tests {
 
         let response = rx.await.unwrap();
         match response.payload {
-            LocalRaftResponsePayload::AppendEntries(
-                LocalAppendEntriesCallbackResponse::UnrecognizedLeader,
-            ) => {}
+            LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::UnrecognizedLeader) => {}
             _ => panic!("Expected UnrecognizedLeader response"),
         }
     }
-    
+
     #[tokio::test]
     async fn test_malformed_entry_is_rejected_not_persisted() {
         let mut shared_state = create_test_shared_state();
@@ -657,9 +642,9 @@ mod tests {
         // Should receive an error response
         let response = rx.await.unwrap();
         match response.payload {
-            LocalRaftResponsePayload::AppendEntries(
-                LocalAppendEntriesCallbackResponse::WantedPreviousEntry { .. },
-            ) => {
+            LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
+                ..
+            }) => {
                 // This is expected - we reject the entry and ask for retransmission
             }
             LocalRaftResponsePayload::AppendEntries(LocalAppendEntriesCallbackResponse::Ok) => {

@@ -1,10 +1,9 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use crossbeam_queue::SegQueue;
 use log::warn;
-use opentelemetry::trace::TraceContextExt;
-use tokio::sync::oneshot::{Receiver, Sender};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::oneshot;
+use tokio::sync::oneshot::{Receiver, Sender};
 use tracing::{Instrument, Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -78,14 +77,9 @@ pub async fn handle_local_write_response(
 }
 
 /// Handles a completed insert by dispatching responses to callbacks.
-fn handle_insert_completed(
-    msg: LocalRaftResponseMessage,
-    batch_callbacks: HashMap<String, Sender<WriteResponse>>,
-) {
+fn handle_insert_completed(msg: LocalRaftResponseMessage, batch_callbacks: HashMap<String, Sender<WriteResponse>>) {
     match msg.payload {
-        LocalRaftResponsePayload::WriteBatch(response) => {
-            respond_to_batch_callbacks(response.message, batch_callbacks)
-        }
+        LocalRaftResponsePayload::WriteBatch(response) => respond_to_batch_callbacks(response.message, batch_callbacks),
         _ => {
             batch_callbacks.into_iter().for_each(|callback| {
                 let msg = WriteResponse::error();

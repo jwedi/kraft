@@ -1,13 +1,12 @@
+use crate::config::config::ClusterNode;
+use crate::transport::capnp::message_receiver::MessageReceiver;
+use crate::transport::capnp::message_sender::MessageSender;
+use crate::transport::capnp::owned_message::OwnedQuorumMessage;
+use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::{oneshot, RwLock};
-use tokio::sync::oneshot::error::RecvError;
-use crate::config::config::ClusterNode;
-use crate::transport::capnp::owned_message::OwnedQuorumMessage;
-use crate::transport::capnp::message_sender::MessageSender;
-use crate::transport::capnp::message_receiver::MessageReceiver;
 
 /// Manages Cap'n Proto TCP connections for cluster communication.
 /// Provides per-peer outbound send channels and inbound receive queues.
@@ -20,11 +19,7 @@ pub struct ClusterStreamManager {
 }
 
 impl ClusterStreamManager {
-    pub fn new(
-        self_id: u32,
-        cluster_nodes: Vec<ClusterNode>,
-        listen_addr: SocketAddr,
-    ) -> Self {
+    pub fn new(self_id: u32, cluster_nodes: Vec<ClusterNode>, listen_addr: SocketAddr) -> Self {
         Self {
             self_id,
             cluster_nodes,
@@ -49,11 +44,15 @@ impl ClusterStreamManager {
         }
 
         // Find node's endpoint
-        let node = self.cluster_nodes.iter()
+        let node = self
+            .cluster_nodes
+            .iter()
             .find(|n| n.node_id == node_id)
             .ok_or_else(|| ClusterConnectError::NoSuchNode(node_id))?;
 
-        let addr: SocketAddr = node.endpoint.parse()
+        let addr: SocketAddr = node
+            .endpoint
+            .parse()
             .map_err(|e| ClusterConnectError::InvalidEndpoint(format!("{}: {}", node.endpoint, e)))?;
 
         // Create bounded crossbeam channel for this connection.
@@ -88,9 +87,7 @@ impl ClusterStreamManager {
                     Err(ClusterConnectError::ConnectionFailed("Err".to_string()))
                 }
             }
-            Err(e) => {
-                Err(ClusterConnectError::ConnectionFailed(e.to_string()))
-            }
+            Err(e) => Err(ClusterConnectError::ConnectionFailed(e.to_string())),
         }
     }
 

@@ -1,6 +1,6 @@
-use std::time::Duration;
-use rand::Rng;
 use rand::rngs::ThreadRng;
+use rand::Rng;
+use std::time::Duration;
 
 use crate::raft::candidate::RaftCandidateStateDelegate;
 use crate::raft::raft_sm::RaftMessageStateChange;
@@ -39,9 +39,9 @@ impl ElectionTimer {
     pub fn check_timeout(&self) -> Option<RaftMessageStateChange> {
         let now = now_millis();
         if self.election_timeout < now {
-            Some(RaftMessageStateChange::Candidate(
-                Box::new(RaftCandidateStateDelegate::new())
-            ))
+            Some(RaftMessageStateChange::Candidate(Box::new(
+                RaftCandidateStateDelegate::new(),
+            )))
         } else {
             None
         }

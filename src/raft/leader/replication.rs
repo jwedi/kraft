@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use log::info;
+use std::sync::Arc;
 use tracing::Span;
 
 use crate::quorum::types::{LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
@@ -7,10 +7,7 @@ use crate::raft::raft_sm::SharedState;
 
 /// Clones a subset of Arc elements from a slice.
 pub fn clone_subset<T>(data: &[Arc<T>], start: usize, end: usize) -> Vec<Arc<T>> {
-    data[start..end]
-        .iter()
-        .map(Arc::clone)
-        .collect()
+    data[start..end].iter().map(Arc::clone).collect()
 }
 
 /// Calculates the quorum worker index for a given node ID.
@@ -80,7 +77,11 @@ pub fn handle_backfill_request(
     }
 
     // Verify the term matches at the requested index
-    if let Some(entry_at_index) = shared_state.volatile_server_state.replication_log.get(last_log_index as usize) {
+    if let Some(entry_at_index) = shared_state
+        .volatile_server_state
+        .replication_log
+        .get(last_log_index as usize)
+    {
         if entry_at_index.term() != last_log_term && last_log_term != 0 {
             // Terms start from 1, log term of 0 means empty
             handle_term_mismatch(shared_state, quorum_node_id, last_log_term, last_log_index);
@@ -93,11 +94,7 @@ pub fn handle_backfill_request(
 }
 
 /// Handles the case where follower has entries beyond our log.
-fn handle_follower_ahead(
-    shared_state: &mut SharedState,
-    quorum_node_id: u64,
-    log_len: u64,
-) {
+fn handle_follower_ahead(shared_state: &mut SharedState, quorum_node_id: u64, log_len: u64) {
     let our_last_index = if log_len > 0 { log_len - 1 } else { 0 };
     let our_last_term = shared_state
         .volatile_server_state
@@ -114,19 +111,22 @@ fn handle_follower_ahead(
     send_truncate_signal(shared_state, quorum_node_id, our_last_term, our_last_index);
 }
 
-/// Handles term mismatch by finding the last matching entry and sending truncate signal.
-fn handle_term_mismatch(
-    shared_state: &mut SharedState,
-    quorum_node_id: u64,
-    last_log_term: u64,
-    last_log_index: u64,
-) {
+/// Handles a term mismatch between leader and follower logs.
+///
+/// Walks backwards through the log to find the last entry with a matching term,
+/// then sends a truncate signal to the follower. This implements the Raft log
+/// consistency check - if terms don't match, we need to find where they diverged.
+fn handle_term_mismatch(shared_state: &mut SharedState, quorum_node_id: u64, last_log_term: u64, last_log_index: u64) {
     let mut truncate_to = last_log_index;
     let mut found_match = false;
 
     while truncate_to > 0 {
         truncate_to -= 1;
-        if let Some(entry) = shared_state.volatile_server_state.replication_log.get(truncate_to as usize) {
+        if let Some(entry) = shared_state
+            .volatile_server_state
+            .replication_log
+            .get(truncate_to as usize)
+        {
             if entry.term() == last_log_term {
                 // Found entry with matching term
                 log::info!(
@@ -150,12 +150,7 @@ fn handle_term_mismatch(
 }
 
 /// Sends backfill data to a follower.
-fn send_backfill_data(
-    shared_state: &mut SharedState,
-    quorum_node_id: u64,
-    last_log_term: u64,
-    last_log_index: u64,
-) {
+fn send_backfill_data(shared_state: &mut SharedState, quorum_node_id: u64, last_log_term: u64, last_log_index: u64) {
     // log term 0 means empty replication log, so start from 0.
     let start_index = if last_log_term == 0 { 0 } else { last_log_index + 1 };
 
@@ -175,9 +170,7 @@ fn send_backfill_data(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::raft_sm::{
-        CommitState, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig,
-    };
+    use crate::raft::raft_sm::{CommitState, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig};
     use crate::transport::capnp::{build_owned_log_entry, OwnedLogEntry};
     use bus::Bus;
     use crossbeam_channel::unbounded;
@@ -300,11 +293,7 @@ mod tests {
 
     #[test]
     fn test_send_truncate_signal_queues_task() {
-        let log_entries = vec![
-            create_log_entry(0, 1),
-            create_log_entry(1, 1),
-            create_log_entry(2, 2),
-        ];
+        let log_entries = vec![create_log_entry(0, 1), create_log_entry(1, 1), create_log_entry(2, 2)];
         let mut shared_state = create_test_shared_state_with_log(log_entries);
 
         // Node 2 with identity 1 -> quorum worker index 0
@@ -316,9 +305,7 @@ mod tests {
 
         match task.unwrap().task_type {
             LocalQuorumWorkerTaskType::TruncateLog {
-                prev_term,
-                prev_index,
-                ..
+                prev_term, prev_index, ..
             } => {
                 assert_eq!(prev_term, 1);
                 assert_eq!(prev_index, 1);
@@ -356,10 +343,7 @@ mod tests {
 
     #[test]
     fn test_handle_backfill_request_empty_log_sends_truncate() {
-        let log_entries = vec![
-            create_log_entry(0, 1),
-            create_log_entry(1, 1),
-        ];
+        let log_entries = vec![create_log_entry(0, 1), create_log_entry(1, 1)];
         let mut shared_state = create_test_shared_state_with_log(log_entries);
 
         // Request with index beyond log - should trigger truncate
@@ -378,11 +362,7 @@ mod tests {
 
     #[test]
     fn test_handle_backfill_request_term_mismatch_sends_truncate() {
-        let log_entries = vec![
-            create_log_entry(0, 1),
-            create_log_entry(1, 1),
-            create_log_entry(2, 2),
-        ];
+        let log_entries = vec![create_log_entry(0, 1), create_log_entry(1, 1), create_log_entry(2, 2)];
         let mut shared_state = create_test_shared_state_with_log(log_entries);
 
         // Request with wrong term at index 2 (entry has term 2, request says term 3)
@@ -401,11 +381,7 @@ mod tests {
 
     #[test]
     fn test_handle_backfill_request_from_empty_follower() {
-        let log_entries = vec![
-            create_log_entry(0, 1),
-            create_log_entry(1, 1),
-            create_log_entry(2, 2),
-        ];
+        let log_entries = vec![create_log_entry(0, 1), create_log_entry(1, 1), create_log_entry(2, 2)];
         let mut shared_state = create_test_shared_state_with_log(log_entries);
 
         // Follower has empty log (term 0)

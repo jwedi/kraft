@@ -1,10 +1,10 @@
 pub mod batch;
 pub mod remote;
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use crossbeam_queue::SegQueue;
 use opentelemetry::Context;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::{Receiver, Sender};
 use tokio::task::JoinSet;
@@ -39,7 +39,10 @@ impl WriteResponse {
     /// Create an empty error response
     pub fn error() -> Self {
         let message = build_owned_write_batch_response(|_| {});
-        Self { message, status: WriteStatus::InternalServerError }
+        Self {
+            message,
+            status: WriteStatus::InternalServerError,
+        }
     }
 
     /// Create a successful response from Cap'n Proto message
@@ -66,7 +69,11 @@ impl WriteBatch {
         self.message
             .with_message(|r| {
                 r.get_requests()
-                    .map(|reqs| reqs.iter().map(|req| req.get_payload().map(|p| p.len() as u64).unwrap_or(0)).sum())
+                    .map(|reqs| {
+                        reqs.iter()
+                            .map(|req| req.get_payload().map(|p| p.len() as u64).unwrap_or(0))
+                            .sum()
+                    })
                     .unwrap_or(0)
             })
             .unwrap_or(0)
@@ -165,7 +172,7 @@ impl WriteProxy {
         match resp {
             Ok(m) => match &m.payload {
                 LocalRaftResponsePayload::RaftState { leader_id } => {
-                    if *leader_id <= 0 {
+                    if *leader_id == 0 {
                         None
                     } else {
                         Some(*leader_id)
@@ -262,8 +269,7 @@ impl WriteProxy {
         let mut leader_resync = Instant::now();
 
         loop {
-            // Check leader periodically
-            if current_leader_id <= 0 || leader_resync.elapsed().as_millis() > 1 {
+            if current_leader_id == 0 || leader_resync.elapsed().as_millis() > 1 {
                 match self.get_current_leader().await {
                     Some(leader_id) => {
                         if leader_id != current_leader_id {
@@ -285,7 +291,7 @@ impl WriteProxy {
             if !batch.is_empty() {
                 let batch_requests: usize = batch.iter().map(|b| b.request_count()).sum();
                 let num_batches: u64 = batch.len() as u64;
-                let mut new_root = tracing::span!(
+                let new_root = tracing::span!(
                     Level::INFO,
                     "write_proxy_batch_process",
                     batch_requests = batch_requests,
@@ -301,15 +307,29 @@ impl WriteProxy {
                     .unwrap_or(0);
 
                 if request_size == 0 {
-                    log::warn!("Request size is 0, batch requests {}, num batches: {}", batch_requests, num_batches)
+                    log::warn!(
+                        "Request size is 0, batch requests {}, num batches: {}",
+                        batch_requests,
+                        num_batches
+                    )
                 }
                 if num_requests == 0 {
-                    log::warn!("Num requests is 0, batch requests {}, num batches: {}", batch_requests, num_batches)
+                    log::warn!(
+                        "Num requests is 0, batch requests {}, num batches: {}",
+                        batch_requests,
+                        num_batches
+                    )
                 }
 
                 if self.self_id == current_leader_id {
                     // Node is the leader
-                    self.process_local_batch(combined_batch, batch_callbacks, num_requests, request_size, &mut join_set);
+                    self.process_local_batch(
+                        combined_batch,
+                        batch_callbacks,
+                        num_requests,
+                        request_size,
+                        &mut join_set,
+                    );
                 } else {
                     // Forward to leader via quorum worker
                     self.process_remote_batch(

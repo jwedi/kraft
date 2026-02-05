@@ -26,9 +26,7 @@ pub struct RecoveredData {
 /// Deserializes the replication log from raw bytes (Cap'n Proto format).
 ///
 /// Returns a tuple of (log entries, term start indices, last index, last term).
-pub fn deserialize_replication_log(
-    log_bytes: &[u8],
-) -> (Vec<Arc<OwnedLogEntry>>, HashMap<u64, u64>, u64, u64) {
+pub fn deserialize_replication_log(log_bytes: &[u8]) -> (Vec<Arc<OwnedLogEntry>>, HashMap<u64, u64>, u64, u64) {
     let start_time = now_millis();
 
     if log_bytes.is_empty() {
@@ -59,7 +57,11 @@ pub fn deserialize_replication_log(
                 offset += bytes_consumed;
             }
             Err(e) => {
-                log::warn!("Failed to read message at offset {}: {:?}, stopping recovery", offset, e);
+                log::warn!(
+                    "Failed to read message at offset {}: {:?}, stopping recovery",
+                    offset,
+                    e
+                );
                 break;
             }
         }
@@ -102,27 +104,23 @@ pub fn process_votes(votes: Vec<VoteRow>, last_log_term: u64) -> (HashMap<u64, u
         votes.last()
     );
 
-    let default_vote = VoteRow { term: 0, candidate_id: 0 };
+    let default_vote = VoteRow {
+        term: 0,
+        candidate_id: 0,
+    };
     let max_vote = votes.iter().max_by(|x, y| x.term.cmp(&y.term));
     let highest_term_vote = max_vote.unwrap_or(&default_vote);
 
     let next_term = std::cmp::max(highest_term_vote.term, last_log_term) + 1;
 
-    let term_votes: HashMap<u64, u32> = votes
-        .into_iter()
-        .map(|v| (v.term, v.candidate_id))
-        .collect();
+    let term_votes: HashMap<u64, u32> = votes.into_iter().map(|v| (v.term, v.candidate_id)).collect();
 
     (term_votes, next_term)
 }
 
 /// Recovers all persisted data (log and votes) and returns a RecoveredData struct.
-pub fn recover_persisted_data(
-    log_bytes: Vec<u8>,
-    votes: Vec<VoteRow>,
-) -> RecoveredData {
-    let (replication_log, term_start_index, last_log_index, last_log_term) =
-        deserialize_replication_log(&log_bytes);
+pub fn recover_persisted_data(log_bytes: Vec<u8>, votes: Vec<VoteRow>) -> RecoveredData {
+    let (replication_log, term_start_index, last_log_index, last_log_term) = deserialize_replication_log(&log_bytes);
 
     let (term_votes, next_term) = process_votes(votes, last_log_term);
 
@@ -161,9 +159,18 @@ mod tests {
     #[test]
     fn test_process_votes_with_data() {
         let votes = vec![
-            VoteRow { term: 1, candidate_id: 2 },
-            VoteRow { term: 3, candidate_id: 1 },
-            VoteRow { term: 2, candidate_id: 3 },
+            VoteRow {
+                term: 1,
+                candidate_id: 2,
+            },
+            VoteRow {
+                term: 3,
+                candidate_id: 1,
+            },
+            VoteRow {
+                term: 2,
+                candidate_id: 3,
+            },
         ];
 
         let (term_votes, next_term) = process_votes(votes, 2);
@@ -177,7 +184,10 @@ mod tests {
 
     #[test]
     fn test_process_votes_log_term_higher() {
-        let votes = vec![VoteRow { term: 1, candidate_id: 2 }];
+        let votes = vec![VoteRow {
+            term: 1,
+            candidate_id: 2,
+        }];
 
         let (_, next_term) = process_votes(votes, 5);
 

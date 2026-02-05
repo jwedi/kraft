@@ -38,9 +38,7 @@ pub async fn handle(stream: TcpStream, queues: Queues) -> std::io::Result<()> {
     let (response_tx, response_rx) = mpsc::channel::<ResponseMessage>(1000);
 
     // Spawn writer task - sends responses as they arrive (unordered by request ID)
-    let writer_handle = tokio::spawn(async move {
-        write_responses(writer, response_rx).await
-    });
+    let writer_handle = tokio::spawn(async move { write_responses(writer, response_rx).await });
 
     // Reader loop - for each request, spawn handler task
     loop {
@@ -64,11 +62,13 @@ pub async fn handle(stream: TcpStream, queues: Queues) -> std::io::Result<()> {
         tokio::spawn(async move {
             let response_payload = dispatch_request(rpc_type, payload, &queues_clone).await;
             // Use blocking send for bounded channel - provides backpressure when writer is slow
-            let _ = tx.send(ResponseMessage {
-                request_id,
-                rpc_type,
-                payload: response_payload,
-            }).await;
+            let _ = tx
+                .send(ResponseMessage {
+                    request_id,
+                    rpc_type,
+                    payload: response_payload,
+                })
+                .await;
         });
     }
 
@@ -82,10 +82,7 @@ pub async fn handle(stream: TcpStream, queues: Queues) -> std::io::Result<()> {
 }
 
 /// Writer task: sends responses as they arrive.
-async fn write_responses(
-    mut writer: WriteHalf<TcpStream>,
-    mut rx: mpsc::Receiver<ResponseMessage>,
-) {
+async fn write_responses(mut writer: WriteHalf<TcpStream>, mut rx: mpsc::Receiver<ResponseMessage>) {
     while let Some(msg) = rx.recv().await {
         if let Err(e) = write_frame(&mut writer, msg.rpc_type, msg.request_id, &msg.payload).await {
             error!("TCP datastore: write error: {}", e);
@@ -125,7 +122,7 @@ async fn handle_put_record(payload: Bytes, queues: &Queues) -> Bytes {
     // Build Cap'n Proto write batch
     let write_batch_message = build_owned_write_batch(|mut builder| {
         builder.set_batch_id(&batch_id);
-        let mut requests = builder.init_requests(1);
+        let requests = builder.init_requests(1);
         let mut put_req = requests.get(0);
         put_req.set_id(&key);
         put_req.set_payload(&value);

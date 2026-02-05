@@ -18,16 +18,14 @@ All core logic and initial implementation is handwritten but refactorings, migra
 - **Observability**: Built-in distributed tracing (Zipkin) and Prometheus metrics
 
 ## Rough Benchmark
-On a 3x Kraft node cluster (~1 core each) running on a 2021 Apple M1 Pro Kraft does:
-- ~ 100.000 durable quorum writes per second.
-- ~ 150.000 commited reads per second.
-- ~ 145.000 mixed 80/20 read/write requests per second.
 
-[TCP WRITE] CHECKPOINT: throughput=99343 rps, p50=9.56ms, p75=11.31ms, p95=14.31ms, p99=17.00ms
+On a 3-node Kraft cluster (~1 core each) running on a 2021 Apple M1 Pro:
 
-[TCP READ] CHECKPOINT: throughput=148410 rps, p50=4.51ms, p75=7.28ms, p95=13.68ms, p99=24.27ms
-
-[TCP MIXED 20w/80r] CHECKPOINT: throughput=144080 rps, p50=4.97ms, p75=8.78ms, p95=14.34ms, p99=19.38ms
+| Workload                       | Throughput | p50 | p75 | p95 | p99 |
+|--------------------------------|------------|-----|-----|-----|-----|
+| **Durable Quorum Write**       | 99,343 rps | 9.56ms | 11.31ms | 14.31ms | 17.00ms |
+| **Committed Read**             | 148,410 rps | 4.51ms | 7.28ms | 13.68ms | 24.27ms |
+| **Mixed Write/Read** (20w/80r) | 144,080 rps | 4.97ms | 8.78ms | 14.34ms | 19.38ms |
 
 ## Architecture Overview
 

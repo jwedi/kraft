@@ -1,13 +1,12 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use dashmap::DashMap;
 use log::info;
-use tokio::io::AsyncReadExt;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 
-use super::owned_message::OwnedQuorumMessage;
 use super::message_sender::read_message;
+use super::owned_message::OwnedQuorumMessage;
 use super::raft_capnp::remote_quorum_message;
 
 /// TCP listener that accepts incoming connections and creates per-peer message queues.
@@ -64,14 +63,12 @@ async fn handle_connection(
     info!("handle_connection waiting for connect message");
     let connect_msg = read_message(&mut reader).await?;
     info!("handle_connection received initial message");
-    let node_id = connect_msg.with_message(|msg| {
-        match msg.get_message_payload().which() {
-            Ok(remote_quorum_message::message_payload::Which::ConnectRequest(req)) => {
-                req.map(|r| r.get_node_id()).ok()
-            }
+    let node_id = connect_msg
+        .with_message(|msg| match msg.get_message_payload().which() {
+            Ok(remote_quorum_message::message_payload::Which::ConnectRequest(req)) => req.map(|r| r.get_node_id()).ok(),
             _ => None,
-        }
-    })?.ok_or("Expected ConnectRequest as first message")?;
+        })?
+        .ok_or("Expected ConnectRequest as first message")?;
 
     log::info!("Accepted Cap'n Proto connection from node {}", node_id);
 

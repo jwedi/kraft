@@ -1,2 +1,0 @@
-#!/bin/bash
-java --add-opens java.base/jdk.internal.misc=ALL-UNNAMED -Dsbe.generate.ir=true -Dsbe.target.language=Rust -Dsbe.target.namespace=sbe -Dsbe.output.dir=sbe -Dsbe.errorLog=yes -jar /Users/jwedi/work/simple-binary-encoding/sbe-all/build/libs/sbe-all-1.36.0-SNAPSHOT.jar sbe/log-schema.xml sbe/log-schema.xml

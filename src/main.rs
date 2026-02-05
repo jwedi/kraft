@@ -5,7 +5,7 @@ use log::info;
 use opentelemetry_sdk::trace::{Sampler, Tracer as SDKTracer};
 use opentelemetry_sdk::{trace, Resource};
 use tokio::join;
-use tracing_subscriber::{Layer, layer::SubscriberExt, Registry};
+use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
 
 use kraft_lib::config::config::{read_config, ClusterNode};
 use kraft_lib::transport::cluster_stream_manager::ClusterStreamManager;
@@ -55,22 +55,14 @@ fn create_cluster_stream_manager(
     cluster_nodes: &[ClusterNode],
     cluster_port: u32,
 ) -> Arc<ClusterStreamManager> {
-    let capnp_addr: std::net::SocketAddr = format!("[::1]:{}", cluster_port)
-        .parse()
-        .expect("Invalid cluster_port");
+    let capnp_addr: std::net::SocketAddr = format!("[::1]:{}", cluster_port).parse().expect("Invalid cluster_port");
 
-    Arc::new(ClusterStreamManager::new(
-        node_id,
-        cluster_nodes.to_vec(),
-        capnp_addr,
-    ))
+    Arc::new(ClusterStreamManager::new(node_id, cluster_nodes.to_vec(), capnp_addr))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    env_logger::builder().filter_level(log::LevelFilter::Info).init();
 
     // Initialize metrics
     transport::metrics::register_metrics();
@@ -111,11 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     // Create Cap'n Proto stream manager for cluster communication
-    let cluster_stream_manager = create_cluster_stream_manager(
-        node_id,
-        &cluster_nodes_without_self,
-        cfg.cluster_port,
-    );
+    let cluster_stream_manager = create_cluster_stream_manager(node_id, &cluster_nodes_without_self, cfg.cluster_port);
 
     // Create quorum workers
     log::info!("Using Cap'n Proto transport for cluster communication");
@@ -159,8 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&queues.query_queue),
     );
 
-    let worker_handle =
-        startup::spawn_state_machine_worker(Arc::clone(&queues.task_queue), shared_state);
+    let worker_handle = startup::spawn_state_machine_worker(Arc::clone(&queues.task_queue), shared_state);
 
     let persistence_handle = startup::spawn_persistence_worker(persistence_worker);
 
@@ -185,8 +172,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    info!("Kraft server started - node_id={}, cluster_port={}, tcp_datastore_port={}",
-          node_id, cfg.cluster_port, cfg.tcp_datastore_port);
+    info!(
+        "Kraft server started - node_id={}, cluster_port={}, tcp_datastore_port={}",
+        node_id, cfg.cluster_port, cfg.tcp_datastore_port
+    );
 
     // Wait for all workers to complete
     let _ = join!(
