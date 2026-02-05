@@ -2,16 +2,13 @@ pub mod inbound;
 pub mod outbound;
 pub mod pending;
 
+use crossbeam_channel::{Receiver, Sender};
+use crossbeam_queue::SegQueue;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use crossbeam_channel::{Receiver, Sender};
-use crossbeam_queue::SegQueue;
 
-use crate::quorum::types::{
-    LocalQuorumWorkerTask, LocalQuorumWorkerTaskType,
-    LocalQuorumResponse,
-};
+use crate::quorum::types::{LocalQuorumResponse, LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
 use crate::raft::raft_sm::{LocalRaftMessage, LocalRaftResponseMessage};
 use crate::transport::capnp::owned_message::OwnedQuorumMessage;
 use crate::transport::cluster_stream_manager::ClusterStreamManager;

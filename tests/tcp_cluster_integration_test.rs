@@ -179,10 +179,7 @@ impl TcpConnection {
         })
     }
 
-    async fn reader_loop(
-        mut reader: ReadHalf<TcpStream>,
-        pending: Arc<DashMap<u64, oneshot::Sender<Bytes>>>,
-    ) {
+    async fn reader_loop(mut reader: ReadHalf<TcpStream>, pending: Arc<DashMap<u64, oneshot::Sender<Bytes>>>) {
         loop {
             match read_frame(&mut reader).await {
                 Ok((_rpc_type, request_id, payload)) => {
@@ -271,8 +268,7 @@ impl NodeHandle {
     }
 
     fn read_stderr(&self) -> String {
-        std::fs::read_to_string(self.temp_dir.path().join("stderr.log"))
-            .unwrap_or_else(|_| "<no stderr>".to_string())
+        std::fs::read_to_string(self.temp_dir.path().join("stderr.log")).unwrap_or_else(|_| "<no stderr>".to_string())
     }
 
     fn log_file_path(&self) -> std::path::PathBuf {
@@ -355,7 +351,11 @@ impl TestCluster {
         // Wait for leader election by trying a write via TCP
         let deadline = tokio::time::Instant::now() + LEADER_ELECTION_TIMEOUT;
         while tokio::time::Instant::now() < deadline {
-            if self.put_record_tcp(0, "__leader_check__", "test", REQUEST_TIMEOUT).await.is_ok() {
+            if self
+                .put_record_tcp(0, "__leader_check__", "test", REQUEST_TIMEOUT)
+                .await
+                .is_ok()
+            {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -370,15 +370,14 @@ impl TestCluster {
         value: &str,
         timeout: Duration,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.tcp_connections[node_idx]
-            .as_ref()
-            .ok_or("No TCP connection")?;
+        let conn = self.tcp_connections[node_idx].as_ref().ok_or("No TCP connection")?;
 
         let payload = build_put_request(key, value.as_bytes());
 
         tokio::time::timeout(timeout, async {
             let rx = conn.send_request(RPC_PUT_RECORD, &payload).await?;
-            rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
+            rx.await
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
             Ok::<(), io::Error>(())
         })
         .await
@@ -392,15 +391,15 @@ impl TestCluster {
         key: &str,
         timeout: Duration,
     ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let conn = self.tcp_connections[node_idx]
-            .as_ref()
-            .ok_or("No TCP connection")?;
+        let conn = self.tcp_connections[node_idx].as_ref().ok_or("No TCP connection")?;
 
         let payload = build_get_request(key);
 
         let response = tokio::time::timeout(timeout, async {
             let rx = conn.send_request(RPC_GET_RECORD, &payload).await?;
-            let resp = rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
+            let resp = rx
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
             Ok::<Bytes, io::Error>(resp)
         })
         .await
@@ -441,8 +440,7 @@ impl TestCluster {
 
     fn read_transaction_log(&self, node_idx: usize) -> Vec<OwnedLogEntry> {
         let log_path = self.nodes[node_idx].log_file_path();
-        let log_bytes = fs::read(&log_path)
-            .expect(&format!("Failed to read log file for node {}", node_idx + 1));
+        let log_bytes = fs::read(&log_path).expect(&format!("Failed to read log file for node {}", node_idx + 1));
 
         if log_bytes.is_empty() {
             return Vec::new();
@@ -524,18 +522,36 @@ async fn test_three_node_cluster_consensus_tcp() {
 
     // Verify all entries via transaction log (more reliable than parsing responses)
     // ===== Transaction Log Verification =====
-    let logs: Vec<Vec<OwnedLogEntry>> = (0..3)
-        .map(|i| cluster.read_transaction_log(i))
-        .collect();
+    let logs: Vec<Vec<OwnedLogEntry>> = (0..3).map(|i| cluster.read_transaction_log(i)).collect();
 
     // Verify all logs have the same length (identical entry count)
-    assert!(logs.windows(2).all(|w| w[0].len() == w[1].len()), "Transaction logs have different lengths 1: {}, 2: {}, 3: {}", logs[0].len(), logs[1].len(), logs[2].len());
+    assert!(
+        logs.windows(2).all(|w| w[0].len() == w[1].len()),
+        "Transaction logs have different lengths 1: {}, 2: {}, 3: {}",
+        logs[0].len(),
+        logs[1].len(),
+        logs[2].len()
+    );
 
     // Verify all logs have the same indices and terms
     for (i, entry_pair) in logs.windows(2).enumerate() {
         for (j, (e1, e2)) in entry_pair[0].iter().zip(entry_pair[1].iter()).enumerate() {
-            assert_eq!(e1.index(), e2.index(), "Index mismatch at position {} between nodes {} and {}", j, i, i+1);
-            assert_eq!(e1.term(), e2.term(), "Term mismatch at position {} between nodes {} and {}", j, i, i+1);
+            assert_eq!(
+                e1.index(),
+                e2.index(),
+                "Index mismatch at position {} between nodes {} and {}",
+                j,
+                i,
+                i + 1
+            );
+            assert_eq!(
+                e1.term(),
+                e2.term(),
+                "Term mismatch at position {} between nodes {} and {}",
+                j,
+                i,
+                i + 1
+            );
         }
     }
 
@@ -551,14 +567,26 @@ async fn test_three_node_cluster_consensus_tcp() {
         let key = format!("key-{}", i);
         let expected = format!("value-{}", i);
         let actual = log_entries.get(&key).map(|v| String::from_utf8_lossy(v).to_string());
-        assert_eq!(actual.as_deref(), Some(expected.as_str()), "Key {} mismatch in log", key);
+        assert_eq!(
+            actual.as_deref(),
+            Some(expected.as_str()),
+            "Key {} mismatch in log",
+            key
+        );
     }
 
-    println!("TCP Transport: Transaction log verification passed: {} entries across all nodes", logs[0].len());
+    println!(
+        "TCP Transport: Transaction log verification passed: {} entries across all nodes",
+        logs[0].len()
+    );
 
     // ===== GET Record API Verification =====
     // Verify all written entries can be fetched via get_record API from all nodes
-    println!("Starting GET record verification for {} entries across {} nodes...", entry_count, cluster.nodes.len());
+    println!(
+        "Starting GET record verification for {} entries across {} nodes...",
+        entry_count,
+        cluster.nodes.len()
+    );
 
     for i in 0..entry_count {
         let key = format!("key-{}", i);
@@ -573,22 +601,26 @@ async fn test_three_node_cluster_consensus_tcp() {
             match result {
                 Ok(actual_value) => {
                     assert_eq!(
-                        actual_value, expected_value,
+                        actual_value,
+                        expected_value,
                         "Value mismatch for key {} on node {}: expected '{}', got '{}'",
-                        key, node_idx + 1, expected_value, actual_value
+                        key,
+                        node_idx + 1,
+                        expected_value,
+                        actual_value
                     );
                 }
                 Err(e) => {
-                    panic!(
-                        "Failed to get key {} from node {}: {:?}",
-                        key, node_idx + 1, e
-                    );
+                    panic!("Failed to get key {} from node {}: {:?}", key, node_idx + 1, e);
                 }
             }
         }
     }
 
-    println!("TCP Transport: GET record verification passed: {} entries verified across all nodes", entry_count);
+    println!(
+        "TCP Transport: GET record verification passed: {} entries verified across all nodes",
+        entry_count
+    );
 
     cluster.close().await;
 }

@@ -3,18 +3,16 @@ use tokio::sync::oneshot;
 
 pub enum CommandType {
     RequestVote,
-    AppendEntries
+    AppendEntries,
 }
 
 pub struct Command {
-    pub command_type: CommandType
+    pub command_type: CommandType,
 }
 
-pub struct RuntimeTaskResponse {
-
-}
+pub struct RuntimeTaskResponse {}
 
 pub struct RuntimeTask {
     pub command: Arc<Command>,
-    pub callback: oneshot::Sender<RuntimeTaskResponse>
+    pub callback: oneshot::Sender<RuntimeTaskResponse>,
 }

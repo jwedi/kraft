@@ -1,11 +1,11 @@
 // benches/replication_log.rs
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use std::sync::Arc;
-use std::thread;
 use arc_swap::ArcSwap;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use crossbeam_queue::SegQueue;
 use im::Vector;
 use kraft_lib::transport::capnp::{build_owned_log_entry, OwnedLogEntry};
+use std::sync::Arc;
+use std::thread;
 
 const DATA_SIZE: usize = 30000;
 

@@ -2,8 +2,7 @@ use std::collections::HashMap;
 use tokio::sync::oneshot::Sender;
 
 use crate::transport::capnp::{
-    build_owned_write_batch, build_owned_write_batch_response,
-    OwnedWriteBatch, OwnedWriteBatchResponse,
+    build_owned_write_batch, build_owned_write_batch_response, OwnedWriteBatch, OwnedWriteBatchResponse,
 };
 
 use super::{WriteBatch, WriteResponse};
@@ -34,10 +33,13 @@ pub fn prepare_batch_and_callbacks(
     }
 
     // Collect callbacks - we need to move these out of batches
-    let batches_with_callbacks: Vec<_> = batches.into_iter().map(|b| {
-        batch_callbacks.insert(b.batch_id.clone(), b.callback);
-        b.message
-    }).collect();
+    let batches_with_callbacks: Vec<_> = batches
+        .into_iter()
+        .map(|b| {
+            batch_callbacks.insert(b.batch_id.clone(), b.callback);
+            b.message
+        })
+        .collect();
 
     let combined = build_owned_write_batch(|mut builder| {
         builder.set_batch_id(batch_id);
@@ -140,10 +142,7 @@ mod tests {
 
     #[test]
     fn test_prepare_batch_and_callbacks_single_batch() {
-        let batch = create_test_write_batch(
-            "batch-1",
-            vec![("req1", b"payload1", 1), ("req2", b"payload2", 2)],
-        );
+        let batch = create_test_write_batch("batch-1", vec![("req1", b"payload1", 1), ("req2", b"payload2", 2)]);
 
         let (combined, callbacks) = prepare_batch_and_callbacks("combined-1", vec![batch]);
 
@@ -162,13 +161,9 @@ mod tests {
     fn test_prepare_batch_and_callbacks_multiple_batches() {
         let batch1 = create_test_write_batch("batch-1", vec![("req1", b"payload1", 1)]);
         let batch2 = create_test_write_batch("batch-2", vec![("req2", b"payload2", 2)]);
-        let batch3 = create_test_write_batch(
-            "batch-3",
-            vec![("req3", b"payload3", 3), ("req4", b"payload4", 4)],
-        );
+        let batch3 = create_test_write_batch("batch-3", vec![("req3", b"payload3", 3), ("req4", b"payload4", 4)]);
 
-        let (combined, callbacks) =
-            prepare_batch_and_callbacks("combined-all", vec![batch1, batch2, batch3]);
+        let (combined, callbacks) = prepare_batch_and_callbacks("combined-all", vec![batch1, batch2, batch3]);
 
         // Check callbacks
         assert_eq!(callbacks.len(), 3);

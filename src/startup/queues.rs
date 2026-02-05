@@ -1,8 +1,8 @@
 //! Queue and channel creation for inter-component communication.
 
-use std::sync::Arc;
-use crossbeam_channel::{Sender, Receiver, unbounded};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use crossbeam_queue::SegQueue;
+use std::sync::Arc;
 
 use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
 use crate::query::worker::QueryRequest;

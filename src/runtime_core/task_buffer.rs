@@ -1,8 +1,8 @@
-use std::sync;
-use std::sync::atomic::Ordering;
+use crate::runtime_core::types::RuntimeTask;
 use crate::service_utils::errors::ServiceError;
 use crate::service_utils::errors::ServiceError::{RaceConditionError, ThrottlingError};
-use crate::runtime_core::types::{RuntimeTask};
+use std::sync;
+use std::sync::atomic::Ordering;
 
 pub trait TaskBuffer {
     fn claim_spot(&mut self) -> u64;
@@ -16,7 +16,7 @@ pub struct TaskBufferImpl<T> {
     tasks: Vec<T>,
 }
 
-impl <T>TaskBufferImpl<T> {
+impl<T> TaskBufferImpl<T> {
     pub fn new() -> Self {
         Self {
             read_index: 0,
@@ -54,12 +54,10 @@ impl <T>TaskBufferImpl<T> {
             // For now, we just prevent overflow.
 
             // Atomically try to claim this spot
-            match self.write_index.compare_exchange_weak(
-                idx,
-                next_idx,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .write_index
+                .compare_exchange_weak(idx, next_idx, Ordering::AcqRel, Ordering::Relaxed)
+            {
                 Ok(_) => return Ok(idx),
                 Err(_) => {
                     // Another thread claimed this spot, retry
@@ -138,10 +136,7 @@ mod tests {
             })
             .collect();
 
-        let mut all_spots: Vec<u64> = handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect();
+        let mut all_spots: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
 
         // All claimed spots should be unique
         let original_len = all_spots.len();
@@ -155,10 +150,7 @@ mod tests {
 
         // All spots should be sequential starting from 0
         for (i, spot) in all_spots.iter().enumerate() {
-            assert_eq!(
-                *spot, i as u64,
-                "Spots should be sequential without gaps"
-            );
+            assert_eq!(*spot, i as u64, "Spots should be sequential without gaps");
         }
     }
 
@@ -171,9 +163,7 @@ mod tests {
         let buffer: TaskBufferImpl<i32> = TaskBufferImpl::new();
 
         // Set write_index near u64::MAX to test overflow protection
-        buffer
-            .write_index
-            .store(u64::MAX, Ordering::Release);
+        buffer.write_index.store(u64::MAX, Ordering::Release);
 
         let result = buffer.claim_spot();
         assert!(result.is_err());

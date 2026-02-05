@@ -22,9 +22,7 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 ///
 /// Returns (rpc_type, request_id, payload).
 /// The payload is returned as `Bytes` for zero-copy handling.
-pub async fn read_frame<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-) -> io::Result<(u8, u64, Bytes)> {
+pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<(u8, u64, Bytes)> {
     // Read length (4 bytes, little-endian)
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
@@ -112,14 +110,11 @@ mod tests {
 
         // Write frame
         let mut buf = Vec::new();
-        write_frame(&mut buf, rpc_type, request_id, payload)
-            .await
-            .unwrap();
+        write_frame(&mut buf, rpc_type, request_id, payload).await.unwrap();
 
         // Read frame
         let mut reader = Cursor::new(buf);
-        let (read_rpc_type, read_request_id, read_payload) =
-            read_frame(&mut reader).await.unwrap();
+        let (read_rpc_type, read_request_id, read_payload) = read_frame(&mut reader).await.unwrap();
 
         assert_eq!(read_rpc_type, rpc_type);
         assert_eq!(read_request_id, request_id);
@@ -132,13 +127,10 @@ mod tests {
         let request_id = 0u64;
 
         let mut buf = Vec::new();
-        write_frame(&mut buf, rpc_type, request_id, &[])
-            .await
-            .unwrap();
+        write_frame(&mut buf, rpc_type, request_id, &[]).await.unwrap();
 
         let mut reader = Cursor::new(buf);
-        let (read_rpc_type, read_request_id, read_payload) =
-            read_frame(&mut reader).await.unwrap();
+        let (read_rpc_type, read_request_id, read_payload) = read_frame(&mut reader).await.unwrap();
 
         assert_eq!(read_rpc_type, rpc_type);
         assert_eq!(read_request_id, request_id);

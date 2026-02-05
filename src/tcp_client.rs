@@ -20,8 +20,8 @@ use dashmap::DashMap;
 use log::info;
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{oneshot, Semaphore};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 
@@ -226,10 +226,7 @@ impl TcpConnection {
         })
     }
 
-    async fn reader_loop(
-        mut reader: ReadHalf<TcpStream>,
-        pending: Arc<DashMap<u64, oneshot::Sender<Bytes>>>,
-    ) {
+    async fn reader_loop(mut reader: ReadHalf<TcpStream>, pending: Arc<DashMap<u64, oneshot::Sender<Bytes>>>) {
         loop {
             match read_frame(&mut reader).await {
                 Ok((_rpc_type, request_id, payload)) => {
@@ -435,9 +432,11 @@ async fn do_write_batch_async(config: &LoadTestConfig) -> io::Result<()> {
 
             let result = tokio::time::timeout(timeout, async {
                 let rx = conn.send_request(RPC_PUT_RECORD, &payload).await?;
-                rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
+                rx.await
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
                 Ok::<_, io::Error>(())
-            }).await;
+            })
+            .await;
 
             match result {
                 Ok(Ok(())) => {
@@ -537,9 +536,11 @@ async fn do_get_record_async(config: &LoadTestConfig) -> io::Result<()> {
 
             let result = tokio::time::timeout(timeout, async {
                 let rx = conn.send_request(RPC_GET_RECORD, &payload).await?;
-                rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
+                rx.await
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
                 Ok::<_, io::Error>(())
-            }).await;
+            })
+            .await;
 
             match result {
                 Ok(Ok(())) => {
@@ -643,16 +644,20 @@ async fn do_mixed_operations_async(config: &LoadTestConfig, write_ratio: f64) ->
 
             let result = tokio::time::timeout(timeout, async {
                 if should_write(request_id, write_ratio) {
-                    let payload = build_put_request(&request_id.to_string(), format!("value-{}", request_id).as_bytes());
+                    let payload =
+                        build_put_request(&request_id.to_string(), format!("value-{}", request_id).as_bytes());
                     let rx = conn.send_request(RPC_PUT_RECORD, &payload).await?;
-                    rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
+                    rx.await
+                        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
                 } else {
                     let payload = build_get_request(&request_id.to_string());
                     let rx = conn.send_request(RPC_GET_RECORD, &payload).await?;
-                    rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
+                    rx.await
+                        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
                 }
                 Ok::<_, io::Error>(())
-            }).await;
+            })
+            .await;
 
             match result {
                 Ok(Ok(())) => {
@@ -694,9 +699,7 @@ async fn do_mixed_operations_async(config: &LoadTestConfig, write_ratio: f64) ->
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    env_logger::builder().filter_level(log::LevelFilter::Info).init();
 
     let config = LoadTestConfig {
         concurrency: 1000,

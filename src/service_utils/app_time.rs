@@ -1,6 +1,6 @@
-use std::time::Duration;
 use lazy_static::lazy_static;
 use minstant::{Anchor, Instant};
+use std::time::Duration;
 
 lazy_static! {
     /// Anchor for converting minstant monotonic time to Unix epoch.

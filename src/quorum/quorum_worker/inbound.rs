@@ -1,14 +1,14 @@
-use std::sync::Arc;
 use crossbeam_channel::{Receiver, TryRecvError};
 use crossbeam_queue::SegQueue;
 use log::{info, warn};
+use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::Level;
 
 use crate::quorum::types::{LocalQuorumResponse, LocalQuorumTaskResponseType};
 use crate::raft::raft_sm::{
-    LocalAppendEntries, LocalRaftMessage,
-    LocalRaftMessagePayload, LocalRaftWriteBatchRequest, LocalRequestVoteRequest, LogEntry,
+    LocalAppendEntries, LocalRaftMessage, LocalRaftMessagePayload, LocalRaftWriteBatchRequest, LocalRequestVoteRequest,
+    LogEntry,
 };
 use crate::transport::capnp::owned_message::OwnedQuorumMessage;
 use crate::transport::capnp::raft_capnp::remote_quorum_message;
@@ -129,12 +129,7 @@ fn handle_inbound_message(
             }
             Which::TruncateLogResponse(resp) => {
                 let resp = resp?;
-                on_truncate_log_response(
-                    response_queue,
-                    ongoing_backfill,
-                    resp.get_request_id(),
-                    resp.get_ok(),
-                );
+                on_truncate_log_response(response_queue, ongoing_backfill, resp.get_request_id(), resp.get_ok());
             }
             Which::AppendEntriesRequest(req) => {
                 let req = req?;
@@ -242,7 +237,8 @@ fn on_append_entries_ack(
         } else {
             log::warn!(
                 "Ongoing backfill already in progress, ignoring new backfill request for term {} and index {}",
-                last_log_term, last_log_index
+                last_log_term,
+                last_log_index
             );
         }
     } else if request_id != 0 {
@@ -303,11 +299,7 @@ fn on_truncate_log_response(
     request_id: u64,
     ok: bool,
 ) {
-    log::info!(
-        "Received truncate log response for request {}, ok: {}",
-        request_id,
-        ok
-    );
+    log::info!("Received truncate log response for request {}, ok: {}", request_id, ok);
     response_queue.push(LocalQuorumResponse {
         response_type: LocalQuorumTaskResponseType::TruncateLogResponse { id: request_id, ok },
     });

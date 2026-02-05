@@ -1,9 +1,9 @@
+use config::{Config, Environment, File};
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::fmt;
 use std::ops::Add;
 use std::path::Path;
-use config::{Config, Environment, File};
-use serde::Deserialize;
 
 /// Configuration validation error
 #[derive(Debug)]
@@ -48,13 +48,19 @@ impl AppConfig {
         if self.max_message_size_bytes < MIN_MESSAGE_SIZE {
             errors.push(ConfigValidationError {
                 field: "max_message_size_bytes".to_string(),
-                message: format!("Must be at least {} bytes, got {}", MIN_MESSAGE_SIZE, self.max_message_size_bytes),
+                message: format!(
+                    "Must be at least {} bytes, got {}",
+                    MIN_MESSAGE_SIZE, self.max_message_size_bytes
+                ),
             });
         }
         if self.max_message_size_bytes > MAX_MESSAGE_SIZE {
             errors.push(ConfigValidationError {
                 field: "max_message_size_bytes".to_string(),
-                message: format!("Must be at most {} bytes, got {}", MAX_MESSAGE_SIZE, self.max_message_size_bytes),
+                message: format!(
+                    "Must be at most {} bytes, got {}",
+                    MAX_MESSAGE_SIZE, self.max_message_size_bytes
+                ),
             });
         }
 
@@ -78,7 +84,10 @@ impl AppConfig {
         if self.min_batch_interval_ms > MAX_BATCH_INTERVAL {
             errors.push(ConfigValidationError {
                 field: "min_batch_interval_ms".to_string(),
-                message: format!("Must be at most {}ms, got {}", MAX_BATCH_INTERVAL, self.min_batch_interval_ms),
+                message: format!(
+                    "Must be at most {}ms, got {}",
+                    MAX_BATCH_INTERVAL, self.min_batch_interval_ms
+                ),
             });
         }
 
@@ -145,7 +154,10 @@ impl AppConfig {
             } else if node.endpoint.parse::<std::net::SocketAddr>().is_err() {
                 errors.push(ConfigValidationError {
                     field: "cluster_nodes".to_string(),
-                    message: format!("Node {} has invalid endpoint '{}': expected format 'host:port'", node.node_id, node.endpoint),
+                    message: format!(
+                        "Node {} has invalid endpoint '{}': expected format 'host:port'",
+                        node.node_id, node.endpoint
+                    ),
                 });
             }
         }
@@ -189,9 +201,9 @@ pub fn read_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     // Initialize a Config builder
     let resource_dir = std::env::var("RESOURCE_DIR").unwrap_or_else(|_| "resources".to_string());
     let default_search_locations = vec![
-        resource_dir.clone(),  // Environment variable-based folder
+        resource_dir.clone(), // Environment variable-based folder
         "src/resources".to_string(),
-        ".".to_string(),           // Current directory
+        ".".to_string(), // Current directory
     ];
     let override_search_locations = default_search_locations.clone();
 
@@ -221,11 +233,12 @@ pub fn read_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
 
     // Validate the configuration
     if let Err(validation_errors) = app_config.validate() {
-        let error_messages: Vec<String> = validation_errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect();
-        return Err(format!("Configuration validation failed:\n  - {}", error_messages.join("\n  - ")).into());
+        let error_messages: Vec<String> = validation_errors.iter().map(|e| e.to_string()).collect();
+        return Err(format!(
+            "Configuration validation failed:\n  - {}",
+            error_messages.join("\n  - ")
+        )
+        .into());
     }
 
     // Use safe display instead of Debug to avoid logging sensitive data
@@ -244,8 +257,14 @@ mod tests {
             metrics_port: 9090,
             node_id: 1,
             cluster_nodes: vec![
-                ClusterNode { endpoint: "127.0.0.1:50051".to_string(), node_id: 2 },
-                ClusterNode { endpoint: "127.0.0.1:50052".to_string(), node_id: 3 },
+                ClusterNode {
+                    endpoint: "127.0.0.1:50051".to_string(),
+                    node_id: 2,
+                },
+                ClusterNode {
+                    endpoint: "127.0.0.1:50052".to_string(),
+                    node_id: 3,
+                },
             ],
             max_message_size_bytes: 1024 * 1024, // 1MB
             min_batch_interval_ms: 100,
@@ -331,14 +350,22 @@ mod tests {
     fn test_validate_duplicate_node_ids() {
         let mut config = create_valid_config();
         config.cluster_nodes = vec![
-            ClusterNode { endpoint: "127.0.0.1:50051".to_string(), node_id: 2 },
-            ClusterNode { endpoint: "127.0.0.1:50052".to_string(), node_id: 2 }, // Duplicate!
+            ClusterNode {
+                endpoint: "127.0.0.1:50051".to_string(),
+                node_id: 2,
+            },
+            ClusterNode {
+                endpoint: "127.0.0.1:50052".to_string(),
+                node_id: 2,
+            }, // Duplicate!
         ];
 
         let result = config.validate();
         assert!(result.is_err());
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| e.field == "cluster_nodes" && e.message.contains("Duplicate")));
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "cluster_nodes" && e.message.contains("Duplicate")));
     }
 
     // =========================================================================
@@ -348,27 +375,33 @@ mod tests {
     #[test]
     fn test_validate_invalid_endpoint_format() {
         let mut config = create_valid_config();
-        config.cluster_nodes = vec![
-            ClusterNode { endpoint: "not-a-valid-endpoint".to_string(), node_id: 2 },
-        ];
+        config.cluster_nodes = vec![ClusterNode {
+            endpoint: "not-a-valid-endpoint".to_string(),
+            node_id: 2,
+        }];
 
         let result = config.validate();
         assert!(result.is_err());
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| e.field == "cluster_nodes" && e.message.contains("invalid endpoint")));
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "cluster_nodes" && e.message.contains("invalid endpoint")));
     }
 
     #[test]
     fn test_validate_empty_endpoint() {
         let mut config = create_valid_config();
-        config.cluster_nodes = vec![
-            ClusterNode { endpoint: "".to_string(), node_id: 2 },
-        ];
+        config.cluster_nodes = vec![ClusterNode {
+            endpoint: "".to_string(),
+            node_id: 2,
+        }];
 
         let result = config.validate();
         assert!(result.is_err());
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| e.field == "cluster_nodes" && e.message.contains("empty endpoint")));
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "cluster_nodes" && e.message.contains("empty endpoint")));
     }
 
     // =========================================================================

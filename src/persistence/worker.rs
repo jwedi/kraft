@@ -1,19 +1,29 @@
+use crossbeam_channel::{Receiver, RecvTimeoutError};
+use crossbeam_queue::SegQueue;
+use csv::{ReaderBuilder, Writer, WriterBuilder};
+use log::info;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::{BufWriter, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
-use crossbeam_channel::{Receiver, RecvTimeoutError};
-use crossbeam_queue::SegQueue;
-use csv::{ReaderBuilder, Writer, WriterBuilder};
-use log::info;
 use tracing::{Level, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub enum PersistenceTaskType {
-    AppendVote{id: u64, term: u64, candidate_id: u32, parent_span: Span},
-    AppendLog{id: u64, data: Arc<Vec<u8>>, parent_span: Span, request_id: u64},
+    AppendVote {
+        id: u64,
+        term: u64,
+        candidate_id: u32,
+        parent_span: Span,
+    },
+    AppendLog {
+        id: u64,
+        data: Arc<Vec<u8>>,
+        parent_span: Span,
+        request_id: u64,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -23,31 +33,30 @@ pub struct VoteRow {
 }
 
 pub enum PersistenceResponseType {
-    VotePersisted{id: u64, term: u64, candidate_id: u32},
-    LogPersisted{id: u64}
+    VotePersisted { id: u64, term: u64, candidate_id: u32 },
+    LogPersisted { id: u64 },
 }
 
 pub struct PersistenceConfig {
-    pub out_dir: String
+    pub out_dir: String,
 }
 
 pub struct PersistenceWorker {
     work_queue: Receiver<PersistenceTaskType>,
     response_queue: Arc<SegQueue<PersistenceResponseType>>,
-    persistence_config: PersistenceConfig
+    persistence_config: PersistenceConfig,
 }
 
 impl PersistenceWorker {
-
     pub fn new(
         work_queue: Receiver<PersistenceTaskType>,
         response_queue: Arc<SegQueue<PersistenceResponseType>>,
-        persistence_config: PersistenceConfig
+        persistence_config: PersistenceConfig,
     ) -> Self {
         Self {
             work_queue,
             response_queue,
-            persistence_config
+            persistence_config,
         }
     }
 
@@ -71,7 +80,9 @@ impl PersistenceWorker {
             .append(true)
             .open(format!("{}votes.csv", self.persistence_config.out_dir))
             .unwrap();
-        let mut vote_write_buffer = WriterBuilder::new().has_headers(false).from_writer(vote_write_file_handle);
+        let mut vote_write_buffer = WriterBuilder::new()
+            .has_headers(false)
+            .from_writer(vote_write_file_handle);
 
         // Track pending log responses for batched flushing
         let mut pending_log_responses: Vec<PersistenceResponseType> = Vec::with_capacity(BATCH_SIZE);
@@ -80,16 +91,30 @@ impl PersistenceWorker {
             // Block until task arrives (or timeout for batch flush)
             match self.work_queue.recv_timeout(Duration::from_millis(10)) {
                 Ok(task) => {
-                    self.process_task(task, &mut log_write_buffer, &mut vote_write_buffer, &mut pending_log_responses, BATCH_SIZE);
+                    self.process_task(
+                        task,
+                        &mut log_write_buffer,
+                        &mut vote_write_buffer,
+                        &mut pending_log_responses,
+                        BATCH_SIZE,
+                    );
 
                     // After processing, drain any additional queued tasks (non-blocking) for batching
                     while let Ok(task) = self.work_queue.try_recv() {
-                        self.process_task(task, &mut log_write_buffer, &mut vote_write_buffer, &mut pending_log_responses, BATCH_SIZE);
+                        self.process_task(
+                            task,
+                            &mut log_write_buffer,
+                            &mut vote_write_buffer,
+                            &mut pending_log_responses,
+                            BATCH_SIZE,
+                        );
                     }
 
                     // Flush after draining the queue
                     if !pending_log_responses.is_empty() {
-                        let flushed = self.flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses).unwrap();
+                        let flushed = self
+                            .flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses)
+                            .unwrap();
                         if flushed > 1 {
                             tracing::debug!("Batched flush of {} log entries", flushed);
                         }
@@ -97,11 +122,13 @@ impl PersistenceWorker {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // Timeout - flush any pending writes to ensure durability
-                    self.flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses).unwrap();
+                    self.flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses)
+                        .unwrap();
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     // Channel closed, flush remaining and exit
-                    self.flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses).unwrap();
+                    self.flush_pending_logs(&mut log_write_buffer, &mut pending_log_responses)
+                        .unwrap();
                     info!("Persistence worker channel disconnected, exiting");
                     break;
                 }
@@ -118,33 +145,61 @@ impl PersistenceWorker {
         batch_size: usize,
     ) {
         match task {
-            PersistenceTaskType::AppendVote{id, term, candidate_id, parent_span} => {
+            PersistenceTaskType::AppendVote {
+                id,
+                term,
+                candidate_id,
+                parent_span,
+            } => {
                 // Flush any pending log writes before handling vote
-                self.flush_pending_logs(log_write_buffer, pending_log_responses).unwrap();
+                self.flush_pending_logs(log_write_buffer, pending_log_responses)
+                    .unwrap();
 
-                let span = tracing::span!(Level::INFO, "persistence_append_vote", id=id, term=term, candidate=candidate_id);
+                let span = tracing::span!(
+                    Level::INFO,
+                    "persistence_append_vote",
+                    id = id,
+                    term = term,
+                    candidate = candidate_id
+                );
                 span.set_parent(parent_span.context());
                 let _enter = span.enter();
                 log::info!("Saving vote message {}, term {}, candidate {}", id, term, candidate_id);
                 self.persist_vote(term, candidate_id, vote_write_buffer).unwrap();
-                self.response_queue.push(PersistenceResponseType::VotePersisted{id, term, candidate_id})
+                self.response_queue
+                    .push(PersistenceResponseType::VotePersisted { id, term, candidate_id })
             }
-            PersistenceTaskType::AppendLog {id, data, parent_span, request_id} => {
-                log::debug!("Appending log entry with id {} and data length {}", request_id, data.len());
-                let span = tracing::span!(Level::INFO, "persistence_append_log", id=id, bytes=data.len());
+            PersistenceTaskType::AppendLog {
+                id,
+                data,
+                parent_span,
+                request_id,
+            } => {
+                log::debug!(
+                    "Appending log entry with id {} and data length {}",
+                    request_id,
+                    data.len()
+                );
+                let span = tracing::span!(Level::INFO, "persistence_append_log", id = id, bytes = data.len());
                 span.set_parent(parent_span.context());
                 let _enter = span.enter();
-                tracing::debug!("Appending log entry with id {} and data length {}", request_id, data.len());
+                tracing::debug!(
+                    "Appending log entry with id {} and data length {}",
+                    request_id,
+                    data.len()
+                );
 
                 // Write to buffer without flushing
                 self.write_log_entry(data, log_write_buffer).unwrap();
 
                 // Queue response for later (after flush)
-                pending_log_responses.push(PersistenceResponseType::LogPersisted{id});
+                pending_log_responses.push(PersistenceResponseType::LogPersisted { id });
 
                 // Flush if batch is full
                 if pending_log_responses.len() >= batch_size {
-                    let flushed = self.flush_pending_logs(log_write_buffer, pending_log_responses).unwrap();
+                    let flushed = self
+                        .flush_pending_logs(log_write_buffer, pending_log_responses)
+                        .unwrap();
                     if flushed > 1 {
                         tracing::debug!("Batched flush of {} log entries", flushed);
                     }
@@ -154,11 +209,13 @@ impl PersistenceWorker {
         }
     }
 
-    pub fn persist_vote(&mut self, term: u64, candidate_id: u32, file_handle: & mut Writer<File>) -> Result<(), Box<dyn Error>> {
-        file_handle.serialize(VoteRow {
-            term,
-            candidate_id
-        })?;
+    pub fn persist_vote(
+        &mut self,
+        term: u64,
+        candidate_id: u32,
+        file_handle: &mut Writer<File>,
+    ) -> Result<(), Box<dyn Error>> {
+        file_handle.serialize(VoteRow { term, candidate_id })?;
         file_handle.flush()?;
         Ok(())
     }

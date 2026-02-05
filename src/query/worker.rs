@@ -1,50 +1,48 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::thread;
-use std::time::Duration;
-use bus::BusReader;
-use crossbeam_utils::Backoff;
-use crossbeam_queue::SegQueue;
-use log::{debug, info, warn};
-use tokio::sync::oneshot;
 use crate::raft::raft_sm::CommitState;
 use crate::transport::capnp::OwnedLogEntry;
+use bus::BusReader;
+use crossbeam_queue::SegQueue;
+use crossbeam_utils::Backoff;
+use log::{debug, info, warn};
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 pub struct QueryWorker {
     bus: BusReader<Arc<OwnedLogEntry>>,
     commit_state: Arc<CommitState>,
     query_structure: HashMap<String, Arc<Vec<u8>>>,
-    pending_queries: Arc<SegQueue<QueryRequest>>
+    pending_queries: Arc<SegQueue<QueryRequest>>,
 }
 
 pub struct QueryResponse {
-    pub value: Option<Arc<Vec<u8>>>
+    pub value: Option<Arc<Vec<u8>>>,
 }
 
 pub struct QueryRequest {
     pub id: String,
     pub index: u64,
-    pub callback: oneshot::Sender<QueryResponse>
+    pub callback: oneshot::Sender<QueryResponse>,
 }
 
 impl QueryWorker {
-
     pub fn new(
         bus: BusReader<Arc<OwnedLogEntry>>,
         commit_state: Arc<CommitState>,
-        pending_queries: Arc<SegQueue<QueryRequest>>
+        pending_queries: Arc<SegQueue<QueryRequest>>,
     ) -> Self {
         Self {
             bus,
             commit_state,
             query_structure: HashMap::new(),
-            pending_queries
+            pending_queries,
         }
     }
 
     pub fn run(&mut self) {
-
         let mut last_version = 0;
         let mut parked: Option<Arc<OwnedLogEntry>> = None;
         let mut parked_request: Option<QueryRequest> = None;
@@ -81,7 +79,10 @@ impl QueryWorker {
                                 let _ = val.for_each_command(|id, payload, _| {
                                     self.query_structure.insert(id.to_string(), Arc::new(payload.to_vec()));
                                     if entry_index < applied_index {
-                                        warn!("Received index {} less than previously applied index {}", entry_index, applied_index);
+                                        warn!(
+                                            "Received index {} less than previously applied index {}",
+                                            entry_index, applied_index
+                                        );
                                     }
                                 });
                                 applied_index = entry_index;
@@ -98,11 +99,14 @@ impl QueryWorker {
                         }
                         Err(..) => {
                             break;
-                        },
+                        }
                     }
                     num_entries_applied += 1
                 }
-                debug!("Applied transaction log data to commit version: {}, number of updates applied {}", current_version, num_entries_applied)
+                debug!(
+                    "Applied transaction log data to commit version: {}, number of updates applied {}",
+                    current_version, num_entries_applied
+                )
             }
 
             // Process read requests
@@ -114,14 +118,16 @@ impl QueryWorker {
                         self.handle_query(query);
                         queries_fulfilled += 1;
                     } else {
-                        info!("Parked query with index {}, applied index {}", query.index, applied_index);
+                        info!(
+                            "Parked query with index {}, applied index {}",
+                            query.index, applied_index
+                        );
                         parked_request = Some(query);
                         thread::yield_now();
-                        continue
+                        continue;
                     }
                 }
-                None => {
-                }
+                None => {}
             }
 
             loop {
@@ -164,12 +170,14 @@ impl QueryWorker {
         let resp = self.query_structure.get(&query.id);
         match resp {
             None => {
-                if let Err(_) = query.callback.send(QueryResponse{ value: None}) {
+                if let Err(_) = query.callback.send(QueryResponse { value: None }) {
                     warn!("handle_query sending empty response failed, the receiver dropped")
                 }
             }
             Some(value) => {
-                if let Err(_) = query.callback.send(QueryResponse{ value: Some(Arc::clone(value))}) {
+                if let Err(_) = query.callback.send(QueryResponse {
+                    value: Some(Arc::clone(value)),
+                }) {
                     warn!("handle_query sending response failed, the receiver dropped")
                 }
             }

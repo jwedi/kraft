@@ -5,17 +5,15 @@ use tracing::Span;
 use crate::persistence::worker::PersistenceTaskType;
 use crate::quorum::types::{LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
 use crate::raft::raft_sm::{
-    LocalRaftResponseMessage, LocalRaftResponsePayload, LocalRaftWriteBatchRequest,
-    LocalRaftWriteBatchResponse, OutstandingMessage, OutstandingMessageType, SharedState,
+    LocalRaftResponseMessage, LocalRaftResponsePayload, LocalRaftWriteBatchRequest, LocalRaftWriteBatchResponse,
+    OutstandingMessage, OutstandingMessageType, SharedState,
 };
 use crate::service_utils::app_time::now_millis;
 use crate::transport::capnp::{build_owned_log_entry, build_owned_write_batch_response, OwnedLogEntry};
 
 /// Validates a write batch request.
 /// Returns None if valid, or an error message if invalid.
-pub fn validate_write_batch(
-    write_batch_request: &LocalRaftWriteBatchRequest,
-) -> Option<&'static str> {
+pub fn validate_write_batch(write_batch_request: &LocalRaftWriteBatchRequest) -> Option<&'static str> {
     if write_batch_request.message.is_empty() {
         return Some("Empty write batch request");
     }
@@ -36,32 +34,37 @@ pub fn create_and_append_log_entry(
     let timestamp = now_millis() as u64;
 
     // Build OwnedLogEntry by reading commands from the write batch
-    let owned_entry = Arc::new(write_batch_request.message.with_message(|reader| {
-        let requests = reader.get_requests().ok();
-        let request_count = requests.as_ref().map(|r| r.len()).unwrap_or(0);
-        build_owned_log_entry(|mut builder| {
-            builder.set_index(idx);
-            builder.set_term(current_term);
-            builder.set_prev_log_index(prev_log_index);
-            builder.set_prev_log_term(prev_log_term);
-            builder.set_message_id(message_id);
-            builder.set_timestamp(timestamp);
-            // Build commands from write batch requests
-            let mut commands = builder.init_commands(request_count as u32);
-            if let Some(reqs) = &requests {
-                for (i, req) in reqs.iter().enumerate() {
-                let mut cmd = commands.reborrow().get(i as u32);
-                if let Ok(id) = req.get_id() {
-                    cmd.set_id(id);
-                }
-                if let Ok(payload) = req.get_payload() {
-                    cmd.set_payload(payload);
-                }
-                cmd.set_node_id(req.get_node_id());
-                }
-            }
-        })
-    }).expect("Failed to build log entry from write batch"));
+    let owned_entry = Arc::new(
+        write_batch_request
+            .message
+            .with_message(|reader| {
+                let requests = reader.get_requests().ok();
+                let request_count = requests.as_ref().map(|r| r.len()).unwrap_or(0);
+                build_owned_log_entry(|mut builder| {
+                    builder.set_index(idx);
+                    builder.set_term(current_term);
+                    builder.set_prev_log_index(prev_log_index);
+                    builder.set_prev_log_term(prev_log_term);
+                    builder.set_message_id(message_id);
+                    builder.set_timestamp(timestamp);
+                    // Build commands from write batch requests
+                    let mut commands = builder.init_commands(request_count as u32);
+                    if let Some(reqs) = &requests {
+                        for (i, req) in reqs.iter().enumerate() {
+                            let mut cmd = commands.reborrow().get(i as u32);
+                            if let Ok(id) = req.get_id() {
+                                cmd.set_id(id);
+                            }
+                            if let Ok(payload) = req.get_payload() {
+                                cmd.set_payload(payload);
+                            }
+                            cmd.set_node_id(req.get_node_id());
+                        }
+                    }
+                })
+            })
+            .expect("Failed to build log entry from write batch"),
+    );
 
     // Track term start if this is the first entry of a new term
     if prev_log_term != current_term {
@@ -72,7 +75,10 @@ pub fn create_and_append_log_entry(
     }
 
     // Append to replication log
-    shared_state.volatile_server_state.replication_log.push(Arc::clone(&owned_entry));
+    shared_state
+        .volatile_server_state
+        .replication_log
+        .push(Arc::clone(&owned_entry));
 
     tracing::info!("created log entry size: {} bytes", owned_entry.as_bytes().len());
     owned_entry
@@ -101,19 +107,16 @@ pub fn dispatch_to_quorum(
     owned_entry: Arc<crate::transport::capnp::OwnedLogEntry>,
     shared_state: &SharedState,
 ) {
-    shared_state
-        .quorum_worker_tasks
-        .iter()
-        .for_each(|task_queue| {
-            let quorum_span = Span::current();
-            let task = LocalQuorumWorkerTaskType::AppendEntries {
-                id: message_id,
-                parent_span: quorum_span,
-                entry: owned_entry.clone(),
-                commit_index: shared_state.volatile_server_state.commit_index,
-            };
-            task_queue.push(LocalQuorumWorkerTask { task_type: task });
-        });
+    shared_state.quorum_worker_tasks.iter().for_each(|task_queue| {
+        let quorum_span = Span::current();
+        let task = LocalQuorumWorkerTaskType::AppendEntries {
+            id: message_id,
+            parent_span: quorum_span,
+            entry: owned_entry.clone(),
+            commit_index: shared_state.volatile_server_state.commit_index,
+        };
+        task_queue.push(LocalQuorumWorkerTask { task_type: task });
+    });
 }
 
 /// Creates and registers an outstanding message for tracking the write batch.
@@ -151,10 +154,7 @@ pub fn update_volatile_state(idx: u64, shared_state: &mut SharedState) {
 }
 
 /// Sends an error response for an invalid write batch.
-pub fn send_error_response(
-    error_msg: &str,
-    callback: oneshot::Sender<LocalRaftResponseMessage>,
-) {
+pub fn send_error_response(error_msg: &str, callback: oneshot::Sender<LocalRaftResponseMessage>) {
     log::warn!("{}", error_msg);
     let r = LocalRaftWriteBatchResponse {
         message: build_owned_write_batch_response(|_| {}),
@@ -168,11 +168,7 @@ pub fn send_error_response(
 /// Creates a no-op log entry and appends it to the replication log.
 /// No-op entries have zero commands and are used for leader initialization
 /// per Raft Section 5.4.2.
-pub fn create_and_append_noop_entry(
-    idx: u64,
-    message_id: u64,
-    shared_state: &mut SharedState,
-) -> Arc<OwnedLogEntry> {
+pub fn create_and_append_noop_entry(idx: u64, message_id: u64, shared_state: &mut SharedState) -> Arc<OwnedLogEntry> {
     let current_term = shared_state.server_state.current_term;
     let prev_log_index = shared_state.volatile_server_state.last_log_index;
     let prev_log_term = shared_state.volatile_server_state.last_log_term;
@@ -196,16 +192,15 @@ pub fn create_and_append_noop_entry(
         );
     }
 
-    shared_state.volatile_server_state.replication_log.push(Arc::clone(&owned_entry));
+    shared_state
+        .volatile_server_state
+        .replication_log
+        .push(Arc::clone(&owned_entry));
     owned_entry
 }
 
 /// Registers an outstanding message for tracking the no-op entry.
-pub fn register_noop_outstanding_message(
-    message_id: u64,
-    idx: u64,
-    shared_state: &mut SharedState,
-) {
+pub fn register_noop_outstanding_message(message_id: u64, idx: u64, shared_state: &mut SharedState) {
     let message_type = OutstandingMessageType::NoOp {
         persistence_done: false,
         quorum_acks: 0,
@@ -217,15 +212,15 @@ pub fn register_noop_outstanding_message(
         message_type,
         span: Span::current(),
     };
-    shared_state.outstanding_messages.insert(message_id, outstanding_message);
+    shared_state
+        .outstanding_messages
+        .insert(message_id, outstanding_message);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::raft_sm::{
-        CommitState, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig,
-    };
+    use crate::raft::raft_sm::{CommitState, RaftServerState, RaftVolatileState, SharedState, StateMachineConfig};
     use crate::transport::capnp::build_owned_write_batch;
     use bus::Bus;
     use crossbeam_channel::{unbounded, Receiver};
@@ -238,42 +233,45 @@ mod tests {
             vec![Arc::new(SegQueue::new()), Arc::new(SegQueue::new())];
         let (persistence_tx, persistence_rx) = unbounded();
 
-        (SharedState {
-            server_state: RaftServerState {
-                current_term: 2,
-                leader_id: 1,
+        (
+            SharedState {
+                server_state: RaftServerState {
+                    current_term: 2,
+                    leader_id: 1,
+                },
+                volatile_server_state: RaftVolatileState {
+                    next_term: 3,
+                    last_log_term: 1,
+                    last_log_index: 5,
+                    commit_index: 3,
+                    replication_log: vec![],
+                    replication_log_term_starts: HashMap::new(),
+                    last_applied: 0,
+                    next_log_index: 6,
+                    commit_state: Arc::new(CommitState {
+                        commit_index: AtomicU64::new(3),
+                        version: AtomicU64::new(0),
+                    }),
+                    last_broadcast_index: None,
+                    has_deferred_broadcast: false,
+                },
+                next_message_id: 100,
+                outstanding_messages: HashMap::new(),
+                quorum_size: 2,
+                quorum_worker_tasks: quorum_tasks,
+                persistence_work: persistence_tx,
+                persistence_response: Arc::new(SegQueue::new()),
+                quorum_work: Arc::new(SegQueue::new()),
+                quorum_response: Arc::new(SegQueue::new()),
+                identity: 1,
+                term_votes: HashMap::new(),
+                state_machine_config: StateMachineConfig {
+                    max_message_size_bytes: 2048,
+                },
+                log_entry_bus: Bus::new(5000),
             },
-            volatile_server_state: RaftVolatileState {
-                next_term: 3,
-                last_log_term: 1,
-                last_log_index: 5,
-                commit_index: 3,
-                replication_log: vec![],
-                replication_log_term_starts: HashMap::new(),
-                last_applied: 0,
-                next_log_index: 6,
-                commit_state: Arc::new(CommitState {
-                    commit_index: AtomicU64::new(3),
-                    version: AtomicU64::new(0),
-                }),
-                last_broadcast_index: None,
-                has_deferred_broadcast: false,
-            },
-            next_message_id: 100,
-            outstanding_messages: HashMap::new(),
-            quorum_size: 2,
-            quorum_worker_tasks: quorum_tasks,
-            persistence_work: persistence_tx,
-            persistence_response: Arc::new(SegQueue::new()),
-            quorum_work: Arc::new(SegQueue::new()),
-            quorum_response: Arc::new(SegQueue::new()),
-            identity: 1,
-            term_votes: HashMap::new(),
-            state_machine_config: StateMachineConfig {
-                max_message_size_bytes: 2048,
-            },
-            log_entry_bus: Bus::new(5000),
-        }, persistence_rx)
+            persistence_rx,
+        )
     }
 
     fn create_write_batch_request_with_data() -> LocalRaftWriteBatchRequest {
@@ -335,9 +333,11 @@ mod tests {
 
         // Verify commands via for_each_command
         let mut commands = Vec::new();
-        entry.for_each_command(|id, _payload, _node_id| {
-            commands.push(id.to_string());
-        }).unwrap();
+        entry
+            .for_each_command(|id, _payload, _node_id| {
+                commands.push(id.to_string());
+            })
+            .unwrap();
         assert_eq!(commands, vec!["req1", "req2"]);
     }
 

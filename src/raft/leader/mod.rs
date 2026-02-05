@@ -5,9 +5,9 @@
 //! - `outstanding`: Outstanding message handling (persistence and quorum responses)
 //! - `replication`: Log replication and backfill handling
 
-mod write_batch;
 mod outstanding;
 mod replication;
+mod write_batch;
 
 use log::info;
 use rand::rngs::ThreadRng;
@@ -20,10 +20,9 @@ use crate::persistence::worker::PersistenceTaskType;
 use crate::quorum::types::{LocalQuorumWorkerTask, LocalQuorumWorkerTaskType};
 use crate::raft::follower::RaftFollowerStateDelegate;
 use crate::raft::raft_sm::{
-    LocalAppendEntries, LocalAppendEntriesCallbackResponse, OutstandingMessage,
-    OutstandingMessageType, RaftMessageStateChange, RaftNodeType, RaftProtocol,
-    LocalRaftResponseMessage, LocalRaftResponsePayload, LocalRaftWriteBatchRequest,
-    LocalRequestVoteRequest, SharedState,
+    LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftResponseMessage, LocalRaftResponsePayload,
+    LocalRaftWriteBatchRequest, LocalRequestVoteRequest, OutstandingMessage, OutstandingMessageType,
+    RaftMessageStateChange, RaftNodeType, RaftProtocol, SharedState,
 };
 use crate::service_utils::app_time::now_millis;
 
@@ -135,9 +134,7 @@ impl RaftLeaderStateDelegate {
         let last_log_index = shared_state.volatile_server_state.last_log_index;
         let last_log_term = shared_state.volatile_server_state.last_log_term;
 
-        if append_entries_request.prev_index == last_log_index
-            && append_entries_request.prev_term == last_log_term
-        {
+        if append_entries_request.prev_index == last_log_index && append_entries_request.prev_term == last_log_term {
             // Request is consecutive - acknowledge and transition to follower
             callback
                 .send(LocalRaftResponseMessage {
@@ -182,7 +179,12 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         let idx = shared_state.volatile_server_state.next_log_index;
         let batch_size = write_batch_request.message.len();
 
-        tracing::info!("writing batches {} as message id: {} with index: {}", batch_size, message_id, idx);
+        tracing::info!(
+            "writing batches {} as message id: {} with index: {}",
+            batch_size,
+            message_id,
+            idx
+        );
         shared_state.next_message_id += 1;
 
         let span = tracing::span!(Level::INFO, "delegate_write_batch");
@@ -195,12 +197,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
         }
 
         // Create OwnedLogEntry directly and append to log
-        let owned_entry = write_batch::create_and_append_log_entry(
-            &write_batch_request,
-            idx,
-            message_id,
-            shared_state,
-        );
+        let owned_entry = write_batch::create_and_append_log_entry(&write_batch_request, idx, message_id, shared_state);
 
         // Queue persistence task (writes Cap'n Proto bytes directly)
         if !write_batch::queue_persistence_task(message_id, &owned_entry, shared_state) {
@@ -270,12 +267,7 @@ impl RaftProtocol for RaftLeaderStateDelegate {
 
         // Handle backfill requests
         for (quorum_node_id, last_log_term, last_log_index) in backfill_requests {
-            replication::handle_backfill_request(
-                shared_state,
-                quorum_node_id,
-                last_log_term,
-                last_log_index,
-            );
+            replication::handle_backfill_request(shared_state, quorum_node_id, last_log_term, last_log_index);
         }
 
         // Retry deferred broadcasts
@@ -323,7 +315,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             });
             return RaftMessageStateChange::None;
         }
-        shared_state.term_votes.insert(request_vote_request.term, request_vote_request.candidate_id);
+        shared_state
+            .term_votes
+            .insert(request_vote_request.term, request_vote_request.candidate_id);
         shared_state.next_message_id = message_id + 1;
 
         let message_type = OutstandingMessageType::RequestVote { callback };
@@ -335,7 +329,9 @@ impl RaftProtocol for RaftLeaderStateDelegate {
             message_type,
             span: response_span,
         };
-        shared_state.outstanding_messages.insert(message_id, outstanding_message);
+        shared_state
+            .outstanding_messages
+            .insert(message_id, outstanding_message);
 
         RaftMessageStateChange::None
     }
@@ -343,57 +339,65 @@ impl RaftProtocol for RaftLeaderStateDelegate {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use super::*;
+    use crate::persistence::worker::PersistenceResponseType;
+    use crate::quorum::types::LocalQuorumResponse;
+    use crate::quorum::types::LocalQuorumTaskResponseType;
     use crate::raft::raft_sm::*;
-    use tokio::sync::oneshot;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
-    use std::time::Instant;
+    use crate::transport::capnp::{build_owned_log_entry, build_owned_write_batch};
     use bus::Bus;
     use crossbeam_channel::unbounded;
     use crossbeam_queue::SegQueue;
-    use crate::quorum::types::LocalQuorumResponse;
-    use crate::quorum::types::LocalQuorumTaskResponseType;
-    use crate::persistence::worker::PersistenceResponseType;
-    use crate::transport::capnp::{build_owned_write_batch, build_owned_log_entry};
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::oneshot;
 
-    fn create_shared_state() -> (SharedState, crossbeam_channel::Receiver<crate::persistence::worker::PersistenceTaskType>) {
+    fn create_shared_state() -> (
+        SharedState,
+        crossbeam_channel::Receiver<crate::persistence::worker::PersistenceTaskType>,
+    ) {
         let (persistence_tx, persistence_rx) = unbounded();
-        (SharedState {
-            server_state: RaftServerState {
-                current_term: 1,
-                leader_id: 1,
+        (
+            SharedState {
+                server_state: RaftServerState {
+                    current_term: 1,
+                    leader_id: 1,
+                },
+                volatile_server_state: RaftVolatileState {
+                    next_term: 2,
+                    last_log_term: 1,
+                    last_log_index: 0,
+                    commit_index: 0,
+                    replication_log: vec![],
+                    replication_log_term_starts: HashMap::new(),
+                    last_applied: 0,
+                    next_log_index: 1,
+                    commit_state: Arc::new(CommitState {
+                        commit_index: AtomicU64::new(0),
+                        version: AtomicU64::new(0),
+                    }),
+                    last_broadcast_index: None,
+                    has_deferred_broadcast: false,
+                },
+                next_message_id: 1,
+                outstanding_messages: std::collections::HashMap::new(),
+                quorum_size: 3,
+                quorum_worker_tasks: vec![],
+                persistence_work: persistence_tx,
+                persistence_response: Arc::new(SegQueue::new()),
+                quorum_work: Arc::new(SegQueue::new()),
+                quorum_response: Arc::new(SegQueue::new()),
+                identity: 0,
+                term_votes: HashMap::new(),
+                state_machine_config: StateMachineConfig {
+                    max_message_size_bytes: 2048,
+                },
+                log_entry_bus: Bus::new(5000),
             },
-            volatile_server_state: RaftVolatileState {
-                next_term: 2,
-                last_log_term: 1,
-                last_log_index: 0,
-                commit_index: 0,
-                replication_log: vec![],
-                replication_log_term_starts: HashMap::new(),
-                last_applied: 0,
-                next_log_index: 1,
-                commit_state: Arc::new(CommitState {
-                    commit_index: AtomicU64::new(0),
-                    version: AtomicU64::new(0),
-                }),
-                last_broadcast_index: None,
-                has_deferred_broadcast: false,
-            },
-            next_message_id: 1,
-            outstanding_messages: std::collections::HashMap::new(),
-            quorum_size: 3,
-            quorum_worker_tasks: vec![],
-            persistence_work: persistence_tx,
-            persistence_response: Arc::new(SegQueue::new()),
-            quorum_work: Arc::new(SegQueue::new()),
-            quorum_response: Arc::new(SegQueue::new()),
-            identity: 0,
-            term_votes: HashMap::new(),
-            state_machine_config: StateMachineConfig { max_message_size_bytes: 2048 },
-            log_entry_bus: Bus::new(5000),
-        }, persistence_rx)
+            persistence_rx,
+        )
     }
 
     #[tokio::test]
@@ -457,21 +461,36 @@ mod tests {
         shared_state.volatile_server_state.next_term = 4;
 
         // Leader has 5 entries: 3 in term 2, then 2 in term 3
-        shared_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
-        shared_state.volatile_server_state.replication_log_term_starts.insert(3, 3);
+        shared_state
+            .volatile_server_state
+            .replication_log_term_starts
+            .insert(2, 0);
+        shared_state
+            .volatile_server_state
+            .replication_log_term_starts
+            .insert(3, 3);
 
         for i in 0..5u64 {
             let term = if i < 3 { 2 } else { 3 };
             let prev_index = if i > 0 { i - 1 } else { 0 };
-            let prev_term = if i < 3 { 2 } else if i == 3 { 2 } else { 3 };
-            shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
-                builder.set_index(i);
-                builder.set_term(term);
-                builder.set_prev_log_index(prev_index);
-                builder.set_prev_log_term(prev_term);
-                builder.set_message_id(i);
-                builder.set_timestamp(0);
-            })));
+            let prev_term = if i < 3 {
+                2
+            } else if i == 3 {
+                2
+            } else {
+                3
+            };
+            shared_state
+                .volatile_server_state
+                .replication_log
+                .push(Arc::new(build_owned_log_entry(|mut builder| {
+                    builder.set_index(i);
+                    builder.set_term(term);
+                    builder.set_prev_log_index(prev_index);
+                    builder.set_prev_log_term(prev_term);
+                    builder.set_message_id(i);
+                    builder.set_timestamp(0);
+                })));
         }
 
         // Set up quorum worker task queues
@@ -494,7 +513,9 @@ mod tests {
 
         if let Some(task) = queue.pop() {
             match task.task_type {
-                LocalQuorumWorkerTaskType::TruncateLog { prev_term, prev_index, .. } => {
+                LocalQuorumWorkerTaskType::TruncateLog {
+                    prev_term, prev_index, ..
+                } => {
                     assert_eq!(prev_term, 2);
                     assert_eq!(prev_index, 2);
                 }
@@ -513,22 +534,28 @@ mod tests {
         shared_state.server_state.leader_id = 0;
 
         // Leader has 2 entries
-        shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
-            builder.set_index(0);
-            builder.set_term(1);
-            builder.set_prev_log_index(0);
-            builder.set_prev_log_term(0);
-            builder.set_message_id(0);
-            builder.set_timestamp(0);
-        })));
-        shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
-            builder.set_index(1);
-            builder.set_term(3);
-            builder.set_prev_log_index(0);
-            builder.set_prev_log_term(1);
-            builder.set_message_id(0);
-            builder.set_timestamp(0);
-        })));
+        shared_state
+            .volatile_server_state
+            .replication_log
+            .push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(0);
+                builder.set_term(1);
+                builder.set_prev_log_index(0);
+                builder.set_prev_log_term(0);
+                builder.set_message_id(0);
+                builder.set_timestamp(0);
+            })));
+        shared_state
+            .volatile_server_state
+            .replication_log
+            .push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(1);
+                builder.set_term(3);
+                builder.set_prev_log_index(0);
+                builder.set_prev_log_term(1);
+                builder.set_message_id(0);
+                builder.set_timestamp(0);
+            })));
 
         shared_state.quorum_worker_tasks = vec![Arc::new(SegQueue::new()); 3];
 
@@ -549,7 +576,9 @@ mod tests {
 
         if let Some(task) = queue.pop() {
             match task.task_type {
-                LocalQuorumWorkerTaskType::TruncateLog { prev_term, prev_index, .. } => {
+                LocalQuorumWorkerTaskType::TruncateLog {
+                    prev_term, prev_index, ..
+                } => {
                     assert_eq!(prev_term, 3);
                     assert_eq!(prev_index, 1);
                 }
@@ -567,19 +596,28 @@ mod tests {
         shared_state.server_state.current_term = 3;
         shared_state.server_state.leader_id = 0;
 
-        shared_state.volatile_server_state.replication_log_term_starts.insert(2, 0);
-        shared_state.volatile_server_state.replication_log_term_starts.insert(3, 6);
+        shared_state
+            .volatile_server_state
+            .replication_log_term_starts
+            .insert(2, 0);
+        shared_state
+            .volatile_server_state
+            .replication_log_term_starts
+            .insert(3, 6);
 
         for i in 0..10u64 {
             let term = if i < 6 { 2 } else { 3 };
-            shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
-                builder.set_index(i);
-                builder.set_term(term);
-                builder.set_prev_log_index(0);
-                builder.set_prev_log_term(0);
-                builder.set_message_id(i);
-                builder.set_timestamp(0);
-            })));
+            shared_state
+                .volatile_server_state
+                .replication_log
+                .push(Arc::new(build_owned_log_entry(|mut builder| {
+                    builder.set_index(i);
+                    builder.set_term(term);
+                    builder.set_prev_log_index(0);
+                    builder.set_prev_log_term(0);
+                    builder.set_message_id(i);
+                    builder.set_timestamp(0);
+                })));
         }
 
         shared_state.quorum_worker_tasks = vec![Arc::new(SegQueue::new()); 3];
@@ -652,7 +690,9 @@ mod tests {
         entry.for_each_command(|id, _, _| ids.push(id.to_string())).unwrap();
         assert_eq!(ids[0], "put_1");
 
-        assert!(shared_state.outstanding_messages.contains_key(&(shared_state.next_message_id - 1)));
+        assert!(shared_state
+            .outstanding_messages
+            .contains_key(&(shared_state.next_message_id - 1)));
         assert!(persistence_rx.try_recv().is_ok());
 
         let queue = &shared_state.quorum_worker_tasks[0];
@@ -712,7 +752,9 @@ mod tests {
             quorum_response: Arc::new(SegQueue::new()),
             identity: 0,
             term_votes: std::collections::HashMap::new(),
-            state_machine_config: StateMachineConfig { max_message_size_bytes: 2048 },
+            state_machine_config: StateMachineConfig {
+                max_message_size_bytes: 2048,
+            },
             log_entry_bus: Bus::new(5000),
         }
     }
@@ -731,7 +773,13 @@ mod tests {
         for queue in &shared_state.quorum_worker_tasks {
             let task = queue.pop().unwrap();
             match task.task_type {
-                LocalQuorumWorkerTaskType::StartHeartbeats { id, term, prev_term, prev_log_index, .. } => {
+                LocalQuorumWorkerTaskType::StartHeartbeats {
+                    id,
+                    term,
+                    prev_term,
+                    prev_log_index,
+                    ..
+                } => {
                     assert_eq!(id, 1);
                     assert_eq!(term, 1);
                     assert_eq!(prev_term, 1);
@@ -748,22 +796,28 @@ mod tests {
     fn test_time_step_handles_log_persisted_and_quorum_ack_happy_path() {
         let mut delegate = RaftLeaderStateDelegate::new();
         let mut shared_state = create_shared_state_with_quorum();
-        shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
-            builder.set_index(0);
-            builder.set_term(1);
-            builder.set_prev_log_index(0);
-            builder.set_prev_log_term(0);
-            builder.set_message_id(0);
-            builder.set_timestamp(0);
-        })));
-        shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
-            builder.set_index(1);
-            builder.set_term(1);
-            builder.set_prev_log_index(0);
-            builder.set_prev_log_term(0);
-            builder.set_message_id(0);
-            builder.set_timestamp(0);
-        })));
+        shared_state
+            .volatile_server_state
+            .replication_log
+            .push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(0);
+                builder.set_term(1);
+                builder.set_prev_log_index(0);
+                builder.set_prev_log_term(0);
+                builder.set_message_id(0);
+                builder.set_timestamp(0);
+            })));
+        shared_state
+            .volatile_server_state
+            .replication_log
+            .push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(1);
+                builder.set_term(1);
+                builder.set_prev_log_index(0);
+                builder.set_prev_log_term(0);
+                builder.set_message_id(0);
+                builder.set_timestamp(0);
+            })));
 
         let (callback_tx, mut callback_rx) = oneshot::channel();
         let msg_id = shared_state.next_message_id;
@@ -782,7 +836,9 @@ mod tests {
         };
         shared_state.outstanding_messages.insert(msg_id, outstanding);
 
-        shared_state.persistence_response.push(PersistenceResponseType::LogPersisted { id: msg_id });
+        shared_state
+            .persistence_response
+            .push(PersistenceResponseType::LogPersisted { id: msg_id });
         shared_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::AppendEntries { id: msg_id, ok: true },
         });
@@ -808,24 +864,33 @@ mod tests {
         delegate.initialized = true;
         let mut shared_state = create_shared_state_with_quorum();
 
-        shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
-            builder.set_index(0);
-            builder.set_term(1);
-            builder.set_prev_log_index(0);
-            builder.set_prev_log_term(0);
-            builder.set_message_id(0);
-            builder.set_timestamp(0);
-        })));
-        shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
-            builder.set_index(1);
-            builder.set_term(1);
-            builder.set_prev_log_index(0);
-            builder.set_prev_log_term(1);
-            builder.set_message_id(1);
-            builder.set_timestamp(0);
-        })));
+        shared_state
+            .volatile_server_state
+            .replication_log
+            .push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(0);
+                builder.set_term(1);
+                builder.set_prev_log_index(0);
+                builder.set_prev_log_term(0);
+                builder.set_message_id(0);
+                builder.set_timestamp(0);
+            })));
+        shared_state
+            .volatile_server_state
+            .replication_log
+            .push(Arc::new(build_owned_log_entry(|mut builder| {
+                builder.set_index(1);
+                builder.set_term(1);
+                builder.set_prev_log_index(0);
+                builder.set_prev_log_term(1);
+                builder.set_message_id(1);
+                builder.set_timestamp(0);
+            })));
 
-        shared_state.volatile_server_state.replication_log_term_starts.insert(1, 0);
+        shared_state
+            .volatile_server_state
+            .replication_log_term_starts
+            .insert(1, 0);
 
         shared_state.quorum_response.push(LocalQuorumResponse {
             response_type: LocalQuorumTaskResponseType::BackfillLog {
@@ -869,24 +934,28 @@ mod tests {
         // commit_index is behind last_log_index (uncommitted entries exist)
         let initial_commit_index = 3;
         shared_state.volatile_server_state.commit_index = initial_commit_index;
-        shared_state.volatile_server_state.commit_state.commit_index.store(
-            initial_commit_index,
-            std::sync::atomic::Ordering::Release,
-        );
+        shared_state
+            .volatile_server_state
+            .commit_state
+            .commit_index
+            .store(initial_commit_index, std::sync::atomic::Ordering::Release);
 
         // Current term is 3 (new leader election)
         shared_state.server_state.current_term = 3;
 
         // Add some log entries to simulate the uncommitted state
         for i in 0..=5 {
-            shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
-                builder.set_index(i);
-                builder.set_term(2); // All entries from previous term
-                builder.set_prev_log_index(if i > 0 { i - 1 } else { 0 });
-                builder.set_prev_log_term(2);
-                builder.set_message_id(i);
-                builder.set_timestamp(0);
-            })));
+            shared_state
+                .volatile_server_state
+                .replication_log
+                .push(Arc::new(build_owned_log_entry(|mut builder| {
+                    builder.set_index(i);
+                    builder.set_term(2); // All entries from previous term
+                    builder.set_prev_log_index(if i > 0 { i - 1 } else { 0 });
+                    builder.set_prev_log_term(2);
+                    builder.set_message_id(i);
+                    builder.set_timestamp(0);
+                })));
         }
 
         // Initialize the leader (first time_step)
@@ -896,15 +965,18 @@ mod tests {
         // The old buggy behavior was: commit_index = last_log_index = 5
         // The correct behavior is: commit_index remains at 3
         assert_eq!(
-            shared_state.volatile_server_state.commit_index,
-            initial_commit_index,
+            shared_state.volatile_server_state.commit_index, initial_commit_index,
             "Leader should NOT advance commit_index on initialization. \
              Entries from previous terms cannot be committed until a current-term entry is replicated."
         );
 
         // The atomic commit_index should also remain unchanged
         assert_eq!(
-            shared_state.volatile_server_state.commit_state.commit_index.load(std::sync::atomic::Ordering::Acquire),
+            shared_state
+                .volatile_server_state
+                .commit_state
+                .commit_index
+                .load(std::sync::atomic::Ordering::Acquire),
             initial_commit_index,
             "Atomic commit_index should also remain unchanged"
         );
@@ -926,14 +998,17 @@ mod tests {
 
         // Add log entries
         for i in 0..=10 {
-            shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
-                builder.set_index(i);
-                builder.set_term(2);
-                builder.set_prev_log_index(if i > 0 { i - 1 } else { 0 });
-                builder.set_prev_log_term(2);
-                builder.set_message_id(i);
-                builder.set_timestamp(0);
-            })));
+            shared_state
+                .volatile_server_state
+                .replication_log
+                .push(Arc::new(build_owned_log_entry(|mut builder| {
+                    builder.set_index(i);
+                    builder.set_term(2);
+                    builder.set_prev_log_index(if i > 0 { i - 1 } else { 0 });
+                    builder.set_prev_log_term(2);
+                    builder.set_message_id(i);
+                    builder.set_timestamp(0);
+                })));
         }
 
         // Initialize leader
@@ -971,14 +1046,17 @@ mod tests {
 
         // Add some existing log entries
         for i in 0..=5 {
-            shared_state.volatile_server_state.replication_log.push(Arc::new(build_owned_log_entry(|mut builder| {
-                builder.set_index(i);
-                builder.set_term(2);
-                builder.set_prev_log_index(if i > 0 { i - 1 } else { 0 });
-                builder.set_prev_log_term(2);
-                builder.set_message_id(i);
-                builder.set_timestamp(0);
-            })));
+            shared_state
+                .volatile_server_state
+                .replication_log
+                .push(Arc::new(build_owned_log_entry(|mut builder| {
+                    builder.set_index(i);
+                    builder.set_term(2);
+                    builder.set_prev_log_index(if i > 0 { i - 1 } else { 0 });
+                    builder.set_prev_log_term(2);
+                    builder.set_message_id(i);
+                    builder.set_timestamp(0);
+                })));
         }
 
         let initial_log_len = shared_state.volatile_server_state.replication_log.len();
@@ -1001,8 +1079,16 @@ mod tests {
         assert_eq!(noop_entry.term(), 3, "No-op entry should be in current term");
         assert_eq!(noop_entry.index(), 6, "No-op entry should have correct index");
         assert_eq!(noop_entry.command_count(), 0, "No-op entry should have zero commands");
-        assert_eq!(noop_entry.prev_log_index(), 5, "No-op entry should reference previous entry");
-        assert_eq!(noop_entry.prev_log_term(), 2, "No-op entry should reference previous term");
+        assert_eq!(
+            noop_entry.prev_log_index(),
+            5,
+            "No-op entry should reference previous entry"
+        );
+        assert_eq!(
+            noop_entry.prev_log_term(),
+            2,
+            "No-op entry should reference previous term"
+        );
 
         // Verify volatile state was updated
         assert_eq!(shared_state.volatile_server_state.last_log_index, 6);
@@ -1019,7 +1105,11 @@ mod tests {
 
         let outstanding = shared_state.outstanding_messages.get(&noop_message_id).unwrap();
         match &outstanding.message_type {
-            OutstandingMessageType::NoOp { persistence_done, quorum_acks, index } => {
+            OutstandingMessageType::NoOp {
+                persistence_done,
+                quorum_acks,
+                index,
+            } => {
                 assert!(!persistence_done);
                 assert_eq!(*quorum_acks, 0);
                 assert_eq!(*index, 6);

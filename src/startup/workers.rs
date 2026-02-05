@@ -1,20 +1,20 @@
 //! Worker creation and spawning for the Kraft server.
 
-use std::sync::Arc;
 use bus::BusReader;
 use crossbeam_channel::Receiver;
 use crossbeam_queue::SegQueue;
-use tokio::task::{JoinHandle, spawn_blocking};
+use std::sync::Arc;
+use tokio::task::{spawn_blocking, JoinHandle};
 
 use crate::config::config::ClusterNode;
-use crate::persistence::worker::{PersistenceConfig, PersistenceTaskType, PersistenceWorker};
 use crate::persistence::worker::PersistenceResponseType;
+use crate::persistence::worker::{PersistenceConfig, PersistenceTaskType, PersistenceWorker};
 use crate::query::worker::QueryRequest;
 use crate::quorum::quorum_worker::QuorumWorker;
 use crate::quorum::types::LocalQuorumWorkerTask;
 use crate::raft::raft_sm::{CommitState, LocalRaftMessage, SharedState};
-use crate::transport::capnp::OwnedLogEntry;
 use crate::startup::queues::AppQueues;
+use crate::transport::capnp::OwnedLogEntry;
 use crate::transport::cluster_stream_manager::ClusterStreamManager;
 use crate::transport::datastore::DatastoreServer;
 use crate::transport::write_proxy::{WriteBatch, WriteProxy};
@@ -28,7 +28,9 @@ pub fn create_persistence_worker(
     PersistenceWorker::new(
         persistence_rx,
         response_queue,
-        PersistenceConfig { out_dir: persistence_dir },
+        PersistenceConfig {
+            out_dir: persistence_dir,
+        },
     )
 }
 
@@ -99,11 +101,7 @@ pub fn spawn_query_worker(
     query_queue: Arc<SegQueue<QueryRequest>>,
 ) -> JoinHandle<bool> {
     spawn_blocking(move || {
-        let mut worker = crate::query::worker::QueryWorker::new(
-            bus_reader,
-            commit_state,
-            query_queue,
-        );
+        let mut worker = crate::query::worker::QueryWorker::new(bus_reader, commit_state, query_queue);
         worker.run();
         true
     })
@@ -115,10 +113,7 @@ pub fn spawn_state_machine_worker(
     shared_state: SharedState,
 ) -> JoinHandle<bool> {
     spawn_blocking(move || {
-        let mut worker = crate::raft::state_machine_worker::StateMachineWorker::new(
-            task_queue,
-            shared_state,
-        );
+        let mut worker = crate::raft::state_machine_worker::StateMachineWorker::new(task_queue, shared_state);
         worker.run();
         true
     })
@@ -134,9 +129,7 @@ pub fn spawn_persistence_worker(mut worker: PersistenceWorker) -> JoinHandle<boo
 }
 
 /// Spawns the Cap'n Proto listener.
-pub fn spawn_capnp_listener(
-    stream_manager: Arc<ClusterStreamManager>,
-) -> JoinHandle<()> {
+pub fn spawn_capnp_listener(stream_manager: Arc<ClusterStreamManager>) -> JoinHandle<()> {
     tokio::spawn(async move {
         log::info!("Starting Cap'n Proto listener");
         if let Err(e) = stream_manager.start_listener().await {
@@ -175,9 +168,7 @@ pub fn spawn_tcp_datastore_server(
     query_queue: Arc<SegQueue<QueryRequest>>,
     commit_state: Arc<CommitState>,
 ) -> JoinHandle<()> {
-    let addr: std::net::SocketAddr = format!("[::1]:{}", port)
-        .parse()
-        .expect("Invalid tcp_datastore_port");
+    let addr: std::net::SocketAddr = format!("[::1]:{}", port).parse().expect("Invalid tcp_datastore_port");
 
     tokio::spawn(async move {
         log::info!("Starting TCP datastore server on port {}", port);

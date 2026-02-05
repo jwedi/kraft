@@ -1,5 +1,5 @@
+use super::raft_capnp::{internal_log_entry, internal_write_batch, internal_write_batch_response};
 use std::sync::Arc;
-use super::raft_capnp::{internal_write_batch, internal_log_entry, internal_write_batch_response};
 
 /// Zero-copy write batch wrapper - owns the serialized bytes via Arc.
 /// Can be cloned and sent to multiple crossbeam queues without copying the data.
@@ -14,10 +14,7 @@ impl OwnedWriteBatch {
     pub fn from_bytes(bytes: Vec<u8>) -> capnp::Result<Self> {
         // Validate by parsing once
         let mut slice: &[u8] = &bytes;
-        let _ = capnp::serialize::read_message_from_flat_slice(
-            &mut slice,
-            capnp::message::ReaderOptions::default(),
-        )?;
+        let _ = capnp::serialize::read_message_from_flat_slice(&mut slice, capnp::message::ReaderOptions::default())?;
         Ok(Self { bytes: bytes.into() })
     }
 
@@ -40,7 +37,8 @@ impl OwnedWriteBatch {
 
     /// Get the batch ID without full deserialization
     pub fn batch_id(&self) -> capnp::Result<String> {
-        self.with_message(|r| r.get_batch_id().map(|s| s.to_string().unwrap_or_default()))?.map_err(|e| capnp::Error::failed(format!("{:?}", e)))
+        self.with_message(|r| r.get_batch_id().map(|s| s.to_string().unwrap_or_default()))?
+            .map_err(|e| capnp::Error::failed(format!("{:?}", e)))
     }
 
     /// Get the number of requests in this batch
@@ -51,19 +49,21 @@ impl OwnedWriteBatch {
     /// Get the total size of all payloads in the batch
     pub fn size(&self) -> u64 {
         self.with_message(|r| {
-            r.get_requests().map(|reqs| {
-                reqs.iter().map(|req| {
-                    req.get_payload().map(|p| p.len() as u64).unwrap_or(0)
-                }).sum()
-            }).unwrap_or(0)
-        }).unwrap_or(0)
+            r.get_requests()
+                .map(|reqs| {
+                    reqs.iter()
+                        .map(|req| req.get_payload().map(|p| p.len() as u64).unwrap_or(0))
+                        .sum()
+                })
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
     }
 
     /// Check if the batch is empty
     pub fn is_empty(&self) -> bool {
-        self.with_message(|r| {
-            r.get_requests().map(|reqs| reqs.is_empty()).unwrap_or(true)
-        }).unwrap_or(true)
+        self.with_message(|r| r.get_requests().map(|reqs| reqs.is_empty()).unwrap_or(true))
+            .unwrap_or(true)
     }
 
     /// Get the number of requests (convenience wrapper that doesn't return Result)
@@ -106,10 +106,7 @@ impl OwnedLogEntry {
     pub fn from_bytes(bytes: Vec<u8>) -> capnp::Result<Self> {
         // Validate by parsing once
         let mut slice: &[u8] = &bytes;
-        let _ = capnp::serialize::read_message_from_flat_slice(
-            &mut slice,
-            capnp::message::ReaderOptions::default(),
-        )?;
+        let _ = capnp::serialize::read_message_from_flat_slice(&mut slice, capnp::message::ReaderOptions::default())?;
         Ok(Self { bytes: bytes.into() })
     }
 
@@ -183,19 +180,26 @@ impl OwnedLogEntry {
 
     /// Get the number of commands in this entry
     pub fn command_count(&self) -> usize {
-        self.with_message(|r| r.get_commands().map(|c| c.len() as usize).unwrap_or(0)).unwrap_or(0)
+        self.with_message(|r| r.get_commands().map(|c| c.len() as usize).unwrap_or(0))
+            .unwrap_or(0)
     }
 
     /// Get the data bytes (SBE serialized) for network transmission
     pub fn data(&self) -> Vec<u8> {
-        self.with_message(|r| r.get_data().map(|d| d.to_vec()).unwrap_or_default()).unwrap_or_default()
+        self.with_message(|r| r.get_data().map(|d| d.to_vec()).unwrap_or_default())
+            .unwrap_or_default()
     }
 }
 
 impl std::fmt::Debug for OwnedLogEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OwnedLogEntry(index={}, term={}, {} bytes)",
-            self.index(), self.term(), self.bytes.len())
+        write!(
+            f,
+            "OwnedLogEntry(index={}, term={}, {} bytes)",
+            self.index(),
+            self.term(),
+            self.bytes.len()
+        )
     }
 }
 
@@ -224,10 +228,7 @@ impl OwnedWriteBatchResponse {
     /// Create from bytes (takes ownership). Validates the message format.
     pub fn from_bytes(bytes: Vec<u8>) -> capnp::Result<Self> {
         let mut slice: &[u8] = &bytes;
-        let _ = capnp::serialize::read_message_from_flat_slice(
-            &mut slice,
-            capnp::message::ReaderOptions::default(),
-        )?;
+        let _ = capnp::serialize::read_message_from_flat_slice(&mut slice, capnp::message::ReaderOptions::default())?;
         Ok(Self { bytes: bytes.into() })
     }
 
@@ -249,7 +250,8 @@ impl OwnedWriteBatchResponse {
 
     /// Get the batch ID
     pub fn batch_id(&self) -> capnp::Result<String> {
-        self.with_message(|r| r.get_batch_id().map(|s| s.to_string().unwrap_or_default()))?.map_err(|e| capnp::Error::failed(format!("{:?}", e)))
+        self.with_message(|r| r.get_batch_id().map(|s| s.to_string().unwrap_or_default()))?
+            .map_err(|e| capnp::Error::failed(format!("{:?}", e)))
     }
 }
 

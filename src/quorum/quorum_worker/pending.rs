@@ -2,12 +2,11 @@ use crossbeam_channel::Sender;
 use log::error;
 use tokio::sync::oneshot;
 
-use crate::raft::raft_sm::{LocalAppendEntriesCallbackResponse, LocalRaftResponseMessage, LocalRaftResponsePayload};
 use crate::quorum::types::{LocalQuorumResponse, LocalQuorumTaskResponseType};
+use crate::raft::raft_sm::{LocalAppendEntriesCallbackResponse, LocalRaftResponseMessage, LocalRaftResponsePayload};
 use crate::transport::capnp::owned_message::OwnedQuorumMessage;
 use crate::transport::capnp::{
-    build_vote_response_message, build_append_entries_ack_message,
-    build_put_batch_response_message,
+    build_append_entries_ack_message, build_put_batch_response_message, build_vote_response_message,
 };
 
 use super::{PendingQuorumTask, PendingQuorumTaskEnum};
@@ -67,17 +66,11 @@ fn handle_pending_task_response(
             {
                 let (ok, last_log_index, last_log_term) = match ae_resp {
                     LocalAppendEntriesCallbackResponse::Ok => (true, *log_index, *term),
-                    LocalAppendEntriesCallbackResponse::UnrecognizedLeader => {
-                        (false, *log_index, *term)
+                    LocalAppendEntriesCallbackResponse::UnrecognizedLeader => (false, *log_index, *term),
+                    LocalAppendEntriesCallbackResponse::WantedPreviousEntry { last_term, last_index } => {
+                        (false, last_index, last_term)
                     }
-                    LocalAppendEntriesCallbackResponse::WantedPreviousEntry {
-                        last_term,
-                        last_index,
-                    } => (false, last_index, last_term),
-                    LocalAppendEntriesCallbackResponse::TruncateLog {
-                        prev_term,
-                        prev_index,
-                    } => {
+                    LocalAppendEntriesCallbackResponse::TruncateLog { prev_term, prev_index } => {
                         // Also notify local response queue about truncation
                         response_queue.push(LocalQuorumResponse {
                             response_type: LocalQuorumTaskResponseType::TruncateLog {
