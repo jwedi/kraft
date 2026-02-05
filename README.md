@@ -21,10 +21,13 @@ All core logic and initial implementation is handwritten but refactorings, migra
 On a 3x Kraft node cluster (~1 core each) running on a 2021 Apple M1 Pro Kraft does:
 - ~ 100.000 durable quorum writes per second.
 - ~ 150.000 commited reads per second.
+- ~ 145.000 mixed 80/20 read/write requests per second.
 
 [TCP WRITE] CHECKPOINT: throughput=99343 rps, p50=9.56ms, p75=11.31ms, p95=14.31ms, p99=17.00ms
 
 [TCP READ] CHECKPOINT: throughput=148410 rps, p50=4.51ms, p75=7.28ms, p95=13.68ms, p99=24.27ms
+
+[TCP MIXED 20w/80r] CHECKPOINT: throughput=144080 rps, p50=4.97ms, p75=8.78ms, p95=14.34ms, p99=19.38ms
 
 ## Architecture Overview
 

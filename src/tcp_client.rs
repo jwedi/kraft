@@ -714,8 +714,8 @@ async fn main() -> io::Result<()> {
     //do_write_batch_async(&config).await?;
 
     // Uncomment to run other tests:
-    do_get_record_async(&config).await?;
-    // do_mixed_operations_async(&config, 0.2).await?;
+    //do_get_record_async(&config).await?;
+    do_mixed_operations_async(&config, 0.2).await?;
 
     info!("Load test complete");
     Ok(())
