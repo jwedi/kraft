@@ -27,7 +27,7 @@ pub mod persistence {
 }
 
 pub mod quorum {
-    pub mod capnp_worker;
+    pub mod quorum_worker;
     pub mod types;
 }
 
@@ -41,10 +41,10 @@ pub mod config {
 
 pub mod transport {
     pub mod capnp;
-    pub mod capnp_stream_manager;
+    pub mod cluster_stream_manager;
+    pub mod datastore;
     pub mod metrics;
     pub mod metrics_server;
-    pub mod tcp_datastore;
     pub mod write_proxy;
 }
 

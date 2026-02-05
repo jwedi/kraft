@@ -1,198 +1,171 @@
 # Kraft
 
-A high-performance, distributed, durable key-value store built on the Raft consensus algorithm.
-The project is created for learning purposes and it's not ready for prod usage.
+A high-performance, distributed, durable key-value store built on the Raft consensus algorithm and log replication.
 
-Kraft is designed for throughput over latency, using an actor-based architecture with lock-free queues and intelligent batching to achieve high write throughput while maintaining strong consistency guarantees.
+This project is created for learning purposes and is not ready for production usage.
+
+Kraft is designed for throughput over latency, using an actor-based architecture with lock-free queues, intelligent batching, and zero-copy serialization to achieve high write throughput while maintaining strong consistency guarantees.
+
+All core logic and initial implementation is handwritten but refactorings, migrations and tests are AI assisted.
 
 ## Features
 
+- **Zero-Copy I/O**: Arc-wrapped Cap'n Proto bytes flow through the system without copying
 - **Strong Consistency**: Built on Raft consensus with leader election and log replication
 - **Durability**: All writes are persisted to disk before acknowledgment
 - **Read-Your-Own-Writes**: Clients can immediately read values they've written
 - **High Throughput**: Smart batching of writes and lock-free inter-component communication
 - **Observability**: Built-in distributed tracing (Zipkin) and Prometheus metrics
 
+## Rough Benchmark
+On a 3x Kraft node cluster (~1 core each) running on a 2021 Apple M1 Pro Kraft does:
+- ~ 100.000 durable quorum writes per second.
+- ~ 150.000 commited reads per second.
+
+[TCP WRITE] CHECKPOINT: throughput=99343 rps, p50=9.56ms, p75=11.31ms, p95=14.31ms, p99=17.00ms
+
+[TCP READ] CHECKPOINT: throughput=148410 rps, p50=4.51ms, p75=7.28ms, p95=13.68ms, p99=24.27ms
+
 ## Architecture Overview
 
 Kraft uses an **actor-based architecture** where independent workers communicate via lock-free queues. This design eliminates contention and allows each component to operate at its own pace.
 
 ```
-                                    ┌─────────────────────────────────────────────────────────────┐
-                                    │                         KRAFT NODE                          │
-                                    │                                                             │
-    ┌──────────┐                    │  ┌─────────────┐      ┌─────────────────────────────────┐  │
-    │  Client  │◄──────────────────►│  │   gRPC      │      │      Raft State Machine         │  │
-    │  (gRPC)  │   Put/Get          │  │   Server    │      │  ┌───────┐ ┌─────────┐ ┌──────┐ │  │
-    └──────────┘                    │  │             │      │  │Follower│ │Candidate│ │Leader│ │  │
-                                    │  └──────┬──────┘      │  └───┬───┘ └────┬────┘ └──┬───┘ │  │
-                                    │         │             │      └──────────┴─────────┘     │  │
-                                    │         ▼             │              ▲                  │  │
-                                    │  ┌─────────────┐      │              │                  │  │
-                                    │  │   Write     │      │     Lock-Free Queue             │  │
-                                    │  │   Proxy     ├──────┼──────────────┘                  │  │
-                                    │  │  (Batching) │      │                                 │  │
-                                    │  └─────────────┘      └─────────────────────────────────┘  │
-                                    │                                 │                          │
-                                    │         ┌───────────────────────┼───────────────────────┐  │
-                                    │         │                       │                       │  │
-                                    │         ▼                       ▼                       ▼  │
-                                    │  ┌─────────────┐      ┌─────────────────┐      ┌─────────┐ │
-                                    │  │ Persistence │      │  Quorum Workers │      │  Query  │ │
-                                    │  │   Worker    │      │  (per peer)     │      │  Worker │ │
-                                    │  └──────┬──────┘      └────────┬────────┘      └────┬────┘ │
-                                    │         │                      │                    │      │
-                                    └─────────┼──────────────────────┼────────────────────┼──────┘
-                                              │                      │                    │
-                                              ▼                      ▼                    ▼
-                                    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────┐
-                                    │   Disk (WAL)    │    │   Other Kraft   │    │    Read     │
-                                    │   votes.csv     │    │     Nodes       │    │   Results   │
-                                    │   log.sbe       │    │                 │    │             │
-                                    └─────────────────┘    └─────────────────┘    └─────────────┘
+┌──────────┐                    ┌──────────────────────────────────────────┐
+│  Client  │◄──── TCP ─────────►│                KRAFT NODE                │
+│  (TCP)   │                    │                                          │
+└──────────┘                    │  ┌───────────┐                           │
+                                │  │    TCP    │                           │
+                                │  │ Datastore ├───────────────┐           │
+                                │  │  Server   │               │           │
+                                │  └─────┬─────┘               │           │
+                                │        │                     │           │
+                                │        ▼                     ▼           │
+                                │  ┌───────────┐        ┌─────────────┐    │
+                                │  │   Write   ├───────►│    Query    │    │
+                                │  │   Proxy   │        │    Worker   │    │
+                                │  └─────┬─────┘        └──────▲──────┘    │
+                                │        │                     │           │
+                                │        ├─────────────────────┼─────┐     │
+                                │        │                           │     │
+                                │        ▼                           ▼     │       ┌ ─ ─ ─ ─ ─ ─ ┐
+                                │  ┌────────────────────┐  ┌───┴────────┐  │       │  Other Node │
+                                │  │ Raft State Machine │  │  Quorum   ─┼──┼──────►│ ┌─────────┐ │
+                                │  │ Follower/Candidate/├─►│  Workers   │  │       │ │ Quorum  │ │
+                                │  │       Leader       │  │ (per peer) │◄─┼───────│ │ Worker  │ │
+                                │  └──────────┬─────────┘  └────────────┘  │       │ └─────────┘ │
+                                │             │                            │        ─ ─ ─ ─ ─ ─ ─┘
+                                │             ▼                            │
+                                │      ┌─────────────┐                     │
+                                │      │ Persistence │                     │
+                                │      │   Worker    │                     │
+                                │      └──────┬──────┘                     │
+                                │             │                            │
+                                └─────────────┼────────────────────────────┘
+                                              ▼
+                                        ┌───────────┐
+                                        │   Disk    │
+                                        │ log.capnp │
+                                        │ votes.csv │
+                                        └───────────┘
 ```
 
 ## Core Components
 
-### 1. Raft State Machine (`src/raft/`)
+### Raft State Machine (`src/raft/`)
 
-The heart of the system. Implements the Raft consensus protocol as a **state machine** that responds to:
-- Incoming write requests from clients
-- Responses from the persistence worker (disk writes completed)
-- Responses from quorum workers (replication acknowledgments)
-- Timeouts for leader election
+The heart of the system. Implements the Raft consensus protocol as a state machine that transitions between **Follower**, **Candidate**, and **Leader** states. Responds to client write requests, persistence confirmations, replication acknowledgments, and election timeouts.
 
-The state machine transitions between three states:
-- **Follower**: Receives log entries from the leader
-- **Candidate**: Requests votes to become leader
-- **Leader**: Accepts client writes and replicates to followers
+### Write Proxy (`src/transport/write_proxy/`)
 
-```
-┌──────────┐  timeout   ┌───────────┐  majority votes  ┌────────┐
-│ Follower ├───────────►│ Candidate ├─────────────────►│ Leader │
-└────┬─────┘            └─────┬─────┘                  └───┬────┘
-     │                        │                            │
-     │◄───────────────────────┴────────────────────────────┘
-     │         discovers higher term / new leader
-```
+Smart batching for high throughput. Collects incoming write requests and forwards them when either `max_batch_size` bytes accumulate or `min_batch_interval_ms` elapses. Routes batches to the current Raft leader (locally or remotely).
 
-### 2. Write Proxy (`src/transport/write_proxy.rs`)
+### Persistence Worker (`src/persistence/worker.rs`)
 
-**Smart batching** for high throughput. Instead of processing writes one-by-one:
+Handles all disk I/O on a dedicated thread. Appends log entries to `log.capnp`, records vote decisions to `votes.csv`, batches multiple writes before `fsync()`, and recovers state on startup by replaying the log.
 
-1. Collects incoming write requests into batches
-2. Waits for either:
-   - `max_batch_size` bytes accumulated, OR
-   - `min_batch_interval_ms` elapsed
-3. Gets the current Raft leader from the Raft State Machine.
-4. Forwards the entire batch to the current Raft leader, either locally or remotely.
+### Quorum Workers (`src/quorum/quorum_worker/`)
 
-This dramatically improves throughput by amortizing the cost of disk fsync and network round-trips across many writes.
+One worker per peer node. Sends heartbeats, replicates log entries over TCP using a custom capn proto protocol, handles vote requests during elections, manages backfill when followers fall behind, and processes truncation when logs diverge.
 
-### 3. Persistence Worker (`src/persistence/worker.rs`)
+### Query Worker (`src/query/worker.rs`)
 
-Handles all disk I/O on a dedicated thread:
-- Appends log entries to the write-ahead log (`log.sbe`)
-- Records vote decisions (`votes.csv`)
-- Batches multiple log writes before calling `fsync()` for efficiency
-- Recovers state on startup by replaying the log
+Handles client read requests by subscribing to committed log entries via a broadcast bus. Ensures read-your-own-writes by waiting for the relevant commit index.
 
-### 4. Quorum Workers (`src/quorum/worker.rs`)
+### ClusterStreamManager (`src/transport/cluster_stream_manager.rs`)
 
-One worker per peer node, responsible for:
-- Sending heartbeats (leader only)
-- Replicating log entries via AppendEntries RPCs
-- Handling vote requests during elections
-- Managing backfill when a follower falls behind
-- Processing truncation when logs diverge
+Manages TCP connections for cluster communication. Provides per-peer outbound send channels and inbound receive queues.
 
-Uses **bidirectional gRPC streaming** for efficient communication between nodes and in-order delivery.
+## Zero-Copy Architecture
 
-### 5. Query Worker (`src/query/worker.rs`)
-
-Handles client read requests by subscribing to committed log entries via a broadcast bus. Ensures clients can read their own writes by waiting for the relevant commit index.
-
-## Communication Model
-
-### Lock-Free Queues
-
-All inter-component communication uses **crossbeam's lock-free SegQueue**:
+A key design goal is minimizing memory copies as data flows through the system:
 
 ```
-┌─────────────┐                     ┌─────────────┐
-│   Writer    │  ───push()────►     │  SegQueue   │  ───pop()────►  │   Reader    │
-│   (fast)    │  (non-blocking)     │  (lock-free)│  (non-blocking) │   (fast)    │
-└─────────────┘                     └─────────────┘                 └─────────────┘
+┌──────────────┐     Arc<[u8]>      ┌──────────────┐     Arc<[u8]>      ┌──────────────┐
+│   Network    │ ──────────────────►│   SegQueue   │ ──────────────────►│    Worker    │
+│  (receive)   │   zero-copy        │  (lock-free) │   zero-copy        │  (process)   │
+└──────────────┘                    └──────────────┘                    └──────────────┘
 ```
 
-Benefits:
-- No mutex contention between producers and consumers
-- Writers never block waiting for readers
-- Predictable latency without lock acquisition
+**Zero-copy message types** (`src/transport/capnp/internal_message.rs`):
+- `OwnedWriteBatch` - Client write requests wrapped in Arc
+- `OwnedLogEntry` - Replication log entries wrapped in Arc
+- `OwnedQuorumMessage` - Cluster protocol messages wrapped in Arc
 
-### Callback Channels
-
-For request-response patterns, Kraft uses **oneshot channels**:
-
-```rust
-// Client sends request with callback
-let (tx, rx) = oneshot::channel();
-queue.push(WriteBatch { callback: tx, ... });
-
-// Worker processes and responds
-callback.send(WriteResponse { ... });
-
-// Client awaits response
-let response = rx.await?;
-```
+**Cap'n Proto benefits**:
+- Zero-copy deserialization - no parsing step, read directly from wire format
+- Messages can be stored and transmitted without re-serialization
+- Arc wrapping allows sharing across queues without copying
 
 ## Performance Optimizations
 
-| Optimization | Description |
-|-------------|-------------|
-| **Write Batching** | Multiple client writes combined into single log entries |
-| **Persistence Batching** | Multiple log entries fsynced together |
-| **Lock-Free Queues** | Zero contention between components |
-| **gRPC Streaming** | Persistent connections between nodes, no connection overhead |
-| **SBE Encoding** | Simple Binary Encoding for compact, zero-copy log serialization |
-| **Async I/O** | Tokio runtime for efficient async networking |
+| Optimization         | Description                                                         |
+|----------------------|---------------------------------------------------------------------|
+| **Zero-Copy I/O**    | Arc-wrapped serialized bytes flow without copying                   |
+| **Smart Batching**   | Multiple writes combined into single log entries to ammortise costs |
+| **Lock-Free queues** | Crossbeam SegQueue, zero contention                                 |
+| **Non-blocking**     | Lock free and non-blocking in hot paths                             |
+| **Custom transport** | Reduced overhead from a custom protocol built on raw TCP            |
+| **Async + Blocking** | Tokio for I/O, dedicated threads for CPU work                       |
 
 ## Consistency Guarantees
 
-- **Linearizability**: (Coming soon) All operations appear to execute atomically at some point between invocation and response
 - **Read-Your-Own-Writes**: A client will always see its own previous writes
 - **Durability**: Acknowledged writes survive node failures (persisted to quorum before ack)
+- **Linearizability**: (Coming soon) All operations appear to execute atomically
 
 ## Getting Started
 
 ### Prerequisites
 
 - Rust 1.70+
-- Protobuf compiler (`protoc`)
+- Cap'n Proto compiler (`capnp`)
 
 ### Configuration
 
-Create `application.toml`:
+Create `application.toml` in your resource directory:
 
 ```toml
-persistence_dir = "./data/"
-port = 50051
-metrics_port = 9090
 node_id = 1
-max_message_size_bytes = 4194304
-min_batch_interval_ms = 5
-max_batch_size = 1048576
+persistence_dir = "out/"
+metrics_port = 51051
+cluster_port = 51151        # Cluster communication (Cap'n Proto)
+tcp_datastore_port = 49011  # Client API (TCP)
+max_message_size_bytes = 4096
+max_batch_size = 512
+min_batch_interval_ms = 2
+enable_otel_tracing = false
 
 [[cluster_nodes]]
-endpoint = "http://[::1]:50051"
+endpoint = "[::1]:51151"
 node_id = 1
 
 [[cluster_nodes]]
-endpoint = "http://[::1]:50052"
+endpoint = "[::1]:51152"
 node_id = 2
 
 [[cluster_nodes]]
-endpoint = "http://[::1]:50053"
+endpoint = "[::1]:51153"
 node_id = 3
 ```
 
@@ -200,13 +173,19 @@ node_id = 3
 
 ```bash
 # Terminal 1 - Node 1
-RESOURCE_DIR=./node1 cargo run --bin kraft
+RESOURCE_DIR=./node1 RUSTFLAGS="--emit=asm" cargo run --release --bin kraft
 
 # Terminal 2 - Node 2
-RESOURCE_DIR=./node2 cargo run --bin kraft
+RESOURCE_DIR=./node2 RUSTFLAGS="--emit=asm" cargo run --release --bin kraft
 
 # Terminal 3 - Node 3
-RESOURCE_DIR=./node3 cargo run --bin kraft
+RESOURCE_DIR=./node3 RUSTFLAGS="--emit=asm" cargo run --release --bin kraft
+```
+
+### TCP Client
+
+```bash
+RUSTFLAGS="--emit=asm" cargo run --release --bin tcp-client
 ```
 
 ### Running Tests
@@ -225,7 +204,7 @@ Kraft integrates with **Zipkin** for distributed tracing. Start Zipkin:
 docker run -d -p 9411:9411 openzipkin/zipkin
 ```
 
-Traces show the full path of a write request across batching, persistence, and replication.
+Enable tracing in config: `enable_otel_tracing = true`
 
 ### Metrics
 
@@ -239,37 +218,40 @@ Prometheus metrics are exposed at `http://localhost:{metrics_port}/metrics`:
 
 ```
 src/
-├── main.rs                 # Application entry point
+├── main.rs                     # Application entry point
 ├── raft/
-│   ├── raft_sm.rs          # Shared state and broadcast logic
-│   ├── state_machine_worker.rs  # Main event loop
-│   ├── leader.rs           # Leader state handling
-│   ├── follower.rs         # Follower state handling
-│   └── candidate.rs        # Candidate state handling
+│   ├── raft_sm.rs              # Shared state and broadcast logic
+│   ├── state_machine_worker.rs # Main event loop
+│   ├── leader/                 # Leader state handling
+│   ├── follower/               # Follower state handling
+│   └── candidate.rs            # Candidate state handling
 ├── persistence/
-│   └── worker.rs           # Disk I/O worker
+│   └── worker.rs               # Disk I/O worker
 ├── quorum/
-│   └── worker.rs           # Per-peer replication worker
+│   └── quorum_worker/           # Per-peer replication workers
 ├── query/
-│   └── worker.rs           # Read request handler
+│   └── worker.rs               # Read request handler
 ├── transport/
-│   ├── write_proxy.rs      # Write batching
-│   ├── raft.rs             # gRPC service implementation
-│   ├── datastore.rs        # Client-facing API
-│   └── stream_manager.rs   # gRPC stream management
-└── config/
-    └── config.rs           # Configuration loading
+│   ├── write_proxy/            # Write batching
+│   ├── datastore/              # Client-facing TCP API
+│   ├── capnp/                  # Cap'n Proto message types
+│   │   ├── raft.capnp          # Protocol schema
+│   │   ├── internal_message.rs # Zero-copy owned types
+│   │   └── owned_message.rs    # Quorum message wrapper
+│   └── cluster_stream_manager.rs # TCP connection management
+├── config/
+│   └── config.rs               # Configuration loading
+└── startup/                    # Initialization and recovery
 ```
 
-## TODO / Future Improvements
+## TODO
 
-### High Priority
-- [ ] **Zero copy IO** - Prost gRPC streaming doesn't support Zero copy IO, should migrate to something like cap'n proto / SBE over raw TCP streams instead.
-- [ ] **Log compaction / snapshotting** - Truncate persisted log after snapshotting state
-- [ ] **Linearizable reads** - Implement read index or lease-based reads
-- [ ] **Membership changes** - Dynamic cluster reconfiguration
-- [ ] **Checksum validation** - Verify log integrity on recovery
-- [ ] **Graceful shutdown** - Drain pending writes before stopping
+- [ ] Log compaction / snapshotting
+- [ ] Linearizable reads
+- [ ] Membership changes
+- [ ] Checksum validation
+- [ ] Graceful shutdown
+- [ ] Try a io_uring thread-per-core runtime like monoio instead of Tokio.
 
 ## License
 

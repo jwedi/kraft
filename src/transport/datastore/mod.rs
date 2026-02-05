@@ -15,7 +15,7 @@ pub mod codec;
 pub mod connection;
 pub mod server;
 
-pub use server::TcpDatastoreServer;
+pub use server::DatastoreServer;
 
 /// RPC type constants for the wire protocol
 pub mod rpc {

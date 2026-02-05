@@ -10,13 +10,13 @@ use crate::config::config::ClusterNode;
 use crate::persistence::worker::{PersistenceConfig, PersistenceTaskType, PersistenceWorker};
 use crate::persistence::worker::PersistenceResponseType;
 use crate::query::worker::QueryRequest;
-use crate::quorum::capnp_worker::CapnpQuorumWorker;
+use crate::quorum::quorum_worker::QuorumWorker;
 use crate::quorum::types::LocalQuorumWorkerTask;
 use crate::raft::raft_sm::{CommitState, LocalRaftMessage, SharedState};
 use crate::transport::capnp::OwnedLogEntry;
 use crate::startup::queues::AppQueues;
-use crate::transport::capnp_stream_manager::CapnpStreamManager;
-use crate::transport::tcp_datastore::TcpDatastoreServer;
+use crate::transport::cluster_stream_manager::ClusterStreamManager;
+use crate::transport::datastore::DatastoreServer;
 use crate::transport::write_proxy::{WriteBatch, WriteProxy};
 
 /// Creates and initializes the persistence worker.
@@ -32,16 +32,16 @@ pub fn create_persistence_worker(
     )
 }
 
-/// Creates Cap'n Proto quorum workers for each cluster node.
+/// Creates quorum workers for each cluster node.
 ///
 /// Returns a tuple of (workers, per-worker task queues).
-pub fn create_capnp_quorum_workers(
+pub fn create_quorum_workers(
     queues: &AppQueues,
     cluster_nodes: &[ClusterNode],
     node_id: u32,
-    capnp_stream_manager: Arc<CapnpStreamManager>,
+    cluster_stream_manager: Arc<ClusterStreamManager>,
     max_message_size_bytes: usize,
-) -> (Vec<CapnpQuorumWorker>, Vec<Arc<SegQueue<LocalQuorumWorkerTask>>>) {
+) -> (Vec<QuorumWorker>, Vec<Arc<SegQueue<LocalQuorumWorkerTask>>>) {
     let mut workers = Vec::new();
     let mut quorum_send_channels = Vec::new();
 
@@ -49,14 +49,14 @@ pub fn create_capnp_quorum_workers(
         let task_queue: Arc<SegQueue<LocalQuorumWorkerTask>> = Arc::new(SegQueue::new());
         quorum_send_channels.push(Arc::clone(&task_queue));
 
-        let worker = CapnpQuorumWorker::new(
+        let worker = QuorumWorker::new(
             task_queue,
             Arc::clone(&queues.quorum_response_queue),
             node_id,
             0,
             node.node_id.into(),
             node.endpoint.clone(),
-            Arc::clone(&capnp_stream_manager),
+            Arc::clone(&cluster_stream_manager),
             Arc::clone(&queues.task_queue),
             max_message_size_bytes,
         );
@@ -135,7 +135,7 @@ pub fn spawn_persistence_worker(mut worker: PersistenceWorker) -> JoinHandle<boo
 
 /// Spawns the Cap'n Proto listener.
 pub fn spawn_capnp_listener(
-    stream_manager: Arc<CapnpStreamManager>,
+    stream_manager: Arc<ClusterStreamManager>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         log::info!("Starting Cap'n Proto listener");
@@ -145,13 +145,13 @@ pub fn spawn_capnp_listener(
     })
 }
 
-/// Spawns all Cap'n Proto quorum workers.
-pub fn spawn_capnp_quorum_workers(workers: Vec<CapnpQuorumWorker>) -> Vec<JoinHandle<bool>> {
+/// Spawns all quorum workers.
+pub fn spawn_quorum_workers(workers: Vec<QuorumWorker>) -> Vec<JoinHandle<bool>> {
     workers
         .into_iter()
         .map(|mut cw| {
             tokio::spawn(async move {
-                tracing::info!(message = "Spawning Cap'n Proto quorum worker");
+                tracing::info!(message = "Spawning quorum worker");
                 cw.run().await;
                 true
             })
@@ -181,7 +181,7 @@ pub fn spawn_tcp_datastore_server(
 
     tokio::spawn(async move {
         log::info!("Starting TCP datastore server on port {}", port);
-        let server = TcpDatastoreServer::new(addr, task_queue, query_queue, commit_state);
+        let server = DatastoreServer::new(addr, task_queue, query_queue, commit_state);
         if let Err(e) = server.run().await {
             log::error!("TCP datastore server failed: {}", e);
         }

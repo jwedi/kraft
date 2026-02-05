@@ -11,7 +11,7 @@ use crate::transport::capnp::message_receiver::MessageReceiver;
 
 /// Manages Cap'n Proto TCP connections for cluster communication.
 /// Provides per-peer outbound send channels and inbound receive queues.
-pub struct CapnpStreamManager {
+pub struct ClusterStreamManager {
     self_id: u32,
     cluster_nodes: Vec<ClusterNode>,
     listen_addr: SocketAddr,
@@ -19,7 +19,7 @@ pub struct CapnpStreamManager {
     receiver: Arc<MessageReceiver>,
 }
 
-impl CapnpStreamManager {
+impl ClusterStreamManager {
     pub fn new(
         self_id: u32,
         cluster_nodes: Vec<ClusterNode>,
@@ -42,7 +42,7 @@ impl CapnpStreamManager {
 
     /// Get or establish an outbound connection to a node.
     /// Returns a crossbeam sender that can be used to send messages.
-    pub async fn get_or_connect(&self, node_id: u32) -> Result<Sender<OwnedQuorumMessage>, CapnpConnectError> {
+    pub async fn get_or_connect(&self, node_id: u32) -> Result<Sender<OwnedQuorumMessage>, ClusterConnectError> {
         // Check if already connected
         if let Some(tx) = self.outbound_senders.read().await.get(&node_id) {
             return Ok(tx.clone());
@@ -51,10 +51,10 @@ impl CapnpStreamManager {
         // Find node's endpoint
         let node = self.cluster_nodes.iter()
             .find(|n| n.node_id == node_id)
-            .ok_or_else(|| CapnpConnectError::NoSuchNode(node_id))?;
+            .ok_or_else(|| ClusterConnectError::NoSuchNode(node_id))?;
 
         let addr: SocketAddr = node.endpoint.parse()
-            .map_err(|e| CapnpConnectError::InvalidEndpoint(format!("{}: {}", node.endpoint, e)))?;
+            .map_err(|e| ClusterConnectError::InvalidEndpoint(format!("{}: {}", node.endpoint, e)))?;
 
         // Create bounded crossbeam channel for this connection.
         // Bounded channels provide backpressure to prevent unbounded memory growth
@@ -85,11 +85,11 @@ impl CapnpStreamManager {
                     self.outbound_senders.write().await.insert(node_id, tx.clone());
                     Ok(tx)
                 } else {
-                    Err(CapnpConnectError::ConnectionFailed("Err".to_string()))
+                    Err(ClusterConnectError::ConnectionFailed("Err".to_string()))
                 }
             }
             Err(e) => {
-                Err(CapnpConnectError::ConnectionFailed(e.to_string()))
+                Err(ClusterConnectError::ConnectionFailed(e.to_string()))
             }
         }
     }
@@ -117,20 +117,20 @@ impl CapnpStreamManager {
 }
 
 #[derive(Debug)]
-pub enum CapnpConnectError {
+pub enum ClusterConnectError {
     NoSuchNode(u32),
     InvalidEndpoint(String),
     ConnectionFailed(String),
 }
 
-impl std::fmt::Display for CapnpConnectError {
+impl std::fmt::Display for ClusterConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CapnpConnectError::NoSuchNode(id) => write!(f, "No such node: {}", id),
-            CapnpConnectError::InvalidEndpoint(e) => write!(f, "Invalid endpoint: {}", e),
-            CapnpConnectError::ConnectionFailed(e) => write!(f, "Connection failed: {}", e),
+            ClusterConnectError::NoSuchNode(id) => write!(f, "No such node: {}", id),
+            ClusterConnectError::InvalidEndpoint(e) => write!(f, "Invalid endpoint: {}", e),
+            ClusterConnectError::ConnectionFailed(e) => write!(f, "Connection failed: {}", e),
         }
     }
 }
 
-impl std::error::Error for CapnpConnectError {}
+impl std::error::Error for ClusterConnectError {}
