@@ -24,6 +24,9 @@ pub enum PersistenceTaskType {
         parent_span: Span,
         request_id: u64,
     },
+    TruncateLog {
+        target_length: usize,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -45,6 +48,7 @@ pub struct PersistenceWorker {
     work_queue: Receiver<PersistenceTaskType>,
     response_queue: Arc<SegQueue<PersistenceResponseType>>,
     persistence_config: PersistenceConfig,
+    entry_end_offsets: Vec<u64>,
 }
 
 impl PersistenceWorker {
@@ -52,12 +56,18 @@ impl PersistenceWorker {
         work_queue: Receiver<PersistenceTaskType>,
         response_queue: Arc<SegQueue<PersistenceResponseType>>,
         persistence_config: PersistenceConfig,
+        entry_end_offsets: Vec<u64>,
     ) -> Self {
         Self {
             work_queue,
             response_queue,
             persistence_config,
+            entry_end_offsets,
         }
+    }
+
+    pub fn set_entry_end_offsets(&mut self, offsets: Vec<u64>) {
+        self.entry_end_offsets = offsets;
     }
 
     pub fn run(&mut self) {
@@ -189,8 +199,14 @@ impl PersistenceWorker {
                     data.len()
                 );
 
+                let data_len = data.len() as u64;
+
                 // Write to buffer without flushing
                 self.write_log_entry(data, log_write_buffer).unwrap();
+
+                // Track byte end offset for this entry
+                let last_end = self.entry_end_offsets.last().copied().unwrap_or(0);
+                self.entry_end_offsets.push(last_end + data_len);
 
                 // Queue response for later (after flush)
                 pending_log_responses.push(PersistenceResponseType::LogPersisted { id });
@@ -205,6 +221,37 @@ impl PersistenceWorker {
                     }
                 }
                 tracing::debug!("Append log entry done");
+            }
+            PersistenceTaskType::TruncateLog { target_length } => {
+                // Flush any pending log writes before truncation
+                self.flush_pending_logs(log_write_buffer, pending_log_responses)
+                    .unwrap();
+
+                let truncation_position = if target_length == 0 {
+                    0
+                } else {
+                    self.entry_end_offsets[target_length - 1]
+                };
+
+                log::info!(
+                    "Truncating log file to {} entries ({} bytes)",
+                    target_length,
+                    truncation_position
+                );
+
+                // Truncate the file on disk
+                log_write_buffer
+                    .get_ref()
+                    .set_len(truncation_position)
+                    .expect("Failed to truncate log file");
+
+                // Truncate the offset tracking
+                self.entry_end_offsets.truncate(target_length);
+
+                log::info!(
+                    "Log file truncated successfully, entry_end_offsets len={}",
+                    self.entry_end_offsets.len()
+                );
             }
         }
     }
@@ -276,5 +323,240 @@ impl PersistenceWorker {
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
         Ok(buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn create_test_worker(
+        dir: &str,
+        entry_end_offsets: Vec<u64>,
+    ) -> (
+        PersistenceWorker,
+        crossbeam_channel::Sender<PersistenceTaskType>,
+        Arc<SegQueue<PersistenceResponseType>>,
+    ) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let response_queue = Arc::new(SegQueue::new());
+        let worker = PersistenceWorker::new(
+            rx,
+            Arc::clone(&response_queue),
+            PersistenceConfig {
+                out_dir: dir.to_string(),
+            },
+            entry_end_offsets,
+        );
+        (worker, tx, response_queue)
+    }
+
+    #[test]
+    fn test_append_log_tracks_offsets() {
+        let tmp_dir = TempDir::new().unwrap();
+        let dir = format!("{}/", tmp_dir.path().to_str().unwrap());
+        let (mut worker, tx, response_queue) = create_test_worker(&dir, vec![]);
+
+        // Send some AppendLog tasks, then disconnect
+        let data1 = Arc::new(vec![1u8; 100]);
+        let data2 = Arc::new(vec![2u8; 200]);
+        let data3 = Arc::new(vec![3u8; 50]);
+
+        tx.send(PersistenceTaskType::AppendLog {
+            id: 1,
+            data: data1,
+            parent_span: tracing::Span::none(),
+            request_id: 1,
+        })
+        .unwrap();
+        tx.send(PersistenceTaskType::AppendLog {
+            id: 2,
+            data: data2,
+            parent_span: tracing::Span::none(),
+            request_id: 2,
+        })
+        .unwrap();
+        tx.send(PersistenceTaskType::AppendLog {
+            id: 3,
+            data: data3,
+            parent_span: tracing::Span::none(),
+            request_id: 3,
+        })
+        .unwrap();
+
+        drop(tx); // Disconnect to let run() exit
+        worker.run();
+
+        // Verify offsets
+        assert_eq!(worker.entry_end_offsets, vec![100, 300, 350]);
+
+        // Verify responses were sent
+        assert_eq!(response_queue.len(), 3);
+
+        // Verify file size
+        let file_size = fs::metadata(format!("{}log.capnp", dir)).unwrap().len();
+        assert_eq!(file_size, 350);
+    }
+
+    #[test]
+    fn test_truncate_log_shortens_file_and_offsets() {
+        let tmp_dir = TempDir::new().unwrap();
+        let dir = format!("{}/", tmp_dir.path().to_str().unwrap());
+        let (mut worker, tx, _response_queue) = create_test_worker(&dir, vec![]);
+
+        // Append 3 entries
+        let data1 = Arc::new(vec![1u8; 100]);
+        let data2 = Arc::new(vec![2u8; 200]);
+        let data3 = Arc::new(vec![3u8; 50]);
+
+        tx.send(PersistenceTaskType::AppendLog {
+            id: 1,
+            data: data1,
+            parent_span: tracing::Span::none(),
+            request_id: 1,
+        })
+        .unwrap();
+        tx.send(PersistenceTaskType::AppendLog {
+            id: 2,
+            data: data2,
+            parent_span: tracing::Span::none(),
+            request_id: 2,
+        })
+        .unwrap();
+        tx.send(PersistenceTaskType::AppendLog {
+            id: 3,
+            data: data3,
+            parent_span: tracing::Span::none(),
+            request_id: 3,
+        })
+        .unwrap();
+
+        // Truncate to 2 entries
+        tx.send(PersistenceTaskType::TruncateLog { target_length: 2 })
+            .unwrap();
+
+        drop(tx);
+        worker.run();
+
+        // Verify offsets truncated
+        assert_eq!(worker.entry_end_offsets, vec![100, 300]);
+
+        // Verify file was truncated
+        let file_size = fs::metadata(format!("{}log.capnp", dir)).unwrap().len();
+        assert_eq!(file_size, 300);
+    }
+
+    #[test]
+    fn test_truncate_log_to_zero() {
+        let tmp_dir = TempDir::new().unwrap();
+        let dir = format!("{}/", tmp_dir.path().to_str().unwrap());
+        let (mut worker, tx, _response_queue) = create_test_worker(&dir, vec![]);
+
+        // Append 2 entries
+        tx.send(PersistenceTaskType::AppendLog {
+            id: 1,
+            data: Arc::new(vec![1u8; 100]),
+            parent_span: tracing::Span::none(),
+            request_id: 1,
+        })
+        .unwrap();
+        tx.send(PersistenceTaskType::AppendLog {
+            id: 2,
+            data: Arc::new(vec![2u8; 200]),
+            parent_span: tracing::Span::none(),
+            request_id: 2,
+        })
+        .unwrap();
+
+        // Truncate to 0
+        tx.send(PersistenceTaskType::TruncateLog { target_length: 0 })
+            .unwrap();
+
+        drop(tx);
+        worker.run();
+
+        assert!(worker.entry_end_offsets.is_empty());
+
+        let file_size = fs::metadata(format!("{}log.capnp", dir)).unwrap().len();
+        assert_eq!(file_size, 0);
+    }
+
+    #[test]
+    fn test_truncate_then_append() {
+        let tmp_dir = TempDir::new().unwrap();
+        let dir = format!("{}/", tmp_dir.path().to_str().unwrap());
+        let (mut worker, tx, _response_queue) = create_test_worker(&dir, vec![]);
+
+        // Append 3 entries
+        tx.send(PersistenceTaskType::AppendLog {
+            id: 1,
+            data: Arc::new(vec![1u8; 100]),
+            parent_span: tracing::Span::none(),
+            request_id: 1,
+        })
+        .unwrap();
+        tx.send(PersistenceTaskType::AppendLog {
+            id: 2,
+            data: Arc::new(vec![2u8; 200]),
+            parent_span: tracing::Span::none(),
+            request_id: 2,
+        })
+        .unwrap();
+        tx.send(PersistenceTaskType::AppendLog {
+            id: 3,
+            data: Arc::new(vec![3u8; 50]),
+            parent_span: tracing::Span::none(),
+            request_id: 3,
+        })
+        .unwrap();
+
+        // Truncate to 1 entry
+        tx.send(PersistenceTaskType::TruncateLog { target_length: 1 })
+            .unwrap();
+
+        // Append a new entry after truncation
+        tx.send(PersistenceTaskType::AppendLog {
+            id: 4,
+            data: Arc::new(vec![4u8; 75]),
+            parent_span: tracing::Span::none(),
+            request_id: 4,
+        })
+        .unwrap();
+
+        drop(tx);
+        worker.run();
+
+        // After truncate to 1 (offset 100), then append 75 bytes
+        assert_eq!(worker.entry_end_offsets, vec![100, 175]);
+
+        let file_size = fs::metadata(format!("{}log.capnp", dir)).unwrap().len();
+        assert_eq!(file_size, 175);
+    }
+
+    #[test]
+    fn test_worker_with_initial_offsets() {
+        let tmp_dir = TempDir::new().unwrap();
+        let dir = format!("{}/", tmp_dir.path().to_str().unwrap());
+
+        // Pre-create a log file with some data
+        let log_path = format!("{}log.capnp", dir);
+        fs::write(&log_path, vec![0u8; 500]).unwrap();
+
+        let initial_offsets = vec![100, 300, 500];
+        let (mut worker, tx, _response_queue) = create_test_worker(&dir, initial_offsets);
+
+        // Truncate to 2 entries
+        tx.send(PersistenceTaskType::TruncateLog { target_length: 2 })
+            .unwrap();
+
+        drop(tx);
+        worker.run();
+
+        assert_eq!(worker.entry_end_offsets, vec![100, 300]);
+
+        let file_size = fs::metadata(&log_path).unwrap().len();
+        assert_eq!(file_size, 300);
     }
 }

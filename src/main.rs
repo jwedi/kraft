@@ -84,12 +84,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         queues.persistence_work_receiver.clone(),
         Arc::clone(&queues.persistence_response_queue),
         cfg.persistence_dir.clone(),
+        vec![],
     );
     let votes = persistence_worker.read_votes()?;
     let log_bytes = persistence_worker.read_log()?;
 
     // Recover persisted data (replication log and votes)
     let recovered = startup::recover_persisted_data(log_bytes, votes);
+
+    // Set the recovered log entry end offsets on the persistence worker
+    persistence_worker.set_entry_end_offsets(recovered.log_entry_end_offsets.clone());
 
     // Create commit state
     let commit_state = startup::create_commit_state();

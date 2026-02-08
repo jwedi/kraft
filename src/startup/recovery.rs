@@ -21,23 +21,29 @@ pub struct RecoveredData {
     pub term_votes: HashMap<u64, u32>,
     /// The next term to use (max of vote terms and log terms, plus one).
     pub next_term: u64,
+    /// Byte end offsets for each log entry in the persisted file.
+    /// `log_entry_end_offsets[i]` is the byte position right after entry `i`.
+    pub log_entry_end_offsets: Vec<u64>,
 }
 
 /// Deserializes the replication log from raw bytes (Cap'n Proto format).
 ///
-/// Returns a tuple of (log entries, term start indices, last index, last term).
-pub fn deserialize_replication_log(log_bytes: &[u8]) -> (Vec<Arc<OwnedLogEntry>>, HashMap<u64, u64>, u64, u64) {
+/// Returns a tuple of (log entries, term start indices, last index, last term, entry end offsets).
+pub fn deserialize_replication_log(
+    log_bytes: &[u8],
+) -> (Vec<Arc<OwnedLogEntry>>, HashMap<u64, u64>, u64, u64, Vec<u64>) {
     let start_time = now_millis();
 
     if log_bytes.is_empty() {
         log::warn!("Replication log is empty, starting with an empty log");
-        return (vec![], HashMap::new(), 0, 0);
+        return (vec![], HashMap::new(), 0, 0, vec![]);
     }
 
     log::info!("Recovered replication log with {} bytes", log_bytes.len());
 
     // Parse concatenated Cap'n Proto messages
     let mut replication_log = Vec::new();
+    let mut entry_end_offsets = Vec::new();
     let mut offset = 0;
 
     while offset < log_bytes.len() {
@@ -49,12 +55,14 @@ pub fn deserialize_replication_log(log_bytes: &[u8]) -> (Vec<Arc<OwnedLogEntry>>
                 match OwnedLogEntry::from_bytes(entry_bytes) {
                     Ok(entry) => {
                         replication_log.push(Arc::new(entry));
+                        offset += bytes_consumed;
+                        entry_end_offsets.push(offset as u64);
                     }
                     Err(e) => {
                         log::warn!("Failed to parse log entry at offset {}: {:?}", offset, e);
+                        offset += bytes_consumed;
                     }
                 }
-                offset += bytes_consumed;
             }
             Err(e) => {
                 log::warn!(
@@ -91,7 +99,7 @@ pub fn deserialize_replication_log(log_bytes: &[u8]) -> (Vec<Arc<OwnedLogEntry>>
         elapsed
     );
 
-    (replication_log, term_start_index, last_log_index, last_log_term)
+    (replication_log, term_start_index, last_log_index, last_log_term, entry_end_offsets)
 }
 
 /// Processes recovered votes and computes the next term.
@@ -120,7 +128,8 @@ pub fn process_votes(votes: Vec<VoteRow>, last_log_term: u64) -> (HashMap<u64, u
 
 /// Recovers all persisted data (log and votes) and returns a RecoveredData struct.
 pub fn recover_persisted_data(log_bytes: Vec<u8>, votes: Vec<VoteRow>) -> RecoveredData {
-    let (replication_log, term_start_index, last_log_index, last_log_term) = deserialize_replication_log(&log_bytes);
+    let (replication_log, term_start_index, last_log_index, last_log_term, log_entry_end_offsets) =
+        deserialize_replication_log(&log_bytes);
 
     let (term_votes, next_term) = process_votes(votes, last_log_term);
 
@@ -131,6 +140,7 @@ pub fn recover_persisted_data(log_bytes: Vec<u8>, votes: Vec<VoteRow>) -> Recove
         last_log_term,
         term_votes,
         next_term,
+        log_entry_end_offsets,
     }
 }
 
@@ -140,12 +150,13 @@ mod tests {
 
     #[test]
     fn test_deserialize_empty_log() {
-        let (log, term_starts, last_idx, last_term) = deserialize_replication_log(&[]);
+        let (log, term_starts, last_idx, last_term, end_offsets) = deserialize_replication_log(&[]);
 
         assert!(log.is_empty());
         assert!(term_starts.is_empty());
         assert_eq!(last_idx, 0);
         assert_eq!(last_term, 0);
+        assert!(end_offsets.is_empty());
     }
 
     #[test]
@@ -205,5 +216,6 @@ mod tests {
         assert_eq!(data.last_log_term, 0);
         assert!(data.term_votes.is_empty());
         assert_eq!(data.next_term, 1);
+        assert!(data.log_entry_end_offsets.is_empty());
     }
 }

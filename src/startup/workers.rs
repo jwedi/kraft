@@ -24,6 +24,7 @@ pub fn create_persistence_worker(
     persistence_rx: Receiver<PersistenceTaskType>,
     response_queue: Arc<SegQueue<PersistenceResponseType>>,
     persistence_dir: String,
+    entry_end_offsets: Vec<u64>,
 ) -> PersistenceWorker {
     PersistenceWorker::new(
         persistence_rx,
@@ -31,6 +32,7 @@ pub fn create_persistence_worker(
         PersistenceConfig {
             out_dir: persistence_dir,
         },
+        entry_end_offsets,
     )
 }
 

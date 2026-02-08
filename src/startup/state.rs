@@ -103,6 +103,7 @@ mod tests {
             last_log_term: 0,
             term_votes: HashMap::new(),
             next_term: 1,
+            log_entry_end_offsets: vec![],
         }
     }
 
@@ -131,6 +132,7 @@ mod tests {
             last_log_term: 2,
             term_votes: HashMap::new(),
             next_term: 3,
+            log_entry_end_offsets: vec![],
         };
         let commit_state = create_commit_state();
 
