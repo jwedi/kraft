@@ -99,7 +99,13 @@ pub fn deserialize_replication_log(
         elapsed
     );
 
-    (replication_log, term_start_index, last_log_index, last_log_term, entry_end_offsets)
+    (
+        replication_log,
+        term_start_index,
+        last_log_index,
+        last_log_term,
+        entry_end_offsets,
+    )
 }
 
 /// Processes recovered votes and computes the next term.

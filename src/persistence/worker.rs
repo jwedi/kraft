@@ -434,8 +434,7 @@ mod tests {
         .unwrap();
 
         // Truncate to 2 entries
-        tx.send(PersistenceTaskType::TruncateLog { target_length: 2 })
-            .unwrap();
+        tx.send(PersistenceTaskType::TruncateLog { target_length: 2 }).unwrap();
 
         drop(tx);
         worker.run();
@@ -471,8 +470,7 @@ mod tests {
         .unwrap();
 
         // Truncate to 0
-        tx.send(PersistenceTaskType::TruncateLog { target_length: 0 })
-            .unwrap();
+        tx.send(PersistenceTaskType::TruncateLog { target_length: 0 }).unwrap();
 
         drop(tx);
         worker.run();
@@ -513,8 +511,7 @@ mod tests {
         .unwrap();
 
         // Truncate to 1 entry
-        tx.send(PersistenceTaskType::TruncateLog { target_length: 1 })
-            .unwrap();
+        tx.send(PersistenceTaskType::TruncateLog { target_length: 1 }).unwrap();
 
         // Append a new entry after truncation
         tx.send(PersistenceTaskType::AppendLog {
@@ -548,8 +545,7 @@ mod tests {
         let (mut worker, tx, _response_queue) = create_test_worker(&dir, initial_offsets);
 
         // Truncate to 2 entries
-        tx.send(PersistenceTaskType::TruncateLog { target_length: 2 })
-            .unwrap();
+        tx.send(PersistenceTaskType::TruncateLog { target_length: 2 }).unwrap();
 
         drop(tx);
         worker.run();

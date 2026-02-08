@@ -656,7 +656,9 @@ mod tests {
             .contains_key(&3));
 
         // Verify that a TruncateLog task was sent to the persistence worker
-        let task = persistence_rx.try_recv().expect("Expected TruncateLog task on persistence channel");
+        let task = persistence_rx
+            .try_recv()
+            .expect("Expected TruncateLog task on persistence channel");
         match task {
             PersistenceTaskType::TruncateLog { target_length } => {
                 assert_eq!(target_length, 5, "TruncateLog target_length should be prev_index + 1");
@@ -860,7 +862,9 @@ mod tests {
             .contains_key(&3));
 
         // Verify that a TruncateLog task was sent to the persistence worker
-        let task = persistence_rx.try_recv().expect("Expected TruncateLog task on persistence channel");
+        let task = persistence_rx
+            .try_recv()
+            .expect("Expected TruncateLog task on persistence channel");
         match task {
             PersistenceTaskType::TruncateLog { target_length } => {
                 assert_eq!(target_length, 3, "TruncateLog target_length should be prev_index + 1");
