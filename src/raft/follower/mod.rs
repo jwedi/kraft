@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 use tracing::Level;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::persistence::worker::PersistenceResponseType;
+use crate::persistence::worker::{PersistenceResponseType, PersistenceTaskType};
 use crate::quorum::types::LocalQuorumTaskResponseType;
 use crate::raft::raft_sm::{
     LocalAppendEntries, LocalAppendEntriesCallbackResponse, LocalRaftResponseMessage, LocalRaftResponsePayload,
@@ -50,6 +50,14 @@ impl RaftFollowerStateDelegate {
                 .volatile_server_state
                 .replication_log_term_starts
                 .retain(|_term, start| *start <= prev_index);
+
+            // Send truncation task to persistence worker to truncate the log file on disk
+            if let Err(e) = shared_state
+                .persistence_work
+                .send(PersistenceTaskType::TruncateLog { target_length })
+            {
+                log::error!("Failed to send TruncateLog task to persistence worker: {}", e);
+            }
 
             log::info!(
                 "Updated log state: last_log_term={}, last_log_index={}, next_log_index={}",
@@ -574,7 +582,7 @@ mod tests {
     #[tokio::test]
     async fn test_truncate_log_basic_functionality() {
         let delegate = RaftFollowerStateDelegate::new();
-        let (mut shared_state, _persistence_rx) = create_shared_state();
+        let (mut shared_state, persistence_rx) = create_shared_state();
 
         // Set up a log with multiple terms using absolute indexing
         shared_state
@@ -646,6 +654,17 @@ mod tests {
             .volatile_server_state
             .replication_log_term_starts
             .contains_key(&3));
+
+        // Verify that a TruncateLog task was sent to the persistence worker
+        let task = persistence_rx
+            .try_recv()
+            .expect("Expected TruncateLog task on persistence channel");
+        match task {
+            PersistenceTaskType::TruncateLog { target_length } => {
+                assert_eq!(target_length, 5, "TruncateLog target_length should be prev_index + 1");
+            }
+            _ => panic!("Expected TruncateLog task, got a different task type"),
+        }
     }
 
     #[tokio::test]
@@ -740,7 +759,7 @@ mod tests {
     #[tokio::test]
     async fn test_truncate_log_no_truncation_needed() {
         let delegate = RaftFollowerStateDelegate::new();
-        let (mut shared_state, _persistence_rx) = create_shared_state();
+        let (mut shared_state, persistence_rx) = create_shared_state();
 
         // Set up a log
         shared_state
@@ -771,12 +790,18 @@ mod tests {
         assert_eq!(shared_state.volatile_server_state.replication_log.len(), 5);
         assert_eq!(shared_state.volatile_server_state.last_log_term, 2);
         assert_eq!(shared_state.volatile_server_state.last_log_index, 4);
+
+        // Verify no TruncateLog task was sent (no-op truncation)
+        assert!(
+            persistence_rx.try_recv().is_err(),
+            "No TruncateLog task should be sent when truncation is a no-op"
+        );
     }
 
     #[tokio::test]
     async fn test_follower_handles_truncate_log_message() {
         let mut delegate = RaftFollowerStateDelegate::new();
-        let (mut shared_state, _persistence_rx) = create_shared_state();
+        let (mut shared_state, persistence_rx) = create_shared_state();
 
         // Set up a log that will be truncated
         shared_state
@@ -835,5 +860,16 @@ mod tests {
             .volatile_server_state
             .replication_log_term_starts
             .contains_key(&3));
+
+        // Verify that a TruncateLog task was sent to the persistence worker
+        let task = persistence_rx
+            .try_recv()
+            .expect("Expected TruncateLog task on persistence channel");
+        match task {
+            PersistenceTaskType::TruncateLog { target_length } => {
+                assert_eq!(target_length, 3, "TruncateLog target_length should be prev_index + 1");
+            }
+            _ => panic!("Expected TruncateLog task, got a different task type"),
+        }
     }
 }
